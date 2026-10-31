@@ -15,7 +15,6 @@ const TOOL_PHASES: Readonly<Record<string, OddPhase>> = {
 	grep: "exploring",
 	find: "exploring",
 	ls: "exploring",
-	codegraph: "exploring",
 	ask_user_choice: "deciding",
 	ask_user_question: "deciding",
 	todo: "planning",
@@ -23,6 +22,16 @@ const TOOL_PHASES: Readonly<Record<string, OddPhase>> = {
 	gentle_review_scope: "checking",
 	gentle_review_capture: "checking",
 	gentle_review_capture_group: "checking",
+};
+
+// CodeGraph registers three operations and only two of them are exploration
+// work: query and explore read the index, while init builds it — the tool's own
+// setup step, not a phase of the agent's work. Naming init exploring would
+// claim work the agent did not do, so it leaves the current label untouched.
+const CODEGRAPH_TOOL = "codegraph";
+const CODEGRAPH_OPERATION_PHASES: Readonly<Record<string, OddPhase>> = {
+	query: "exploring",
+	explore: "exploring",
 };
 
 const DELEGATED_PHASES: Readonly<Record<string, OddPhase>> = {
@@ -96,6 +105,12 @@ export function inferOddPhase(toolName: string, args: unknown): OddPhase | undef
 	}
 	if (WRITE_TOOLS.has(name)) return isOddTaskPath(stringArg(args, "path") ?? stringArg(args, "file_path")) ? "planning" : "implementing";
 	if (SHELL_TOOLS.has(name)) return inferShellPhase(stringArg(args, "command"));
+	if (name === CODEGRAPH_TOOL) {
+		const operation = stringArg(args, "operation");
+		return operation !== undefined && Object.hasOwn(CODEGRAPH_OPERATION_PHASES, operation)
+			? CODEGRAPH_OPERATION_PHASES[operation]
+			: undefined;
+	}
 	return Object.hasOwn(TOOL_PHASES, name) ? TOOL_PHASES[name] : undefined;
 }
 

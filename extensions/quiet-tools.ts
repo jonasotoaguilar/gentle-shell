@@ -8,18 +8,20 @@ import {
 	createWriteTool,
 	keyHint,
 } from "@earendil-works/pi-coding-agent";
-import { Text, type Component } from "@earendil-works/pi-tui";
+import { Text, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { resolveGentleAiDevBinaryOverride, type GentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { CARD_CONTENT, cardContent } from "../lib/card-content-policy.ts";
 import { GentleAiElapsedTimingLedger } from "../lib/gentle-ai-elapsed-store.ts";
+import { inferOddPhase } from "../lib/odd-phase-inference.ts";
+import type { OddPhase } from "../lib/odd-phase.ts";
 import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
 import { registerCompactCodemode } from "../lib/codemode-renderer.ts";
 import { offerBuiltinCodemodeOptOut, type BuiltinCodemodeOptOutOptions } from "../lib/builtin-codemode-optout.ts";
 import { getGentleAiRenderState, renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import {
-	CARD_TONE, cardAwaitingResult, cardBottom, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopRows, floatRows, markCardResult,
+	CARD_TONE, cardAwaitingResult, cardBottom, cardElapsed, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopLine, cardTopRows, floatRows, markCardResult,
 	type CardRowContext, type CardTheme,
 } from "../lib/shell-card.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
@@ -50,6 +52,23 @@ const TOOL_GLYPH = {
 	edit: "✎",
 	write: "+",
 } as const satisfies Record<QuietToolName, string>;
+
+// A bash command's phase inference can only return these two phases
+// (lib/odd-phase-inference.ts inferShellPhase: a checker segment checks, every
+// read-only segment explores, anything else is undefined), so a card style
+// exists for exactly those two and generic bash covers the rest. edit, write,
+// todo and the choice tools keep their own existing cards.
+export type BashCardPhase = Extract<OddPhase, "exploring" | "checking">;
+
+// Each reachable phase leads with its own mark and paints itself in its own
+// theme role, so an exploring row never looks like a checking one.
+export const PHASE_IDENTITY = {
+	exploring: { glyph: "◎", titleRole: "mdLink" },
+	checking: { glyph: "✓", titleRole: "mdHeading" },
+} as const satisfies Record<BashCardPhase, { glyph: string; titleRole: string }>;
+
+/** The identity of a command whose phase the inference cannot tell: the tool's own mark and role, never a borrowed phase. */
+export const BASH_IDENTITY = { glyph: TOOL_GLYPH.bash, titleRole: "bashMode" } as const;
 
 const COLLAPSED_COUNT_LABELS: Partial<Record<QuietToolName, string>> = {
 	grep: "matches",
@@ -464,11 +483,118 @@ export function formatToolResultOutput(
 	return "";
 }
 
+/**
+ * The visible rows of one quiet result at one expansion level, before the card
+ * paints them. Both levels are computed for every result, so a card can tell
+ * whether expanding it would show anything else at all.
+ */
+function quietResultRows(
+	toolName: QuietToolName,
+	result: AgentToolResult<unknown>,
+	text: string,
+	options: { expanded: boolean; isError: boolean; args?: Record<string, unknown>; withheld: boolean },
+): string {
+	const { expanded, isError, args, withheld } = options;
+	if (!expanded && withheld) return "";
+	let output = formatToolResultOutput(toolName, result, { expanded, isError, args });
+	// Counts alone hide the result: retain their useful totals alongside actual rows.
+	if (!expanded && !isError && output && COLLAPSED_COUNT_LABELS[toolName]) {
+		output += `\n${firstLines(text, PREVIEW_LINE_LIMIT - 1)}`;
+	}
+	if (!expanded && !isError && toolName === "edit") {
+		const diff = detailsRecord(result).diff;
+		if (typeof diff === "string") output += `\n${firstLines(safeText(diff).split("\n").filter((line) => /^[+-]/.test(line)).join("\n"), PREVIEW_LINE_LIMIT - 1)}`;
+	}
+	return output.replace(/^\n/, "");
+}
+
 function lineRangeSuffix(args: Record<string, unknown>, theme: ThemeLike): string {
 	if (args.offset === undefined && args.limit === undefined) return "";
 	const startLine = typeof args.offset === "number" ? args.offset : 1;
 	const endLine = typeof args.limit === "number" ? startLine + args.limit - 1 : undefined;
 	return theme.fg("warning", `:${startLine}${endLine === undefined ? "" : `-${endLine}`}`);
+}
+
+/**
+ * Splits a shell composition into its segments, or undefined when the command
+ * carries quoting, substitution, escapes, or a pipe the card cannot read
+ * safely. It never guesses: an unreadable composition keeps the whole command
+ * visible. A pipeline routes output into another program (`| tee log.txt`,
+ * `| xargs rm`, `|| fallback`), so no single segment is the whole story.
+ */
+function splitShellSegments(command: string): string[] | undefined {
+	if (/['"`]|\$\(|\\|\|/.test(command)) return undefined;
+	return command.split(/&&|\|\||;|\n/).map((segment) => segment.trim()).filter((segment) => segment.length > 0);
+}
+
+// A composition may skip a segment only when it is a harmless no-op whose output
+// nobody reads. Deliberately tiny: anything unlisted makes the card name the
+// whole command, so a consequential action is never hidden behind a test run.
+const BASH_IGNORABLE_SEGMENT = /^(cd|pushd|popd|echo|printf|sleep|true|false|export|set|\[\[?|test)\b/;
+// A no-op stops being harmless the moment it redirects output to a file. Stream
+// merges and discarded output are not writes; anything else is. Quotes and
+// escapes never reach this check (the splitter refuses those commands).
+const BASH_HARMLESS_REDIRECT = /\s*(\d?>&\d|&?\d?>\s*\/dev\/null)/g;
+
+function writesFileSegment(segment: string): boolean {
+	return segment.replace(BASH_HARMLESS_REDIRECT, "").includes(">");
+}
+
+/**
+ * The segment of a shell composition that names the work the phase came from:
+ * the last segment the same classifier also labels with that phase. A single
+ * segment has nothing to abbreviate, an unreadable composition returns
+ * undefined, and so does a composition holding any segment that is neither a
+ * read/verify step nor a harmless no-op — the heading then keeps the whole
+ * command instead of hiding what else runs.
+ */
+function bashPrincipalAction(command: string, phase: BashCardPhase): string | undefined {
+	const segments = splitShellSegments(command);
+	if (!segments || segments.length < 2) return undefined;
+	const safe = segments.every((segment) => {
+		const segmentPhase = inferOddPhase("bash", { command: segment });
+		if (segmentPhase === "exploring" || segmentPhase === "checking") return true;
+		return BASH_IGNORABLE_SEGMENT.test(segment) && !writesFileSegment(segment);
+	});
+	if (!safe) return undefined;
+	return segments.filter((segment) => inferOddPhase("bash", { command: segment }) === phase).at(-1);
+}
+
+/**
+ * The bash heading: the phase its own command implies (with that phase's mark
+ * and color) over the composition's principal action, or the unconditional
+ * generic `bash` fallback with the command itself for anything the inference
+ * does not label. Collapsed it stays one row; expanded it carries the complete
+ * command.
+ */
+function bashHeading(args: Record<string, unknown>, theme: ThemeLike, expanded: boolean): ToolCardHeading {
+	const command = safeText(asString(args.command, "..."));
+	const timeout = typeof args.timeout === "number" ? ` (timeout ${args.timeout}s)` : "";
+	const phase = inferOddPhase("bash", args);
+	const identity = phase === undefined ? BASH_IDENTITY : PHASE_IDENTITY[phase as BashCardPhase];
+	const detail = phase === undefined ? command : bashPrincipalAction(command, phase as BashCardPhase) ?? command;
+	return {
+		title: theme.bold(phase ?? "bash"),
+		subtitle: `${detail}${timeout}`,
+		glyph: identity.glyph,
+		titleRole: identity.titleRole,
+		singleLine: !expanded,
+	};
+}
+
+/** The parts of a tool card heading: what it says, the mark that leads it, the theme role that paints it, and whether it must fit one row. */
+interface ToolCardHeading {
+	title: string;
+	subtitle?: string;
+	glyph: string;
+	titleRole?: string;
+	singleLine?: boolean;
+}
+
+/** One heading at one expansion level, drawn with whatever card chrome is active right now. */
+function headingRows(heading: ToolCardHeading, tone: ToolTone, theme: CardTheme, singleLine: boolean, width: number, hint?: string): string[] {
+	const card = { ...heading, body: [], tone };
+	return singleLine ? [cardTopLine(card, theme, width, hint)] : cardTopRows(card, theme, width, hint);
 }
 
 interface ToolRenderContextLike {
@@ -485,18 +611,11 @@ interface ToolRenderContextLike {
 	durationMs?: number;
 }
 
-function formatToolCall(toolName: QuietToolName, args: Record<string, unknown>, theme: ThemeLike): string {
+function formatToolCall(toolName: Exclude<QuietToolName, "bash">, args: Record<string, unknown>, theme: ThemeLike): string {
 	switch (toolName) {
 		case "read": {
 			const path = safeText(shortenPath(args.path) || "...");
 			return `${theme.fg("toolTitle", theme.bold("read"))} ${theme.fg("accent", path)}${lineRangeSuffix(args, theme)}`;
-		}
-		case "bash": {
-			const command = safeText(asString(args.command, "..."));
-			const timeout = typeof args.timeout === "number" ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
-			// Minimal cards title bash with the bare command; the card glyph supplies the `$` prompt.
-			const title = cardContent() === CARD_CONTENT.MINIMAL ? command : `bash $ ${command}`;
-			return `${theme.fg("toolTitle", theme.bold(title))}${timeout}`;
 		}
 		case "grep": {
 			let text = `${theme.fg("toolTitle", theme.bold("grep"))} ${theme.fg("accent", `/${safeText(asString(args.pattern))}/`)} in ${safeText(shortenPath(args.path) || ".")}`;
@@ -582,6 +701,77 @@ function toolTone(pending: boolean, failed: boolean): ToolTone {
 	return pending ? CARD_TONE.WARNING : CARD_TONE.SUCCESS;
 }
 
+function expansionSlot(state: unknown): Record<PropertyKey, unknown> | undefined {
+	return state !== null && typeof state === "object" ? state as Record<PropertyKey, unknown> : undefined;
+}
+
+// Nothing to expand. A card offers the expand key, and takes a left click, only
+// when expanding it shows something else: a call whose result already fits stays
+// quiet instead of offering a no-op. Both halves of one row are measured where
+// the row is actually drawn — a result only a narrow terminal wraps past the
+// preview budget still counts as truncated — so the heading and the result halves
+// answer together. Only the bash and codegraph cards opt in; every other quiet
+// card keeps the key and the click it has always had. A host that shares no row
+// state cannot pass the measurement along, so its card also keeps the affordance.
+const CARD_REVEALS = Symbol.for("gentle-pi.card-reveals");
+
+/** What one row of a card still has to show, measured at the width the row is drawn at. */
+interface CardReveal {
+	/** Whether expanding the call continues its heading on more rows. */
+	heading?: (rowWidth: number) => boolean;
+	/** Whether expanding shows result rows the collapsed preview does not. */
+	body?: (rowWidth: number) => boolean;
+}
+
+/** This pass's measurement for the row, reused so either half may run first; both halves refresh their own closure every pass. */
+function cardReveal(state: unknown): CardReveal | undefined {
+	const slot = expansionSlot(state);
+	if (slot === undefined) return undefined;
+	const existing = slot[CARD_REVEALS] as CardReveal | undefined;
+	if (existing !== undefined) return existing;
+	const reveal: CardReveal = {};
+	slot[CARD_REVEALS] = reveal;
+	return reveal;
+}
+
+/** Whether expanding this row shows anything more; a host sharing no row state cannot tell, so its card keeps the key. */
+function cardShowsMore(reveal: CardReveal | undefined, rowWidth: number): boolean {
+	if (reveal === undefined) return true;
+	return reveal.heading?.(rowWidth) === true || reveal.body?.(rowWidth) === true;
+}
+
+/** Physical rows a piece of card content needs at this width, before any preview budget clips it. */
+function contentRows(text: string, width: number): number {
+	return text === "" ? 0 : new Text(text, 0, 0).render(width).length;
+}
+
+/** Two renderings say the same thing when their visible text matches row for row. */
+function sameText(a: string, b: string): boolean {
+	const normalize = (text: string) => stripAnsi(text).split("\n").map((line) => line.trimEnd()).join("\n").trimEnd();
+	return normalize(a) === normalize(b);
+}
+
+/**
+ * The card's part in a click. Expansion belongs to the host: pi wraps every tool
+ * row in a click region that toggles the row's own `expanded`, which is the same
+ * state the card paints and the same state the expand key's global toggle applies
+ * to every row. So a revealing click is left to that region rather than kept in an
+ * override of our own: an override would leave the host believing the row was
+ * still closed, and the next key press — which sets every row to the expansion the
+ * transcript settles on — would appear to do nothing for a row that already looked
+ * open. Without it the card and the key agree at every step, like pi's own rows.
+ *
+ * A click the card cannot show anything for is consumed instead, so the region
+ * cannot toggle the row into a state a later resize or streamed tail would expose.
+ * Only the click is taken: press, drag, release, wheel and other buttons stay with
+ * the host, so dragging a text selection across the card is untouched.
+ */
+function cardClickResult(event: TuiMouseEvent, showsMore: boolean): TuiMouseEventResult | undefined {
+	if (event.type !== "click" || event.button !== "left") return undefined;
+	if (showsMore) return undefined;
+	return { handled: true, render: false };
+}
+
 /** One settled frame per component: bounded memory, including all card chrome. */
 class ToolCardRows {
 	private frame?: { width: number; style: ReturnType<typeof cardStyle>; running: boolean; lines: string[] };
@@ -599,32 +789,50 @@ class ToolCardRows {
 
 class ToolCardTop implements Component {
 	private readonly rows = new ToolCardRows();
-	private readonly header: () => string;
-	private readonly glyph: string;
+	private readonly heading: ToolCardHeading;
 	private readonly tone: ToolTone;
 	private readonly theme: CardTheme;
 	private readonly hint: string | undefined;
 	private readonly row: CardRowContext | undefined;
+	private readonly reveal: CardReveal | undefined;
+	/** What the last drawn frame showed below the heading; a card with nothing left keeps the click with the host. */
+	private showsMore = true;
 
-	constructor(header: () => string, tone: ToolTone, theme: CardTheme, glyph: string, hint?: string, row?: CardRowContext) {
-		this.header = header;
-		this.glyph = glyph;
+	constructor(heading: ToolCardHeading, tone: ToolTone, theme: CardTheme, hint?: string, row?: CardRowContext, reveal?: CardReveal) {
+		this.heading = heading;
 		this.tone = tone;
 		this.theme = theme;
 		this.hint = hint;
 		this.row = row;
+		this.reveal = reveal;
 	}
 
-	/** Renders `╭─ <icon> <call> ── <hint> ╮`, reserving applicable hint space before wrapping the call. A call that does not fit the rule (a long or multi-line command) continues on card rows below it, so every line of the command stays visible. */
+	/** A left click on the heading toggles the card, like the expand key in its top rule. */
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return cardClickResult(event, this.showsMore);
+	}
+
+	/** The heading at one expansion level; `singleLine` is the collapsed form, and `hint` rides its rule. */
+	private headRows(width: number, singleLine: boolean, hint: string | undefined): string[] {
+		return headingRows(this.heading, this.tone, this.theme, singleLine, width, hint);
+	}
+
+	/** Renders `╭─ <icon> <title> · <detail> ── <hint> ╮`. A single-line heading keeps the card one row and ends an over-wide detail in an ellipsis; an expandable heading continues the complete detail on the rows below so every line of the call stays visible. The key only rides the rule when expanding the card shows something else. */
 	render(width: number): string[] {
 		const target = Math.max(0, Math.floor(width));
 		if (target === 0) return [];
 		const running = this.row !== undefined && cardAwaitingResult(this.row);
-		return this.rows.render(target, running, () => floatRows(this.tone, this.theme, target, (inner) => ({
-			head: cardTopRows({ title: this.header(), glyph: this.glyph, body: [], tone: this.tone }, this.theme, inner, this.hint),
-			body: running ? [cardRunningLine(this.tone, this.theme, inner)] : undefined,
-			bottom: running ? cardBottom(this.tone, this.theme, inner) : undefined,
-		})));
+		return this.rows.render(target, running, () => floatRows(this.tone, this.theme, target, (inner) => {
+			// Measured at the width this row is drawn at, with the chrome it is drawn in,
+			// so a heading that only truncates because the terminal is narrow still counts.
+			this.showsMore = cardShowsMore(this.reveal, inner);
+			const hint = this.showsMore ? this.hint : undefined;
+			return {
+				head: this.headRows(inner, this.heading.singleLine === true, hint),
+				body: running ? [cardRunningLine(this.tone, this.theme, inner)] : undefined,
+				bottom: running ? cardBottom(this.tone, this.theme, inner) : undefined,
+			};
+		}));
 	}
 
 	invalidate(): void { this.rows.invalidate(); }
@@ -637,23 +845,40 @@ class ToolCardBody implements Component {
 	private readonly theme: CardTheme;
 
 	private readonly cacheable: boolean;
+	private readonly elapsed: string | undefined;
+	private readonly row: CardRowContext | undefined;
+	private readonly reveal: CardReveal | undefined;
+	/** What the last drawn frame showed; a card with nothing left keeps the click with the host. */
+	private showsMore = true;
 
-	constructor(inner: () => Component, tone: ToolTone, theme: CardTheme, cacheable = true) {
+	constructor(inner: () => Component, tone: ToolTone, theme: CardTheme, cacheable = true, elapsed?: string, row?: CardRowContext, reveal?: CardReveal) {
 		this.inner = inner;
 		this.tone = tone;
 		this.theme = theme;
 		this.cacheable = cacheable;
+		this.elapsed = elapsed;
+		this.row = row;
+		this.reveal = reveal;
+	}
+
+	/** A left click on the result rows toggles the card through the same state as its heading. */
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return cardClickResult(event, this.showsMore);
 	}
 
 	/** Renders the inner component between the card sides and closes the frame, even when the result has no rows. */
 	render(width: number): string[] {
 		const target = Math.max(0, Math.floor(width));
 		if (target === 0) return [];
-		const build = () => floatRows(this.tone, this.theme, target, (inner) => ({
-			body: this.inner().render(cardInnerWidth(inner)).map((line) => cardLine(line.trimEnd(), this.tone, this.theme, inner)),
-			bottom: cardBottom(this.tone, this.theme, inner),
-			afterHeading: true,
-		}));
+		const build = () => floatRows(this.tone, this.theme, target, (inner) => {
+			// The same measurement the heading reads, at the width these rows are drawn at.
+			this.showsMore = cardShowsMore(this.reveal, inner);
+			return {
+				body: this.inner().render(cardInnerWidth(inner)).map((line) => cardLine(line.trimEnd(), this.tone, this.theme, inner)),
+				bottom: cardBottom(this.tone, this.theme, inner, this.elapsed),
+				afterHeading: true,
+			};
+		});
 		return this.cacheable ? this.rows.render(target, false, build) : build();
 	}
 
@@ -748,10 +973,21 @@ export function createQuietToolRenderer(
 				return renderGentleAiLifecycleCall(operationPath, theme, withElapsedTiming(renderContext as GentleAiRenderContext), detail);
 			}
 			const tone = toolTone(renderContext.isPartial !== false, renderContext.isError === true);
-			// Same place and wording as the Gentle AI card: the expand key rides the top rule once the call finished.
-			const finished = renderContext.isPartial === false && (renderContext.executionStarted === true || renderContext.isError === true);
-			const hint = finished ? stripAnsi(keyHint("app.tools.expand", renderContext.expanded === true ? "to collapse" : "to expand")) : undefined;
-			return new ToolCardTop(() => formatToolCall(toolName, callArgs, theme), tone, theme, TOOL_GLYPH[toolName], hint, renderContext);
+			// The host owns expansion: a click moves the same state the key does.
+			const expanded = renderContext.expanded === true;
+			// Same place and wording as the Gentle AI card: the expand key rides the top
+			// rule once the call finished. A host replaying a stored transcript never
+			// starts the call, so only the result says whether it finished.
+			const finished = renderContext.isPartial === false;
+			const hint = finished ? stripAnsi(keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")) : undefined;
+			const heading = toolName === "bash"
+				? bashHeading(callArgs, theme, expanded)
+				: { title: formatToolCall(toolName, callArgs, theme), glyph: TOOL_GLYPH[toolName] };
+			// Only the bash card withholds a no-op expansion; every other quiet card
+			// keeps the key and the click it has always had.
+			const reveal = toolName === "bash" ? cardReveal(renderContext.state) : undefined;
+			if (reveal) reveal.heading = (rowWidth) => !sameText(headingRows(heading, tone, theme, true, rowWidth).join("\n"), headingRows(heading, tone, theme, false, rowWidth).join("\n"));
+			return new ToolCardTop(heading, tone, theme, hint, renderContext, reveal);
 		},
 		/** Builds the card component for this render pass; collapsed cards delegate to the wrapped-line cache keyed by the tool result object. */
 		renderResult(result, options, theme, context) {
@@ -774,53 +1010,205 @@ export function createQuietToolRenderer(
 				return renderGentleAiResult(safeResult, { expanded: options.expanded, isPartial: options.isPartial, isError }, theme, renderContext ? withElapsedTiming(renderContext as GentleAiRenderContext) : undefined);
 			}
 			const resultTone = toolTone(options.isPartial === true, isError);
-			const carded = (component: () => Component, cacheable = options.isPartial !== true): Component => new ToolCardBody(component, resultTone, theme, cacheable);
+			const elapsed = toolName === "bash" ? cardElapsed(renderContext?.durationMs) : undefined;
+			const expanded = options.expanded;
+			const reveal = toolName === "bash" ? cardReveal(renderContext?.state) : undefined;
+			const carded = (component: () => Component, cacheable = options.isPartial !== true): Component => new ToolCardBody(component, resultTone, theme, cacheable, elapsed, renderContext, reveal);
 			// Under the minimal Card content preference, every quiet tool draws
 			// the command alone while collapsed; the expand key still reveals
 			// the full result. Failures keep their bounded error tail so a red
 			// card always says why. The default preference keeps the previews.
-			if (COMMAND_ONLY_TOOLS.has(toolName) && !options.expanded && !isError && cardContent() === CARD_CONTENT.MINIMAL) {
-				return carded(() => new Text("", 0, 0));
-			}
+			const withheld = COMMAND_ONLY_TOOLS.has(toolName) && !isError && cardContent() === CARD_CONTENT.MINIMAL;
+			// Both expansion levels are known here, so the card can tell whether
+			// expanding it would show anything its preview does not, measured where
+			// the rows are drawn (wrapping at a narrow width hides rows too).
+			const collapsedRows = quietResultRows(toolName, safeResult, text, { expanded: false, isError, args: renderContext?.args, withheld });
+			const expandedRows = quietResultRows(toolName, safeResult, text, { expanded: true, isError, args: renderContext?.args, withheld });
+			if (reveal) reveal.body = (rowWidth) => collapsedRows !== expandedRows || contentRows(collapsedRows, cardInnerWidth(rowWidth)) > PREVIEW_LINE_LIMIT;
+			if (!expanded && withheld) return carded(() => new Text("", 0, 0));
 			if (options.isPartial) {
-				if (options.expanded) return carded(() => new Text(`${theme.fg("warning", partialLabel(toolName, text))}\n${theme.fg("muted", text)}`, 0, 0));
+				const label = partialLabel(toolName, text);
 				const visible = lastOutputLines(text, PREVIEW_LINE_LIMIT);
+				if (reveal) reveal.body = (rowWidth) => !sameText(`${label}\n${visible}`, `${label}\n${text}`) || contentRows(`${label}\n${visible}`, cardInnerWidth(rowWidth)) > PREVIEW_LINE_LIMIT;
+				if (expanded) return carded(() => new Text(`${theme.fg("warning", label)}\n${theme.fg("muted", text)}`, 0, 0));
 				return carded(() => new BoundedRows([
-					{ text: theme.fg("warning", partialLabel(toolName, text)), rows: 1 },
+					{ text: theme.fg("warning", label), rows: 1 },
 					...(visible ? [{ text: theme.fg("muted", visible), rows: PREVIEW_LINE_LIMIT, tail: true }] : []),
 				], cacheKey));
 			}
-			if (options.expanded && toolName === "read" && hasImageContent(safeResult) && officialRenderResult) {
+			if (expanded && toolName === "read" && hasImageContent(safeResult) && officialRenderResult) {
 				return carded(() => officialRenderResult(
 					safeResult,
-					options,
+					{ ...options, expanded },
 					theme,
-					{ ...sanitizedRenderContext(renderContext), lastComponent: undefined } as any,
+					{ ...sanitizedRenderContext(renderContext), expanded, lastComponent: undefined } as any,
 				), false);
 			}
-			let output = formatToolResultOutput(toolName, safeResult, {
-				expanded: options.expanded,
-				isError,
-				args: renderContext?.args,
-			});
-			// Counts alone hide the result: retain their useful totals alongside actual rows.
-			if (!options.expanded && !isError && output && COLLAPSED_COUNT_LABELS[toolName]) {
-				output += `\n${firstLines(text, PREVIEW_LINE_LIMIT - 1)}`;
-			}
-			if (!options.expanded && !isError && toolName === "edit") {
-				const diff = detailsRecord(safeResult).diff;
-				if (typeof diff === "string") output += `\n${firstLines(safeText(diff).split("\n").filter((line) => /^[+-]/.test(line)).join("\n"), PREVIEW_LINE_LIMIT - 1)}`;
-			}
-			const color = isError ? "error" : options.expanded ? "toolOutput" : "muted";
-			if (options.expanded) return carded(() => new Text(output ? theme.fg(color, output.replace(/^\n/, "")) : "", 0, 0));
-			if (output) {
+			const color = isError ? "error" : expanded ? "toolOutput" : "muted";
+			if (expanded) return carded(() => new Text(expandedRows ? theme.fg(color, expandedRows) : "", 0, 0));
+			if (collapsedRows) {
 				const tail = shouldRenderPreviewTail(toolName, text, isError, renderContext?.args);
 				return carded(() => new BoundedRows([
-					{ text: theme.fg(color, output.replace(/^\n/, "")), rows: PREVIEW_LINE_LIMIT, tail },
+					{ text: theme.fg(color, collapsedRows), rows: PREVIEW_LINE_LIMIT, tail },
 				], cacheKey));
 			}
 			// The card top rule carries the expand key, so an empty result only closes the frame.
 			return carded(() => new Text("", 0, 0));
+		},
+	};
+}
+
+// CodeGraph draws its own row (`renderShell: "self"`) and ships no card, so
+// quiet tools supplies one through the same renderer resolver that redraws
+// bash. The tool keeps its own execution, arguments, timeouts, and results;
+// only the row's drawing is Gentle's.
+const CODEGRAPH_TOOL = "codegraph";
+const CODEGRAPH_IDENTITY = { glyph: "⌗", titleRole: "mdCode" } as const;
+// The init CLI paints a progress box; its separator rows carry no facts.
+const CODEGRAPH_CHROME = /^[\s│┌└─]*$/;
+// The init log trails into telemetry and upgrade notices after its summary, so
+// the collapsed rows name the index it built rather than the last lines it wrote.
+const CODEGRAPH_INIT_FACT = /\b(Indexed \d+ files?|\d+ nodes?, \d+ edges?|Initialized in)\b/;
+
+/**
+ * The result count CodeGraph's own output states, or undefined when the shape
+ * is not one the card can read reliably — a card never invents a count.
+ */
+export function codeGraphResultSummary(operation: string, text: string): string | undefined {
+	if (operation === "query") {
+		if (/^.*No results found for /m.test(text)) return "0 results";
+		if (!/^Search Results for .*:$/m.test(text)) return undefined;
+		// One entry per blank-line-separated block: a symbol line at column zero
+		// followed by its indented path:line location.
+		const entries = text.split(/\n\s*\n/).filter((block) => {
+			const [head = "", ...rest] = outputLines(block);
+			return /^\S+\s{2,}\S/.test(head) && rest.some((line) => /^ {2}.+:\d+(?::\d+)?\s*$/.test(line));
+		});
+		if (entries.length === 0) return undefined;
+		return `${entries.length} ${entries.length === 1 ? "result" : "results"}`;
+	}
+	if (operation === "explore") {
+		const found = /^Found (\d+) symbols? across (\d+) files?\.$/m.exec(text);
+		if (!found) return undefined;
+		const symbols = Number(found[1]);
+		const files = Number(found[2]);
+		return `${symbols} ${symbols === 1 ? "symbol" : "symbols"} in ${files} ${files === 1 ? "file" : "files"}`;
+	}
+	return undefined;
+}
+
+/** The rows a collapsed CodeGraph card previews: the output without the progress box's empty rows. */
+function codeGraphPreview(text: string): string {
+	return outputLines(text).filter((line) => !CODEGRAPH_CHROME.test(line)).slice(-PREVIEW_LINE_LIMIT).join("\n");
+}
+
+/** The rows an init card previews: the facts it reported, falling back to the plain preview when it stated none. */
+function codeGraphInitPreview(text: string): string {
+	const lines = outputLines(text).filter((line) => !CODEGRAPH_CHROME.test(line));
+	const facts = lines.filter((line) => CODEGRAPH_INIT_FACT.test(line)).slice(-PREVIEW_LINE_LIMIT);
+	return (facts.length > 0 ? facts : lines.slice(-PREVIEW_LINE_LIMIT)).join("\n");
+}
+
+/**
+ * The rows a collapsed CodeGraph card draws, with the row budget and direction
+ * it spends them on, or undefined when the card draws no rows at all. The same
+ * rows tell the card whether expanding it would show anything else.
+ */
+function codeGraphCollapsedRows(
+	operation: string,
+	text: string,
+	failed: boolean,
+	withheld: boolean,
+): { text: string; rows: number; tail: boolean } | undefined {
+	if (withheld && !failed) return undefined;
+	if (failed) {
+		const reason = lastMeaningfulOutputLines(text, PREVIEW_LINE_LIMIT);
+		return reason ? { text: reason, rows: PREVIEW_LINE_LIMIT, tail: true } : undefined;
+	}
+	const summary = codeGraphResultSummary(operation, text);
+	if (summary) return { text: `→ ${summary}`, rows: 1, tail: false };
+	const preview = operation === "init" ? codeGraphInitPreview(text) : codeGraphPreview(text);
+	return preview ? { text: preview, rows: PREVIEW_LINE_LIMIT, tail: true } : undefined;
+}
+
+/**
+ * The CodeGraph heading. Every operation heads with the tool's own mark, role
+ * and name, so a query, an explore, and an init row read as one instrument and
+ * stay distinguishable from the bash phase cards; the operation and its query
+ * are the detail. Only the working label under the prompt follows the phase the
+ * operation performs, where query and explore are exploration and init is not.
+ */
+function codeGraphHeading(args: Record<string, unknown>, theme: ThemeLike, expanded: boolean): ToolCardHeading {
+	const operation = asString(args.operation, "...");
+	const query = asString(args.query);
+	const detail = safeText(query.length > 0 ? `${operation} ${query}` : operation);
+	return {
+		title: theme.bold(CODEGRAPH_TOOL),
+		subtitle: detail,
+		glyph: CODEGRAPH_IDENTITY.glyph,
+		titleRole: CODEGRAPH_IDENTITY.titleRole,
+		singleLine: !expanded,
+	};
+}
+
+/** Rendering-only factory for the CodeGraph card; the tool keeps its own execution, schema, and timeouts. */
+export function createCodeGraphCardRenderer(): Pick<ToolDefinition, "renderShell" | "renderCall" | "renderResult"> {
+	return {
+		renderShell: "self",
+		renderCall(args, theme, context) {
+			const renderContext = sanitizedRenderContext(context);
+			const tone = toolTone(renderContext.isPartial !== false, renderContext.isError === true);
+			const expanded = renderContext.expanded === true;
+			// Same rule as every quiet card: only the final result says the call finished,
+			// because a host replaying a stored transcript never starts it.
+			const finished = renderContext.isPartial === false;
+			const hint = finished ? stripAnsi(keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")) : undefined;
+			const heading = codeGraphHeading(isRenderArgs(args) ? args : {}, theme, expanded);
+			const reveal = cardReveal(renderContext.state);
+			if (reveal) reveal.heading = (rowWidth) => !sameText(headingRows(heading, tone, theme, true, rowWidth).join("\n"), headingRows(heading, tone, theme, false, rowWidth).join("\n"));
+			return new ToolCardTop(heading, tone, theme, hint, renderContext, reveal);
+		},
+		renderResult(result, options, theme, context) {
+			const renderContext = context ? sanitizedRenderContext(context) : undefined;
+			markCardResult(renderContext?.state);
+			const cacheKey = typeof result === "object" && result !== null ? result : undefined;
+			const safeResult = sanitizedResult(result);
+			const details = detailsRecord(safeResult);
+			const operation = asString(renderContext?.args?.operation) || asString(details.operation);
+			const text = safeText(extractTextContent(safeResult));
+			// The tool reports a failed or unavailable run as an ordinary result with a
+			// recorded status, while the host flags a thrown call on its context (older
+			// hosts still put the flag on the options). Either one is a failure here.
+			const legacyError = "isError" in options && options.isError === true;
+			const failed = (renderContext?.isError ?? legacyError) || typeof details.status === "string";
+			const tone = toolTone(options.isPartial === true, failed);
+			const elapsed = cardElapsed(renderContext?.durationMs);
+			const expanded = options.expanded;
+			const reveal = cardReveal(renderContext?.state);
+			const carded = (component: () => Component, cacheable = options.isPartial !== true): Component => new ToolCardBody(component, tone, theme, cacheable, elapsed, renderContext, reveal);
+			// Both expansion levels are known here, so the card can tell whether
+			// expanding it would show anything its preview does not, measured where
+			// the rows are drawn (wrapping at a narrow width hides rows too).
+			const withheld = cardContent() === CARD_CONTENT.MINIMAL;
+			const collapsed = codeGraphCollapsedRows(operation, text, failed, withheld);
+			if (reveal) reveal.body = (rowWidth) => {
+				const rows = collapsed?.text ?? "";
+				return !sameText(rows, text) || contentRows(rows, cardInnerWidth(rowWidth)) > (collapsed?.rows ?? PREVIEW_LINE_LIMIT);
+			};
+			// Minimal cards keep the heading alone; a failure always says why.
+			if (withheld && !expanded && !failed) return carded(() => new Text("", 0, 0));
+			if (options.isPartial) {
+				const visible = codeGraphPreview(text);
+				if (reveal) reveal.body = (rowWidth) => !sameText(visible, text) || contentRows(visible, cardInnerWidth(rowWidth)) > PREVIEW_LINE_LIMIT;
+				return carded(() => new BoundedRows([
+					...(visible ? [{ text: theme.fg("muted", visible), rows: PREVIEW_LINE_LIMIT, tail: true }] : []),
+				], cacheKey));
+			}
+			if (expanded) return carded(() => new Text(text ? theme.fg(failed ? "error" : "toolOutput", text) : "", 0, 0));
+			if (collapsed === undefined) return carded(() => new Text("", 0, 0));
+			return carded(() => new BoundedRows([
+				{ text: theme.fg(failed ? "error" : "muted", collapsed.text), rows: collapsed.rows, tail: collapsed.tail },
+			], cacheKey));
 		},
 	};
 }
@@ -873,14 +1261,17 @@ export default function quietTools(
 		registerQuietTool(pi, toolName, resolveOverride, () => elapsedTiming);
 	}
 	// Native Bash keeps pi's execution and schema; only its drawing becomes a
-	// Gentle card while the Card content preference is minimal, so quiet bash
-	// rows match the other tools. The resolver API is newer than this
-	// package's pinned pi types, so it is probed structurally; hosts without it
-	// — and the default content preference — keep pi's native bash rendering.
+	// Gentle card, so quiet bash rows match the other tools at both Card
+	// content levels and can carry the phase inferred from the command. The
+	// resolver API is newer than this package's pinned pi types, so it is
+	// probed structurally; hosts without it keep pi's native bash rendering.
 	const host = pi as typeof pi & { registerToolRenderer?: (resolver: (toolName: string, next: () => unknown) => unknown) => void };
 	if (typeof host.registerToolRenderer === "function") {
-		host.registerToolRenderer((toolName, next) =>
-			toolName === "bash" && cardContent() === CARD_CONTENT.MINIMAL ? createQuietToolRenderer("bash", resolveOverride, () => elapsedTiming) : next());
+		host.registerToolRenderer((toolName, next) => {
+			if (toolName === "bash") return createQuietToolRenderer("bash", resolveOverride, () => elapsedTiming);
+			if (toolName === CODEGRAPH_TOOL) return createCodeGraphCardRenderer();
+			return next();
+		});
 	}
 	return registerCompactCodemode(pi);
 }

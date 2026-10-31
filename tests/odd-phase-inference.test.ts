@@ -6,9 +6,22 @@ import { inferOddPhase } from "../lib/odd-phase-inference.ts";
 // working label. Unknown tools and ambiguous shell commands never change it.
 
 test("read-only file tools infer exploring", () => {
-	for (const tool of ["read", "grep", "find", "ls", "codegraph"]) {
+	for (const tool of ["read", "grep", "find", "ls"]) {
 		assert.equal(inferOddPhase(tool, { path: "src/index.ts" }), "exploring", tool);
 	}
+});
+
+test("CodeGraph query and explore infer exploring, while init leaves the label alone", () => {
+	// query and explore are the agent reading the index.
+	assert.equal(inferOddPhase("codegraph", { operation: "query", query: "ledger" }), "exploring");
+	assert.equal(inferOddPhase("codegraph", { operation: "explore", query: "ledger" }), "exploring");
+	// init builds the index: the tool's own setup step, not agent exploration.
+	assert.equal(inferOddPhase("codegraph", { operation: "init" }), undefined);
+	// A call whose operation is missing or unknown carries no reliable signal.
+	for (const args of [{}, { path: "src/index.ts" }, { operation: "status" }, { operation: 42 }, undefined]) {
+		assert.equal(inferOddPhase("codegraph", args), undefined, JSON.stringify(args));
+	}
+	assert.equal(inferOddPhase("mcp__codegraph__codegraph", { operation: "query", query: "ledger" }), "exploring");
 });
 
 test("asking the user infers deciding", () => {
