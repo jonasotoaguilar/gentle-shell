@@ -424,6 +424,237 @@ test("MCP-prefixed tool names are normalized before mapping", () => {
 	assert.equal(inferOddPhase("mcp__custom-tools__subagent_run", { agent: "gentle-ai-worker" }), "implementing");
 });
 
+// A bash card names the activity its own command implies. Two of those
+// activities — versioning and publishing — are card-only: they never reach the
+// phase label, the global phase enum, or the exploration budget, so they are
+// asserted through the activity classifier and never through inferOddPhase.
+test("local history changes name the versioning activity", () => {
+	for (const command of [
+		"git add -A",
+		"git add lib/odd-phase-inference.ts",
+		"git -C /repo add .",
+		"git commit -m 'feat: x'",
+		"git commit --amend --no-edit",
+		`git commit -m "$(cat msg.txt)"`,
+		"git commit -m x && git log --oneline -3",
+		"git rebase main",
+		"git rebase -i origin/main",
+		"git rebase --continue",
+		"git rebase --abort",
+		"git cherry-pick abc1234",
+		"git cherry-pick --continue",
+		"git cherry-pick --abort",
+		"git add -A && git commit -m x",
+		// A stack's local half touches branches on this machine only.
+		"gh stack init",
+		"gh stack init --base feat/tracker feat/one feat/two",
+		"gh stack add feat/three",
+		"gh stack rebase --upstack",
+	]) {
+		assert.equal(inferShellActivity(command), "versioning", command);
+	}
+});
+
+test("remote writes name the publishing activity", () => {
+	for (const command of [
+		"git push",
+		"git push -u origin HEAD",
+		"git push origin feat/x",
+		"gh pr create --title x --body y",
+		"gh pr edit 12 --add-label bug --add-assignee octocat",
+		"gh pr close 12",
+		"gh pr reopen 12",
+		"gh pr merge 12 --squash",
+		"gh pr ready 12",
+		"gh pr review 12 --approve",
+		"gh pr update-branch 12",
+		"gh pr comment 12 --body hi",
+		"gh issue create --title x --label bug --assignee octocat",
+		"gh issue edit 7 --add-label bug --remove-label wip --add-assignee octocat",
+		"gh issue close 7",
+		"gh issue reopen 7",
+		"gh issue comment 7 --body hi",
+		"gh issue pin 7",
+		"gh issue transfer 7 owner/other",
+		"gh label create bug --color ff0000",
+		"gh label edit bug --new-name defect",
+		"gh label delete bug --yes",
+		"gh label clone owner/other",
+		"gh release create v1.0.0 --generate-notes",
+		"gh release edit v1.0.0 --draft=false",
+		"gh release upload v1.0.0 dist/app.tgz",
+		// A stack's remote half pushes branches and rewrites its PRs.
+		"gh stack submit",
+		"gh stack submit --auto --open",
+		"gh stack push",
+		"gh stack sync",
+		"gh stack merge",
+		"gh stack link",
+		"gh stack unstack",
+	]) {
+		assert.equal(inferShellActivity(command), "publishing", command);
+	}
+});
+
+test("a stack view is inspection, and an unlisted stack command names no activity", () => {
+	for (const command of ["gh stack view", "gh stack view --json", "gh stack view | jq -r .name"]) {
+		assert.equal(inferShellActivity(command), "exploring", command);
+		assert.equal(inferOddPhase("bash", { command }), "exploring", command);
+	}
+	// Navigation, aliases, feedback and the interactive restructure are neither
+	// reads nor writes this classifier can name, so the card stays generic.
+	for (const command of [
+		"gh stack checkout",
+		"gh stack bottom",
+		"gh stack top",
+		"gh stack up",
+		"gh stack down",
+		"gh stack trunk",
+		"gh stack switch",
+		"gh stack modify",
+		"gh stack alias co",
+		"gh stack feedback",
+	]) {
+		assert.equal(inferShellActivity(command), undefined, command);
+	}
+});
+
+// The activity is a composition rule, like the phase: a segment this classifier
+// cannot name keeps the whole call generic, so a mutation is never hidden behind
+// a labelled neighbour.
+test("every segment must be named, and the strongest activity names the card", () => {
+	assert.equal(inferShellActivity("git add -A && git commit -m x"), "versioning");
+	assert.equal(inferShellActivity("git commit -m x && git push"), "publishing");
+	assert.equal(inferShellActivity("git status && git push"), "publishing");
+	assert.equal(inferShellActivity("git add -A && git commit -m x && git push origin main"), "publishing");
+	assert.equal(inferShellActivity("gh stack view && gh stack submit"), "publishing");
+	for (const command of [
+		"git commit -m x && node scripts/release.mjs",
+		"gh pr create --title x && gh pr comment `gh pr view --json number`",
+		"echo hi > out.txt",
+	]) {
+		assert.equal(inferShellActivity(command), undefined, command);
+	}
+	// Checking still outranks exploring, exactly as the phase inference does.
+	assert.equal(inferShellActivity("git push && pnpm test"), "checking");
+});
+
+// Versioning and publishing are card identities, not ODD phases: the working
+// label and its precedence rules must not move for them.
+test("versioning and publishing never become the inferred ODD phase", () => {
+	for (const command of [
+		"git add -A",
+		"git commit -m 'feat: x'",
+		"git rebase main",
+		"git cherry-pick abc1234",
+		"git push",
+		"gh pr create --title x",
+		"gh issue close 7",
+		"gh label create bug",
+		"gh stack init",
+		"gh stack submit",
+	]) {
+		assert.equal(inferOddPhase("bash", { command }), undefined, command);
+	}
+});
+
+// Preparing, formatting and destructive are card identities like versioning and
+// publishing: they say what the call is doing, never which ODD step the session
+// is on, so every one of them leaves the working label and the exploration
+// budget exactly where they were.
+test("installations, scaffolding and stored configuration name the preparing activity", () => {
+	for (const command of [
+		"pnpm install",
+		"pnpm install --frozen-lockfile",
+		"npm ci",
+		"npm install left-pad",
+		"pnpm -C packages/app install",
+		"yarn add left-pad",
+		"bun install",
+		"pip install -r requirements.txt",
+		"python3 -m pip install -e .",
+		"uv sync",
+		"uv pip install pytest",
+		"poetry install",
+		"bundle install",
+		"brew install jq",
+		"apt-get install -y jq",
+		"go mod download",
+		"go install ./cmd/tool",
+		"composer install",
+		"git init",
+		"git clone https://example.com/repo.git",
+		"cargo new crate",
+		"mkdir -p tmp/scratch",
+		"touch tmp/scratch/file",
+		"cp package.json package.json.bak",
+		"ln -s ../lib/odd-phase.ts odd-phase.ts",
+		"git config user.name 'A B'",
+		"npm config set fund false",
+		"go env -w GOFLAGS=-mod=mod",
+	]) {
+		assert.equal(inferShellActivity(command), "preparing", command);
+		assert.equal(inferOddPhase("bash", { command }), undefined, command);
+	}
+});
+
+test("formatters and lint fixers name the formatting activity", () => {
+	for (const command of [
+		"prettier --write .",
+		"prettier -w src/app.ts",
+		"npx prettier --write src/app.ts",
+		"pnpm exec prettier --write .",
+		"eslint . --fix",
+		"eslint src --fix --max-warnings 0",
+		"cargo fmt",
+		"ruff format .",
+		"ruff check --fix .",
+		"deno fmt",
+		"deno lint --fix",
+		"gofmt -w main.go",
+		"go fmt ./...",
+		"black .",
+		"rustfmt src/main.rs",
+		"biome format --write .",
+		"stylelint --fix '**/*.css'",
+	]) {
+		assert.equal(inferShellActivity(command), "formatting", command);
+		assert.equal(inferOddPhase("bash", { command }), undefined, command);
+	}
+});
+
+// The card keeps the whole call honest: a segment it cannot name keeps it generic
+// even beside a check, while the working label still follows the check that ran.
+test("a check beside an unnamed segment heads generic while the phase keeps the check", () => {
+	for (const command of [
+		"pnpm test && node scripts/release.mjs",
+		"pnpm test && echo ok > out.txt",
+		"pnpm test && echo done | tee log.txt",
+		"pnpm test && ./scripts/deploy.sh",
+		"pnpm test && bash -c 'unknown-tool --flag'",
+	]) {
+		assert.equal(inferShellActivity(command), undefined, command);
+		assert.equal(inferOddPhase("bash", { command }), "checking", command);
+	}
+	// Every segment is named here, so the check names the card as it always did.
+	for (const command of ["pnpm test && pnpm install", "git status && pnpm test", "pnpm test | tail -20"]) {
+		assert.equal(inferShellActivity(command), "checking", command);
+		assert.equal(inferOddPhase("bash", { command }), "checking", command);
+	}
+});
+
+// `git config <key>` reports the stored value; only a written value prepares.
+test("git config reads a stored value and only a written one is preparation", () => {
+	for (const command of ["git config user.name", "git config --get user.name", "git config --list", "git config -l"]) {
+		assert.equal(inferShellActivity(command), "exploring", command);
+		assert.equal(inferOddPhase("bash", { command }), "exploring", command);
+	}
+	for (const command of ["git config user.name 'A B'", "git config core.autocrlf false"]) {
+		assert.equal(inferShellActivity(command), "preparing", command);
+		assert.equal(inferOddPhase("bash", { command }), undefined, command);
+	}
+});
+
 // A bash card names the activity its own command implies, so the vocabulary it
 // words a heading with is a closed list: an activity without a mark and a theme
 // role could not be drawn, and one the phase enum also owned would move the

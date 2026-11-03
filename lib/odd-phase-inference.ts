@@ -141,6 +141,76 @@ const MAKE_FLAGS = new Set(["-s", "--silent", "-k", "--keep-going"]);
 // only the plain GET form is a query.
 const GH_API_WRITE_FLAGS = new Set(["-X", "--method", "-f", "--raw-field", "-F", "--field", "--input"]);
 
+// Formatters and lint fixers rewrite the files they read, so they are not checks.
+// The read-only forms — `--check`, `--diff`, `-l`, `--list-different` — are handled
+// by the check families above, and a segment carrying one is never formatting.
+const FORMATTING_COMMANDS: readonly RegExp[] = [
+	/^((npx|pnpx|bunx)\s+|(pnpm|yarn|npm)\s+(exec|run)\s+)?(prettier|biome|eslint|stylelint|oxlint|standard|markdownlint)\b.*\s(--write|--fix|-w)(?=\s|=|$)/,
+	/^((npx|pnpx|bunx)\s+)?dprint\s+fmt\b/,
+	// Formatters that rewrite in place by default; the read-only forms are excluded
+	// above, so `black --check` and `rustfmt --check` stay the checks they are.
+	/^((npx|pnpx|bunx)\s+)?(black|rustfmt|swiftformat)\b/,
+	/^clang-format\b.*\s-i(?=\s|$)/,
+	/^(cargo\s+fmt|go\s+fmt)\b/,
+	// These print the formatted text unless told to write it.
+	/^(gofmt|gofumpt|shfmt)\b.*\s-w(?=\s|$)/,
+	/^ruff\s+(check|format)\b/,
+	/^deno\s+(fmt|lint)\b/,
+	/^(mix|dart|terraform)\s+(format|fmt)\b/,
+];
+// A formatter told to report instead of rewrite is a check, or nothing at all.
+const FORMAT_READ_ONLY_FLAGS = /(^|\s)(--check|--diff|--list-different|--dry-run|-l)(?=\s|=|$)/;
+
+// Preparing the environment: installing dependencies in any ecosystem, creating a
+// directory, file or repository, and storing configuration in a tool's own file.
+// Only the forms that name themselves count: an unknown script, an unlisted
+// `make` recipe and a bare `git config --unset` stay unnamed.
+const PREPARING_COMMANDS: readonly RegExp[] = [
+	/^(pip|pip3)\s+install\b/,
+	/^python(3(\.\d+)?)?\s+-m\s+pip\s+install\b/,
+	/^uv\s+(pip\s+install|sync|add|init)\b/,
+	/^poetry\s+(install|add)\b/,
+	/^(bundle\s+install|gem\s+install|composer\s+install)\b/,
+	/^(brew|port)\s+install\b/,
+	/^(apt|apt-get|dnf|yum|zypper)\s+(install|add)\b/,
+	/^apk\s+add\b/,
+	/^pacman\s+-S\b/,
+	/^go\s+(get|install|mod\s+download)\b/,
+	/^cargo\s+(install|fetch|new|init)\b/,
+	/^dotnet\s+(restore|add)\b/,
+	// A repository, a directory or a file the call creates.
+	/^git\s+(init|clone)\b/,
+	/^(mkdir|touch|cp|ln)\b/,
+	// Configuration the call stores on this machine. A read is inspection and is
+	// matched before this family; a key deletion is not preparation either.
+	/^git\s+config\s+[^-\s]+\s+\S/,
+	/^(pip|pip3)\s+config\s+set\b/,
+	/^go\s+env\s+-w\b/,
+];
+// The package managers install, scaffold and store configuration through the same
+// subcommand position, so one reader serves every ecosystem.
+const PREPARING_SCRIPTS = new Set(["install", "i", "ci", "add", "init"]);
+
+// Local history. The index, a commit (`--amend` included), a rebase and a
+// cherry-pick (each with its `--continue`/`--abort`) change this machine only.
+const VERSIONING_COMMANDS: readonly RegExp[] = [
+	/^git\s+(add|commit|rebase|cherry-pick)\b/,
+	// A stack's local half creates and rebases branches; it publishes nothing.
+	/^gh\s+stack\s+(init|add|rebase)\b/,
+];
+
+// Remote writes: they create or move something on GitHub, including the label,
+// assignment and review mutations that ride on `edit` and its siblings.
+const PUBLISHING_COMMANDS: readonly RegExp[] = [
+	/^git\s+push\b/,
+	/^gh\s+(pr|issue)\s+(create|edit|close|reopen|delete|merge|ready|review|comment|update-branch|pin|unpin|lock|unlock|transfer)\b/,
+	/^gh\s+label\s+(create|edit|delete|clone)\b/,
+	/^gh\s+release\s+(create|edit|delete|upload)\b/,
+	/^gh\s+repo\s+(create|edit|delete|archive|rename|fork)\b/,
+	// A stack's remote half pushes its branches and rewrites its PRs.
+	/^gh\s+stack\s+(submit|push|merge|link|unstack|sync)\b/,
+];
+
 // Git listing flags that may take one non-flag argument (`--contains <rev>`)
 // without turning `git branch`/`git tag` into a create.
 const GIT_LIST_FLAG = String.raw`(\s+(-a|-r|-l|-v|-vv|-n\d*|--all|--remotes|--list|--show-current|--contains|--merged|--no-merged|--points-at|--sort=\S+)(\s+[^-\s]\S*)?)*$`;
@@ -156,6 +226,8 @@ const EXPLORING_COMMANDS: readonly RegExp[] = [
 	/^git\s+config\s+[^-\s]+\s*$/,
 	/^gh\s+(pr|issue|repo|release)\s+(view|list|diff|status)\b/,
 	/^gh\s+(auth\s+status|search\s+\w+|label\s+list|workflow\s+(list|view))\b/,
+	// Viewing a stack reads the local stack and its PRs.
+	/^gh\s+stack\s+view\b/,
 	// Metadata probes: what is installed, configured, or resolved here.
 	/^locale\b/,
 	/^cargo\s+tree\b/,
@@ -234,14 +306,15 @@ function inferShellPhase(command: string | undefined): OddPhase | undefined {
 
 /**
  * The activity a shell command names for its own card, or undefined when some
- * segment carries no reliable signal. Formatting, preparing, versioning and
+ * segment carries no reliable signal. Preparing, formatting, versioning and
  * publishing are card identities, not ODD phases: the working label and the
  * exploration budget read inferOddPhase, which never returns them.
  *
  * The card keeps every segment honest: a segment nothing can name keeps the whole
  * call generic — a check printed beside an unknown script never claims the card —
- * and a check outranks the inspection beside it. That is a display rule only: the
- * phase inference still lets any checking segment decide the label.
+ * and the strongest named activity wins — a check, then a remote write, a history
+ * change, a rewrite and a build-up. That is a display rule only: the phase
+ * inference still lets any checking segment decide the label.
  */
 export function inferShellActivity(command: string | undefined): ShellActivity | undefined {
 	const segments = shellSegments(command);
@@ -251,6 +324,10 @@ export function inferShellActivity(command: string | undefined): ShellActivity |
 	// claims a check — or any other identity — for work the call also did silently.
 	if (activities.includes(undefined)) return undefined;
 	if (activities.includes("checking")) return "checking";
+	if (activities.includes("publishing")) return "publishing";
+	if (activities.includes("versioning")) return "versioning";
+	if (activities.includes("formatting")) return "formatting";
+	if (activities.includes("preparing")) return "preparing";
 	return "exploring";
 }
 
@@ -263,14 +340,47 @@ function shellSegments(command: string | undefined): string[] {
 }
 
 /**
- * What one simple command does. A check verifies work and a read-only segment
- * inspects it; everything else — a mutation, an install, an unknown program, a
- * redirect — carries no activity this classifier can name.
+ * What one simple command does. A formatter that rewrites files and a build-up
+ * that installs or scaffolds name their own identity, a read-only segment
+ * inspects, and a rewrite of local history or of the remote names the family it
+ * belongs to.
  */
 function segmentActivity(segment: string): ShellActivity | undefined {
 	if (isCheckingSegment(segment)) return "checking";
+	if (isFormattingSegment(segment)) return "formatting";
 	if (isReadOnlyInspection(segment)) return "exploring";
+	// A segment whose payload this classifier cannot read, or that redirects its
+	// output into a file, is a write it cannot name.
+	if (HIDDEN_SUBSTITUTION.test(segment) || writesFile(segment)) return undefined;
+	if (isPreparingSegment(segment)) return "preparing";
+	if (matchesAny(VERSIONING_COMMANDS, segment)) return "versioning";
+	if (matchesAny(PUBLISHING_COMMANDS, segment)) return "publishing";
 	return undefined;
+}
+
+/** A formatter or a lint fixer rewrites what it reads; its read-only form never does. */
+function isFormattingSegment(segment: string): boolean {
+	return !FORMAT_READ_ONLY_FLAGS.test(unquoted(segment)) && matchesAny(FORMATTING_COMMANDS, segment);
+}
+
+/**
+ * Whether a segment prepares the environment. A package manager is read through
+ * its own subcommand position, so `pnpm -C pkg install` installs like
+ * `pnpm install` — the workspace flags a monorepo needs never hide it.
+ */
+function isPreparingSegment(segment: string): boolean {
+	const script = packageManagerCommand(segment);
+	if (script !== undefined) {
+		if (PREPARING_SCRIPTS.has(script)) return true;
+		// `pnpm config set fund false` stores configuration in the tool's own file.
+		return script === "config" && /\sconfig\s+set\b/.test(segment);
+	}
+	return matchesAny(PREPARING_COMMANDS, segment);
+}
+
+/** The segment with its quoted spans removed, so a flag or a `>` mentioned in text is not read as one. */
+function unquoted(segment: string): string {
+	return segment.replace(/"[^"]*"|'[^']*'/g, " ");
 }
 
 /** A segment verifies work when it runs one of the check families below. */
