@@ -8,6 +8,7 @@
 // the current label unchanged. This module is pure (no Pi or registry
 // imports); precedence against explicit reports lives in OddPhaseRegistry.
 
+import { isDestructiveCommand, isDestructiveSegment } from "./destructive-card-activity.ts";
 import type { OddPhase } from "./odd-phase.ts";
 
 /**
@@ -16,7 +17,7 @@ import type { OddPhase } from "./odd-phase.ts";
  * a commit or a push is not a step of the ODD protocol, so none of them reaches the
  * phase label, the global phase enum, or the exploration budget.
  */
-export const SHELL_ACTIVITIES = ["checking", "formatting", "preparing", "publishing", "versioning", "exploring"] as const;
+export const SHELL_ACTIVITIES = ["destructive", "checking", "formatting", "preparing", "publishing", "versioning", "exploring"] as const;
 
 export type ShellActivity = (typeof SHELL_ACTIVITIES)[number];
 
@@ -43,6 +44,7 @@ export type ShellActivity = (typeof SHELL_ACTIVITIES)[number];
  * heading's counted width matches what the terminal paints.
  */
 export const SHELL_ACTIVITY_IDENTITY: Record<ShellActivity, { glyph: string; titleRole: string }> = {
+	destructive: { glyph: "⚠", titleRole: "error" },
 	checking: { glyph: "✓", titleRole: "mdHeading" },
 	formatting: { glyph: "≋", titleRole: "syntaxFunction" },
 	preparing: { glyph: "⚒ ", titleRole: "syntaxFunction" },
@@ -328,20 +330,23 @@ function inferShellPhase(command: string | undefined): OddPhase | undefined {
 
 /**
  * The activity a shell command names for its own card, or undefined when some
- * segment carries no reliable signal. Preparing, formatting, versioning and
- * publishing are card identities, not ODD phases: the working label and the
- * exploration budget read inferOddPhase, which never returns them.
+ * segment carries no reliable signal. Preparing, formatting, destructive,
+ * versioning and publishing are card identities, not ODD phases: the working
+ * label and the exploration budget read inferOddPhase, which never returns them.
  *
  * The card keeps every segment honest: a segment nothing can name keeps the whole
  * call generic — a check printed beside an unknown script never claims the card —
- * and the strongest named activity wins — a check, then a remote write, a history
- * change, a rewrite and a build-up. That is a display rule only: the phase
- * inference still lets any checking segment decide the label.
+ * and the strongest named activity wins, a deletion first, then a check, then a
+ * remote write, a history change, a rewrite and a build-up. That is a display rule
+ * only: the phase inference still lets any checking segment decide the label.
  */
 export function inferShellActivity(command: string | undefined): ShellActivity | undefined {
 	const segments = shellSegments(command);
 	if (segments.length === 0) return undefined;
 	const activities = segments.map(segmentActivity);
+	// A deletion outranks everything, including a segment nothing can name: the card
+	// never hides the one thing the call cannot undo.
+	if (activities.includes("destructive") || (command !== undefined && isDestructiveCommand(command))) return "destructive";
 	// Beside a segment nothing can name the card stays generic: the heading never
 	// claims a check — or any other identity — for work the call also did silently.
 	if (activities.includes(undefined)) return undefined;
@@ -371,6 +376,7 @@ function segmentActivity(segment: string): ShellActivity | undefined {
 	const help = helpFlag(segment);
 	if (help === "request") return "exploring";
 	if (help === "unreadable") return undefined;
+	if (isDestructiveSegment(segment)) return "destructive";
 	if (isCheckingSegment(segment)) return "checking";
 	if (isFormattingSegment(segment)) return "formatting";
 	if (isReadOnlyInspection(segment)) return "exploring";

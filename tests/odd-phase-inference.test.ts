@@ -806,12 +806,156 @@ test("quoted text never turns a command into a write", () => {
 	}
 });
 
+// The mark is shared by the transcript and the Agents pane, and one mark is painted
+// two cells wide by an emoji-fallback font while pi-tui counts it as one: a single
+// space after U+2692 is then painted inside the glyph's own second cell, so the
+// heading reads `⚒preparing`. That mark carries its own gap instead — one column,
+// the minimum that still shows — so the glyph is unchanged and the counted width
+// matches what the terminal paints. No other mark needs one: each is a one-cell
+// glyph and the separator the card draws already shows.
+test("the preparing mark keeps its glyph and carries the gap a wide font would paint over", async () => {
+	const { SHELL_ACTIVITIES, SHELL_ACTIVITY_IDENTITY } = await import("../lib/odd-phase-inference.ts");
+	const marks = Object.fromEntries(SHELL_ACTIVITIES.map((activity) => [activity, SHELL_ACTIVITY_IDENTITY[activity].glyph]));
+	assert.deepEqual(marks, {
+		destructive: "⚠",
+		checking: "✓",
+		formatting: "≋",
+		preparing: "⚒ ",
+		publishing: "↑",
+		versioning: "⎇",
+		exploring: "⌕",
+	}, "only the mark a font paints two cells wide carries a gap");
+	// One column of gap, and the glyph itself is what it always was.
+	const preparing = [...SHELL_ACTIVITY_IDENTITY.preparing.glyph];
+	assert.equal(preparing.at(-1), " ", "the gap is the mark's own last column");
+	assert.equal(preparing.slice(0, -1).join(""), "⚒", "the hammer and pick stays the mark");
+	assert.equal(visibleWidth(SHELL_ACTIVITY_IDENTITY.preparing.glyph), 2, "the mark plus its gap is two counted columns");
+	for (const activity of SHELL_ACTIVITIES) {
+		if (activity === "preparing") continue;
+		assert.equal(visibleWidth(SHELL_ACTIVITY_IDENTITY[activity].glyph), 1, `${activity}: a one-cell mark carries no gap`);
+	}
+});
+
+test("deletions name the destructive activity without becoming a phase", () => {
+	for (const command of [
+		"rm -rf dist",
+		"rm -f logo.png",
+		"rm dist/a.ts",
+		"env FOO=bar rm -rf dist",
+		"sudo env FOO=1 rm -f /usr/local/bin/tool",
+		"sudo rm -f /usr/local/bin/tool",
+		"git clean -fdx",
+		"git reset --hard HEAD~1",
+		"git checkout .",
+		"git checkout -- .",
+		"git restore lib/a.ts",
+		"git branch -D feat/x",
+		"git push --force-with-lease origin feat/x",
+		"git stash drop",
+		"find . -name '*.log' -delete",
+		"shred secret.key",
+	]) {
+		assert.equal(inferShellActivity(command), "destructive", command);
+		assert.equal(inferOddPhase("bash", { command }), undefined, command);
+	}
+});
+
+test("a help flag, a dry run and a recovery never read as destructive", () => {
+	for (const command of ["rm -rf dist --help", "rm --help", "find --help", "git clean --help", "docker system prune --help", "kubectl delete --help"]) {
+		assert.equal(inferShellActivity(command), "exploring", command);
+		assert.equal(inferOddPhase("bash", { command }), "exploring", command);
+	}
+	// A help flag behind a flag-like word is read as that word's value, as before, so
+	// the call stays unnamed rather than claiming either a query or a deletion.
+	assert.equal(inferShellActivity("git clean -fd --help"), undefined);
+	for (const command of [
+		"git clean -n",
+		"git clean --dry-run -f",
+		"git restore --staged lib/a.ts",
+		"git reset --soft HEAD~1",
+		"git stash pop",
+		"git rebase --abort",
+		"git commit --amend --no-edit",
+		// A branch checkout keeps the working tree; only a path checkout discards it.
+		"git checkout main",
+		"git checkout -b feat/x",
+		"git checkout -",
+		"git checkout --",
+	]) {
+		assert.notEqual(inferShellActivity(command), "destructive", command);
+		assert.equal(inferOddPhase("bash", { command }), undefined, command);
+	}
+	for (const command of ["env FOO=bar node scripts/release.mjs", "env FOO=bar pnpm test"]) {
+		assert.notEqual(inferShellActivity(command), "destructive", command);
+	}
+	// A dry-run push is still the remote verb it is, never a deletion.
+	assert.equal(inferShellActivity("git push --dry-run"), "publishing");
+});
+
+test("data-loss evidence from SQL, containers, clusters and remote refs names the destructive activity", () => {
+	for (const command of [
+		`psql -c 'DROP TABLE users'`,
+		`echo 'DROP TABLE t' | psql`,
+		`mysql -e 'DROP DATABASE app'`,
+		"docker system prune -af",
+		"docker volume rm data",
+		"docker builder prune",
+		"kubectl delete pod web",
+		"git push --delete origin feat/x",
+		"git push origin :feat/x",
+		"FOO=1 rm -f logo.png",
+		"nice -n 5 rm -f logo.png",
+	]) {
+		assert.equal(inferShellActivity(command), "destructive", command);
+		assert.equal(inferOddPhase("bash", { command }), undefined, command);
+	}
+	// A scoped delete, a read, a dry run and a help page claim no deletion.
+	for (const command of [
+		`psql -c 'DELETE FROM t WHERE id = 1'`,
+		`psql -c 'SELECT 1'`,
+		"docker ps",
+		"kubectl get pods",
+		"kubectl delete --dry-run=client pod web",
+		"docker system prune --help",
+		"nice -n 5 pnpm test",
+	]) {
+		assert.notEqual(inferShellActivity(command), "destructive", command);
+	}
+});
+
+// A deletion is recognized beside a check — whatever wrapper or shell payload
+// carries it — so no card hides the one thing the call cannot undo.
+test("a recognized deletion beside a check heads the card while the phase keeps the check", () => {
+	for (const command of [
+		"pnpm test && docker system prune -af",
+		"pnpm test && kubectl delete pod web",
+		`pnpm test && psql -c 'DROP TABLE t'`,
+		`pnpm test && echo 'DROP TABLE t' | psql`,
+		"pnpm test && git push --delete origin feat/x",
+		"pnpm test && bash -c 'rm -rf build'",
+		"pnpm test && nice -n 5 rm -f logo.png",
+	]) {
+		assert.equal(inferShellActivity(command), "destructive", command);
+		assert.equal(inferOddPhase("bash", { command }), "checking", command);
+	}
+});
+
+test("quoted prose is never a deletion, so it keeps the activity the call really has", () => {
+	assert.equal(inferShellActivity(`printf 'git reset --hard HEAD~1'`), undefined);
+	assert.equal(inferShellActivity(`echo "shred secret.key"`), undefined);
+	assert.equal(inferShellActivity(`grep -rn "git clean -fd" docs`), "exploring");
+	assert.equal(inferOddPhase("bash", { command: `grep -rn "git clean -fd" docs` }), "exploring");
+	// A message that spells a deletion commits a message, not a deletion.
+	assert.equal(inferShellActivity(`git commit -m "git reset --hard"`), "versioning");
+	assert.equal(inferOddPhase("bash", { command: `git commit -m "git reset --hard"` }), undefined);
+});
+
 // A bash card names the activity its own command implies, so the vocabulary it
 // words a heading with is a closed list: an activity without a mark and a theme
 // role could not be drawn, and one the phase enum also owned would move the
 // working label it must never touch.
 test("the activity vocabulary names each card identity once", () => {
-	assert.deepEqual([...SHELL_ACTIVITIES], ["checking", "formatting", "preparing", "publishing", "versioning", "exploring"]);
+	assert.deepEqual([...SHELL_ACTIVITIES], ["destructive", "checking", "formatting", "preparing", "publishing", "versioning", "exploring"]);
 	assert.deepEqual(Object.keys(SHELL_ACTIVITY_IDENTITY).sort(), [...SHELL_ACTIVITIES].sort());
 });
 
@@ -822,6 +966,7 @@ test("the activity vocabulary names each card identity once", () => {
 // Exactly one mark carries a trailing gap of its own; see SHELL_ACTIVITY_IDENTITY.
 test("every activity wears its own mark and theme role", () => {
 	assert.deepEqual(SHELL_ACTIVITY_IDENTITY, {
+		destructive: { glyph: "⚠", titleRole: "error" },
 		checking: { glyph: "✓", titleRole: "mdHeading" },
 		formatting: { glyph: "≋", titleRole: "syntaxFunction" },
 		preparing: { glyph: "⚒ ", titleRole: "syntaxFunction" },
