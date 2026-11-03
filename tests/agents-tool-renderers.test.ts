@@ -137,8 +137,9 @@ test("the bash offer follows the Card content preference live", (t) => {
 	assert.notEqual(resolvers.at(-1)!("bash", () => native), native, "and the host defers nothing while minimal content is active");
 
 	setCardContent(CARD_CONTENT.DEFAULT);
-	assert.equal(agentToolRowRenderer("bash"), undefined, "the offer withdraws when the chat goes back to pi's drawing");
-	assert.equal(resolvers.at(-1)!("bash", () => native), native, "and the host defers to pi again");
+	// The bash card exists at both Card content levels; the level changes what it shows.
+	assert.equal(agentToolRowRenderer("bash"), offered, "the offer survives the level change");
+	assert.notEqual(resolvers.at(-1)!("bash", () => native), native, "and the host still defers to the Gentle card");
 
 	setCardContent(CARD_CONTENT.MINIMAL);
 	assert.equal(agentToolRowRenderer("bash"), offered, "returning to minimal content offers the same object again");
@@ -151,12 +152,11 @@ test("a disabled extension publishes no renderer to reuse", () => {
 	assert.equal(renderAgentToolItem(toolItem({ name: "read", output: "line one" }), plainTheme, 80, { expanded: false }), undefined);
 });
 
-test("native bash is not claimed while quiet-tools keeps pi's own drawing", () => {
+test("bash keeps the Gentle card at the default Card content level too", () => {
 	const { resolvers } = registeredQuietTools();
 	const native = { native: true };
-	assert.equal(resolvers.at(-1)!("bash", () => native), native, "the default content preference leaves bash to pi");
-	assert.equal(agentToolRowRenderer("bash"), undefined, "so no bash renderer is offered as reusable");
-	assert.equal(renderAgentToolItem(toolItem({ name: "bash", output: "hi" }), plainTheme, 80, { expanded: false }), undefined);
+	assert.notEqual(resolvers.at(-1)!("bash", () => native), native, "the default level still claims bash");
+	assert.notEqual(agentToolRowRenderer("bash"), undefined, "so the bash renderer is offered as reusable");
 });
 
 test("the row gate requires a frame the renderer owns and a call slot", () => {
