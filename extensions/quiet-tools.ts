@@ -14,8 +14,7 @@ import { isAbsolute } from "node:path";
 import { resolveGentleAiDevBinaryOverride, type GentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { CARD_CONTENT, cardContent } from "../lib/card-content-policy.ts";
 import { GentleAiElapsedTimingLedger } from "../lib/gentle-ai-elapsed-store.ts";
-import { inferOddPhase } from "../lib/odd-phase-inference.ts";
-import type { OddPhase } from "../lib/odd-phase.ts";
+import { SHELL_ACTIVITY_IDENTITY, inferShellActivity, type ShellActivity } from "../lib/odd-phase-inference.ts";
 import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
 import { registerCompactCodemode } from "../lib/codemode-renderer.ts";
 import { offerBuiltinCodemodeOptOut, type BuiltinCodemodeOptOutOptions } from "../lib/builtin-codemode-optout.ts";
@@ -53,21 +52,16 @@ const TOOL_GLYPH = {
 	write: "+",
 } as const satisfies Record<QuietToolName, string>;
 
-// A bash command's phase inference can only return these two phases
-// (lib/odd-phase-inference.ts inferShellPhase: a checker segment checks, every
-// read-only segment explores, anything else is undefined), so a card style
-// exists for exactly those two and generic bash covers the rest. edit, write,
-// todo and the choice tools keep their own existing cards.
-export type BashCardPhase = Extract<OddPhase, "exploring" | "checking">;
+// A bash command's card identity: the activity its own command names — the two
+// ODD phases (exploring, checking) plus the identities that are presentation only:
+// preparing (installing, scaffolding, stored configuration), formatting (a
+// formatter or a lint fixer), destructive (a deletion), and versioning for a local
+// history change or publishing for a remote write. None of them is ever inferred
+// into the session's phase (see lib/odd-phase-inference.ts), and none of them is
+// ever an authorization: permission stays with the guard that owns it.
+export type BashCardActivity = ShellActivity;
 
-// Each reachable phase leads with its own mark and paints itself in its own
-// theme role, so an exploring row never looks like a checking one.
-export const PHASE_IDENTITY = {
-	exploring: { glyph: "◎", titleRole: "mdLink" },
-	checking: { glyph: "✓", titleRole: "mdHeading" },
-} as const satisfies Record<BashCardPhase, { glyph: string; titleRole: string }>;
-
-/** The identity of a command whose phase the inference cannot tell: the tool's own mark and role, never a borrowed phase. */
+/** The identity of a command whose activity the classifier cannot tell: the tool's own mark and role, never a borrowed activity. */
 export const BASH_IDENTITY = { glyph: TOOL_GLYPH.bash, titleRole: "bashMode" } as const;
 
 const COLLAPSED_COUNT_LABELS: Partial<Record<QuietToolName, string>> = {
@@ -516,70 +510,39 @@ function lineRangeSuffix(args: Record<string, unknown>, theme: ThemeLike): strin
 }
 
 /**
- * Splits a shell composition into its segments, or undefined when the command
- * carries quoting, substitution, escapes, or a pipe the card cannot read
- * safely. It never guesses: an unreadable composition keeps the whole command
- * visible. A pipeline routes output into another program (`| tee log.txt`,
- * `| xargs rm`, `|| fallback`), so no single segment is the whole story.
- */
-function splitShellSegments(command: string): string[] | undefined {
-	if (/['"`]|\$\(|\\|\|/.test(command)) return undefined;
-	return command.split(/&&|\|\||;|\n/).map((segment) => segment.trim()).filter((segment) => segment.length > 0);
-}
-
-// A composition may skip a segment only when it is a harmless no-op whose output
-// nobody reads. Deliberately tiny: anything unlisted makes the card name the
-// whole command, so a consequential action is never hidden behind a test run.
-const BASH_IGNORABLE_SEGMENT = /^(cd|pushd|popd|echo|printf|sleep|true|false|export|set|\[\[?|test)\b/;
-// A no-op stops being harmless the moment it redirects output to a file. Stream
-// merges and discarded output are not writes; anything else is. Quotes and
-// escapes never reach this check (the splitter refuses those commands).
-const BASH_HARMLESS_REDIRECT = /\s*(\d?>&\d|&?\d?>\s*\/dev\/null)/g;
-
-function writesFileSegment(segment: string): boolean {
-	return segment.replace(BASH_HARMLESS_REDIRECT, "").includes(">");
-}
-
-/**
- * The segment of a shell composition that names the work the phase came from:
- * the last segment the same classifier also labels with that phase. A single
- * segment has nothing to abbreviate, an unreadable composition returns
- * undefined, and so does a composition holding any segment that is neither a
- * read/verify step nor a harmless no-op — the heading then keeps the whole
- * command instead of hiding what else runs.
- */
-function bashPrincipalAction(command: string, phase: BashCardPhase): string | undefined {
-	const segments = splitShellSegments(command);
-	if (!segments || segments.length < 2) return undefined;
-	const safe = segments.every((segment) => {
-		const segmentPhase = inferOddPhase("bash", { command: segment });
-		if (segmentPhase === "exploring" || segmentPhase === "checking") return true;
-		return BASH_IGNORABLE_SEGMENT.test(segment) && !writesFileSegment(segment);
-	});
-	if (!safe) return undefined;
-	return segments.filter((segment) => inferOddPhase("bash", { command: segment }) === phase).at(-1);
-}
-
-/**
- * The bash heading: the phase its own command implies (with that phase's mark
- * and color) over the composition's principal action, or the unconditional
- * generic `bash` fallback with the command itself for anything the inference
- * does not label. Collapsed it stays one row; expanded it carries the complete
- * command.
+ * The bash heading: the activity its own command names (with that activity's mark
+ * and color), or the unconditional generic `bash` fallback, over the command the
+ * call actually runs. The detail is always that complete command — never a
+ * shortened substitute — so nothing the call does is hidden: collapsed the
+ * heading stays one row and an over-wide command ends in an ellipsis, and
+ * expanded the whole command continues on the rows below. The rail that leads
+ * the card is painted in the same role as the label, so the card's left edge
+ * belongs to its heading.
  */
 function bashHeading(args: Record<string, unknown>, theme: ThemeLike, expanded: boolean): ToolCardHeading {
 	const command = safeText(asString(args.command, "..."));
 	const timeout = typeof args.timeout === "number" ? ` (timeout ${args.timeout}s)` : "";
-	const phase = inferOddPhase("bash", args);
-	const identity = phase === undefined ? BASH_IDENTITY : PHASE_IDENTITY[phase as BashCardPhase];
-	const detail = phase === undefined ? command : bashPrincipalAction(command, phase as BashCardPhase) ?? command;
+	const identity = bashIdentity(args);
 	return {
-		title: theme.bold(phase ?? "bash"),
-		subtitle: `${detail}${timeout}`,
+		title: theme.bold(identity.activity ?? "bash"),
+		subtitle: `${command}${timeout}`,
 		glyph: identity.glyph,
 		titleRole: identity.titleRole,
+		railRole: identity.titleRole,
 		singleLine: !expanded,
 	};
+}
+
+/**
+ * The identity a bash call wears: the activity its own command names, or the
+ * generic `$ bash` fallback's. The heading and the rail its result continues are
+ * two halves of one card, so both derive it from the retained call the same way.
+ */
+function bashIdentity(args: Record<string, unknown>): { activity: BashCardActivity | undefined; glyph: string; titleRole: string } {
+	const command = asString(args.command);
+	const activity = command.length > 0 ? inferShellActivity(command) : undefined;
+	const identity = activity === undefined ? BASH_IDENTITY : SHELL_ACTIVITY_IDENTITY[activity];
+	return { activity, glyph: identity.glyph, titleRole: identity.titleRole };
 }
 
 /** The parts of a tool card heading: what it says, the mark that leads it, the theme role that paints it, and whether it must fit one row. */
@@ -588,6 +551,8 @@ interface ToolCardHeading {
 	subtitle?: string;
 	glyph: string;
 	titleRole?: string;
+	/** Theme role for the card's left rail; the bash card names its activity there, so the rail matches the label. */
+	railRole?: string;
 	singleLine?: boolean;
 }
 
@@ -832,7 +797,7 @@ class ToolCardTop implements Component {
 				body: running ? [cardRunningLine(this.tone, this.theme, inner)] : undefined,
 				bottom: running ? cardBottom(this.tone, this.theme, inner) : undefined,
 			};
-		}));
+		}, this.heading.railRole));
 	}
 
 	invalidate(): void { this.rows.invalidate(); }
@@ -848,10 +813,11 @@ class ToolCardBody implements Component {
 	private readonly elapsed: string | undefined;
 	private readonly row: CardRowContext | undefined;
 	private readonly reveal: CardReveal | undefined;
+	private readonly railRole: string | undefined;
 	/** What the last drawn frame showed; a card with nothing left keeps the click with the host. */
 	private showsMore = true;
 
-	constructor(inner: () => Component, tone: ToolTone, theme: CardTheme, cacheable = true, elapsed?: string, row?: CardRowContext, reveal?: CardReveal) {
+	constructor(inner: () => Component, tone: ToolTone, theme: CardTheme, cacheable = true, elapsed?: string, row?: CardRowContext, reveal?: CardReveal, railRole?: string) {
 		this.inner = inner;
 		this.tone = tone;
 		this.theme = theme;
@@ -859,6 +825,7 @@ class ToolCardBody implements Component {
 		this.elapsed = elapsed;
 		this.row = row;
 		this.reveal = reveal;
+		this.railRole = railRole;
 	}
 
 	/** A left click on the result rows toggles the card through the same state as its heading. */
@@ -878,7 +845,7 @@ class ToolCardBody implements Component {
 				bottom: cardBottom(this.tone, this.theme, inner, this.elapsed),
 				afterHeading: true,
 			};
-		});
+		}, this.railRole);
 		return this.cacheable ? this.rows.render(target, false, build) : build();
 	}
 
@@ -1013,7 +980,11 @@ export function createQuietToolRenderer(
 			const elapsed = toolName === "bash" ? cardElapsed(renderContext?.durationMs) : undefined;
 			const expanded = options.expanded;
 			const reveal = toolName === "bash" ? cardReveal(renderContext?.state) : undefined;
-			const carded = (component: () => Component, cacheable = options.isPartial !== true): Component => new ToolCardBody(component, resultTone, theme, cacheable, elapsed, renderContext, reveal);
+			// The result continues the heading's card, so a card whose heading names a rail
+			// keeps that rail — a bash activity's own role — derived from the same retained
+			// call and arguments.
+			const railRole = toolName === "bash" ? bashIdentity(renderContext?.args ?? {}).titleRole : undefined;
+			const carded = (component: () => Component, cacheable = options.isPartial !== true): Component => new ToolCardBody(component, resultTone, theme, cacheable, elapsed, renderContext, reveal, railRole);
 			// Under the minimal Card content preference, every quiet tool draws
 			// the command alone while collapsed; the expand key still reveals
 			// the full result. Failures keep their bounded error tail so a red

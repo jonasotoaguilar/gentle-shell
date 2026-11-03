@@ -67,12 +67,24 @@ function routineRenderContext(overrides: Record<string, unknown> = {}) {
 // helpers, and the quiet card tests assert the raw frame via frameLines.
 // A pending call's `running…` row is frame chrome too, asserted separately.
 const TAG = "(?:</?[a-zA-Z]+>)*";
-const CARD_TOP = new RegExp(`^${TAG}╭─ ${TAG}[✿≡$⌕⌖☷✎+⚿◎❖⚖▣✓◼]${TAG} (.*?) ${TAG}─+${TAG}(?: .*? )?${TAG}╮${TAG}$`);
+const CARD_TOP = new RegExp(`^${TAG}╭─ ${TAG}[✿≡$⌕⌖☷✎+⚿❖⚖▣✓◼⎇↑⚠⚒≋]${TAG} (.*?) ${TAG}─+${TAG}(?: .*? )?${TAG}╮${TAG}$`);
 const CARD_SIDE = new RegExp(`^${TAG}│${TAG} (.*) ${TAG}│${TAG}$`);
 const CARD_BOTTOM = new RegExp(`^${TAG}╰${TAG}─*${TAG}╯${TAG}$`);
 
 function frameLines(component: { render(width: number): string[] }, width = 120): string[] {
 	return component.render(width).map((line) => line.trimEnd());
+}
+
+/** HSL hue of a `#rrggbb` color, so a role can be asserted warm or green rather than merely different. */
+function hueOf(hex: string): number {
+	const match = /^#([0-9a-f]{6})$/i.exec(hex);
+	if (!match) throw new Error(`not a hex color: ${hex}`);
+	const [r, g, b] = [0, 2, 4].map((at) => parseInt(match[1].slice(at, at + 2), 16) / 255);
+	const max = Math.max(r, g, b);
+	const delta = max - Math.min(r, g, b);
+	if (delta === 0) return 0;
+	const hue = max === r ? ((g - b) / delta) % 6 : max === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
+	return (hue * 60 + 360) % 360;
 }
 
 const QUIET_CARD_COMPONENTS = new Set(["ToolCardTop", "ToolCardBody"]);
@@ -549,7 +561,11 @@ test("quiet tool rendering refuses to compact composed Gentle AI shell commands"
 		assert.equal(gentleAiRoutineCommand({ command }), undefined, command);
 		const call = renderToString(tools.get("bash").renderCall({ command }, passthroughTheme, {}));
 		const output = renderToString(tools.get("bash").renderResult(textResult("command output"), { expanded: true, isPartial: false }, passthroughTheme, { args: { command } }));
-		assert.equal(call.replace(/[ \t]+$/gm, "").trimEnd(), `bash · ${command.trimEnd().replace(/\n/g, " ")}`);
+		const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		// The card still never compacts the composition: it keeps the tool's own
+		// identity, or the deletion it also runs, and the whole command after it.
+		const heading = call.replace(/[ \t]+$/gm, "").trimEnd();
+		assert.ok(new RegExp(`^(bash|destructive) · ${escapeRegExp(command.trimEnd().replace(/\n/g, " "))}$`).test(heading), `${command} renders ${JSON.stringify(heading)}`);
 		assert.match(output, /command output/);
 	}
 });
@@ -987,6 +1003,10 @@ test("quiet tool rendering keeps collapsed git bash result tails", () => {
 
 	assert.equal(formatToolResultOutput("bash", textResult(text) as any, { expanded: false, args: { command: "git diff" } }), `\n${tailLines(text, 10)}`);
 	assert.equal(formatToolResultOutput("bash", textResult(text) as any, { expanded: false, args: { command: "git status --short" } }), `\n${tailLines(text, 10)}`);
+	// Publishing is not versioning: a push keeps the tail preview it always had, and
+	// so does a call whose segments the classifier cannot all name.
+	assert.equal(formatToolResultOutput("bash", textResult(text) as any, { expanded: false, args: { command: "git push origin main" } }), `\n${tailLines(text, 10)}`);
+	assert.equal(formatToolResultOutput("bash", textResult(text) as any, { expanded: false, args: { command: "git commit -m x && git push" } }), `\n${tailLines(text, 10)}`);
 });
 
 test("quiet tool rendering keeps concise collapsed edit and write summaries", () => {
@@ -1092,6 +1112,15 @@ test("quiet tool rendering call rows show tool calls without result output", () 
 	assert.match(bashCall, /bash · printf noisy \(timeout 5s\)/);
 	assert.match(grepCall, /grep \/needle\/ in src \(\*\.ts\)/);
     });
+
+// A call that touches a skill or an ODD artifact heads as that file instead of
+// as a plain tool row: the same card, with the file kind's own name, mark and
+// color, and the range it reads or writes beside the path.
+// A card's heading text, mark included: the raw top rule, read the way the
+// transcript paints it.
+function callCardTitle(tool: any, args: Record<string, unknown>, theme: any = passthroughTheme): string {
+	return cardTitle(tool.renderCall(args, theme, {}).render(120).join("\n"));
+}
 
 test("quiet tool rendering limits collapsed visual rows at the actual width", () => {
 	const tools = registeredQuietTools();
@@ -1476,61 +1505,128 @@ test("bash cards head with the ODD phase their command implies and keep the call
 
 	// The phase names the card, its own mark leads it, and the command rides beside it.
 	for (const [command, phase, glyph] of [
-		["git status --short", "exploring", "◎"],
-		["ls -la src", "exploring", "◎"],
+		["git status --short", "exploring", "⌕"],
+		["ls -la src", "exploring", "⌕"],
 		// A verification runner checks, even alongside inspection.
 		["pnpm test", "checking", "✓"],
-		// A composition names the segment that decided its phase.
+		// A composition keeps its whole command, and its phase still names the card.
 		["git log --oneline && pnpm test", "checking", "✓"],
 	] as const) {
-		const detail = command === "git log --oneline && pnpm test" ? "pnpm test" : command;
-		assert.match(header({ command }), new RegExp(`^╭─ ${glyph} ${phase} · ${escape(detail)} ─+╮$`), command);
+		assert.match(header({ command }), new RegExp(`^╭─ ${glyph} ${phase} · ${escape(command)} ─+╮$`), command);
 	}
 
 	// Each label paints itself in its own color while the frame keeps the call's status.
-	assert.match(header({ command: "git status" }, statusTheme), /^<warning>╭<\/warning>.*<mdLink>◎ exploring<\/mdLink>/);
+	assert.match(header({ command: "git status" }, statusTheme), /^<warning>╭<\/warning>.*<mdLink>⌕ exploring<\/mdLink>/);
 	assert.match(header({ command: "pnpm test" }, statusTheme), /<mdHeading>✓ checking<\/mdHeading>/);
 	// The timeout chip stays part of the call detail.
 	assert.match(header({ command: "git status", timeout: 5 }), /· git status \(timeout 5s\) ─+╮$/);
 });
 
-test("bash cards name the principal action of a shell composition", () => {
-	const bash = registeredQuietTools().get("bash");
-	const heading = (command: string) => frameLines(bash.renderCall({ command }, passthroughTheme, routineRenderContext({ args: { command } })), 120)[0] ?? "";
+// A float-capable theme that still tells theme roles apart: the accent bar's own
+// role is what the rail tests read, and the float panel needs a real background
+// reset to paint at all.
+const RAIL_FG: Record<string, number> = { mdLink: 111, mdHeading: 178, bashMode: 114, warning: 221, success: 114, error: 203, muted: 245, toolTitle: 114, accent: 114, toolOutput: 245 };
+const phaseRailTheme = {
+	bold(value: string) {
+		return value;
+	},
+	fg(color: string, value: string) {
+		return `\x1b[38;5;${RAIL_FG[color] ?? 250}m${value}\x1b[39m`;
+	},
+	bg(color: string, value: string) {
+		return `\x1b[48;5;${color === "toolErrorBg" ? 52 : color === "toolPendingBg" ? 58 : 22}m${value}\x1b[49m`;
+	},
+};
 
-	assert.match(heading("git status"), /^╭─ ◎ exploring · git status ─+╮$/, "a single command has nothing to abbreviate");
-	assert.match(heading("cd repo && git diff"), /^╭─ ◎ exploring · git diff ─+╮$/, "the neutral segment is dropped");
-	assert.match(heading("git log --oneline && pnpm test"), /^╭─ ✓ checking · pnpm test ─+╮$/, "checking names the runner that decided it");
-	assert.match(heading("npx vitest run src"), /^╭─ ✓ checking · npx vitest run src ─+╮$/);
-	// An unreadable composition keeps the whole command instead of guessing at it.
-	assert.match(heading('git diff "$(cat list.txt)"'), /^╭─ ◎ exploring · git diff "\$\(cat list\.txt\)" ─+╮$/);
+test("a bash card's left rail carries the phase's own color while the frame keeps the call's status", () => {
+	const bash = registeredQuietTools().get("bash");
+	const args = { command: "git status" };
+	// Running: the frame is the pending tone and the rail already belongs to the phase.
+	const running = frameLines(bash.renderCall(args, statusTheme, routineRenderContext({ args, state: {} })), 80);
+	assert.match(running[0]!, /^<warning>╭<\/warning>.*<mdLink>⌕ exploring<\/mdLink>/);
+	assert.match(running[1]!, /^<mdLink>│<\/mdLink> .*<warning>│<\/warning>$/, "the left rail matches the label, the right rail the status");
+	assert.match(running.at(-1)!, /^<warning>╰<\/warning>/);
+
+	// Finished, the status turns success and the rail keeps the phase color; failed,
+	// the frame turns red for the same rail.
+	const finished = frameLines(bash.renderResult(textResult("clean"), { expanded: false, isPartial: false }, statusTheme, routineRenderContext({ args, executionStarted: true, isPartial: false, state: {} })), 80);
+	assert.match(finished[0]!, /^<mdLink>│<\/mdLink> /);
+	assert.match(finished.at(-1)!, /^<success>╰<\/success>/);
+
+	const failed = frameLines(bash.renderResult(textResult("boom"), { expanded: false, isPartial: false, isError: true }, statusTheme, routineRenderContext({ args, executionStarted: true, isPartial: false, isError: true, state: {} })), 80);
+	assert.match(failed[0]!, /^<mdLink>│<\/mdLink> /);
+	assert.match(failed.at(-1)!, /^<error>╰<\/error>/);
+
+	// A checking phase keeps its own color, and the generic fallback its own, so
+	// the rail never claims a phase the heading does not name.
+	const checking = frameLines(bash.renderCall({ command: "pnpm test" }, statusTheme, routineRenderContext({ args: { command: "pnpm test" }, state: {} })), 80);
+	assert.match(checking[1]!, /^<mdHeading>│<\/mdHeading> /);
+	const generic = frameLines(bash.renderCall({ command: "printf output" }, statusTheme, routineRenderContext({ args: { command: "printf output" }, state: {} })), 80);
+	assert.match(generic[1]!, /^<bashMode>│<\/bashMode> /);
+
+	// Every other quiet tool keeps the rail it always had: the tone, not a phase.
+	const read = registeredQuietTools().get("read");
+	const readRows = frameLines(read.renderCall({ path: "a.md" }, statusTheme, routineRenderContext({ args: { path: "a.md" }, state: {} })), 80);
+	assert.match(readRows[1]!, /^<warning>│<\/warning> /, "a non-phase tool never borrows a phase color");
+
+	// The float style draws one continuous bar, so every row takes the rail color
+	// while its background tint keeps stating the status.
+	const floated = withFloatCards(() => [
+		...bash.renderCall(args, phaseRailTheme, routineRenderContext({ args, state: {} })).render(40),
+		...bash.renderResult(textResult("clean"), { expanded: false, isPartial: false }, phaseRailTheme, routineRenderContext({ args, executionStarted: true, isPartial: false, state: {} })).render(40),
+	]);
+	assert.ok(floated.length > 4);
+	for (const row of floated) {
+		assert.equal(visibleWidth(row), 40);
+		assert.ok(row.includes("\x1b[38;5;111m▎"), `every bar cell keeps the rail color: ${JSON.stringify(row)}`);
+	}
 });
 
-test("a composition with a consequential extra action keeps the whole command", () => {
+test("a bash card heads with the complete command its composition runs", () => {
 	const bash = registeredQuietTools().get("bash");
-	const heading = (command: string) => frameLines(bash.renderCall({ command }, passthroughTheme, routineRenderContext({ args: { command } })), 120)[0] ?? "";
+	const heading = (command: string) => frameLines(bash.renderCall({ command }, passthroughTheme, routineRenderContext({ args: { command } })), 160)[0] ?? "";
 
-	// A mutation or an unknown program must never be hidden behind a test run.
-	assert.match(heading("pnpm test && rm -rf dist"), /✓ checking · pnpm test && rm -rf dist/);
-	assert.match(heading("pnpm test && npm install"), /✓ checking · pnpm test && npm install/);
-	// A mutation makes the whole command ambiguous, so it is generic and shows all of it.
-	assert.match(heading("git status && node scripts/deploy.mjs"), /\$ bash · git status && node scripts\/deploy\.mjs/);
+	// The phase is inferred from the composition, but the detail is the command
+	// itself: no segment is ever dropped or shortened into a substitute.
+	assert.match(heading("git status"), /^╭─ ⌕ exploring · git status ─+╮$/, "a single command is its own detail");
+	assert.match(heading("cd repo && git diff"), /^╭─ ⌕ exploring · cd repo && git diff ─+╮$/, "a neutral segment is never dropped");
+	assert.match(heading("git log --oneline && pnpm test"), /^╭─ ✓ checking · git log --oneline && pnpm test ─+╮$/, "the runner that decided the phase keeps its neighbours");
+	assert.match(heading("npx vitest run src"), /^╭─ ✓ checking · npx vitest run src ─+╮$/);
 
-	// A redirection in an otherwise neutral segment writes a file: show everything.
-	assert.match(heading("pnpm test && echo ok > out.txt"), /✓ checking · pnpm test && echo ok > out\.txt/);
-	assert.match(heading("pnpm test; echo done >> test.log"), /✓ checking · pnpm test; echo done >> test\.log/);
+	// A consequential or unreadable segment is part of the command, not a reason to
+	// abbreviate it: everything the call runs stays visible, a deletion names the
+	// card, and a segment nothing can name keeps the card generic rather than
+	// claiming the check that ran beside it (the working label still follows it).
+	assert.match(heading("pnpm test && rm -rf dist"), /⚠ destructive · pnpm test && rm -rf dist ─+/);
+	assert.match(heading("pnpm test && echo ok > out.txt"), /^╭─ \$ bash · pnpm test && echo ok > out\.txt ─+╮$/);
+	assert.match(heading("pnpm test && echo done | tee log.txt"), /^╭─ \$ bash · pnpm test && echo done \| tee log\.txt ─+╮$/);
+	assert.match(heading("git status || pnpm test"), /✓ checking · git status \|\| pnpm test ─+/);
+	assert.match(heading('git diff "$(cat list.txt)"'), /^╭─ ⌕ exploring · git diff "\$\(cat list\.txt\)" ─+╮$/);
 
-	// A pipeline routes output into another program, so no part of it is the whole story.
-	assert.match(heading("pnpm test && echo done | tee log.txt"), /✓ checking · pnpm test && echo done \| tee log\.txt/);
-	assert.match(heading("git status || pnpm test"), /✓ checking · git status \|\| pnpm test/);
+	// A composition no single phase labels keeps the generic identity and all of it.
+	assert.match(heading("git status && node scripts/deploy.mjs"), /^╭─ \$ bash · git status && node scripts\/deploy\.mjs ─+╮$/);
+});
 
-	// Harmless no-ops may still be skipped, and the preserved cases stay abbreviated.
-	assert.match(heading("pnpm test && echo done"), /✓ checking · pnpm test ─+/);
-	assert.match(heading("git log --oneline && pnpm test"), /✓ checking · pnpm test ─+/);
-	assert.match(heading("cd repo && git diff"), /◎ exploring · git diff ─+/);
-	// Discarded output and stream merges are not writes, so they may still be skipped.
-	assert.match(heading("pnpm test && echo ok 2>/dev/null"), /✓ checking · pnpm test ─+/);
-	assert.match(heading("cd repo && echo ok 2>&1"), /\$ bash|◎ exploring|✓ checking/);
+test("a wide bash command collapses to one ellipsized row and expands to the whole command", () => {
+	const bash = registeredQuietTools().get("bash");
+	const command = "git log --oneline --decorate --graph --all && pnpm --filter packages/app test -- --runInBand";
+	const width = 72;
+	const context = (expanded: boolean) => routineRenderContext({ args: { command }, executionStarted: true, isPartial: false, expanded });
+
+	const collapsed = frameLines(bash.renderCall({ command }, passthroughTheme, context(false)), width);
+	assert.equal(collapsed.length, 1, "the collapsed heading stays one row");
+	assert.ok(collapsed[0]!.includes("✓ checking"), collapsed[0]);
+	assert.ok(collapsed[0]!.includes("…"), `an over-wide command ends in an ellipsis: ${collapsed[0]}`);
+	assert.ok(!collapsed[0]!.includes("--runInBand"), `the collapsed row never keeps one segment instead of the command: ${collapsed[0]}`);
+	assert.ok(visibleWidth(collapsed[0]!) <= width);
+
+	// Expanded, the same command is complete across the rows below the rule.
+	const expanded = frameLines(bash.renderCall({ command }, passthroughTheme, context(true)), width);
+	assert.ok(expanded.length > 1, "the complete command continues below the rule");
+	const shown = expanded.map((row) => stripAnsi(row).replace(/[│╭╮╰╯]/g, " ").replace(/─+/g, " ")).join(" ").replace(/\s+/g, " ").trim();
+	assert.ok(shown.includes(command), `expanded rows carry the whole command: ${shown}`);
+	assert.ok(!shown.includes("…"), "expanding removes the ellipsis");
+	assert.ok(expanded.every((row) => visibleWidth(row) <= width));
 });
 
 test("the elapsed time rides the closing rule when the host reports it", () => {
@@ -1553,32 +1649,289 @@ test("a command with no inferable phase heads as the generic bash card", () => {
 		frameLines(bash.renderCall(args, theme, routineRenderContext({ args })), 120)[0] ?? "";
 
 	// Ambiguous commands keep the generic bash identity: its mark, its title, its color.
-	for (const command of ["printf output", "rm -rf build", "node scripts/release.mjs"]) {
+	for (const command of ["printf output", "node scripts/release.mjs", "make install"]) {
 		const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		assert.match(header({ command }), new RegExp(`^╭─ \\$ bash · ${escaped} ─+╮$`), command);
 	}
 	assert.match(header({ command: "printf output" }, statusTheme), /<bashMode>\$ bash<\/bashMode>/);
 });
 
-test("only the phases a bash command can produce carry a card style", async () => {
-	const { PHASE_IDENTITY, BASH_IDENTITY } = await import("../extensions/quiet-tools.ts") as any;
-	const { inferOddPhase } = await import("../lib/odd-phase-inference.ts");
-	const { ODD_PHASES } = await import("../lib/odd-phase.ts");
-	// Evidence for the narrow table: shell inference can only return these two.
-	const reachable = new Set<string>();
-	for (const command of ["git status", "ls -la", "pnpm test", "npx vitest run", "rm -rf build", "node x.mjs", "printf hi"]) {
-		const phase = inferOddPhase("bash", { command });
-		if (phase) reachable.add(phase);
-	}
-	assert.deepEqual([...reachable].sort(), ["checking", "exploring"]);
-	assert.deepEqual(Object.keys(PHASE_IDENTITY).sort(), [...reachable].sort(), "the card styles exactly the reachable phases");
-	assert.deepEqual(Object.keys(PHASE_IDENTITY).filter((phase) => !(ODD_PHASES as readonly string[]).includes(phase)), []);
-	const marks = Object.values(PHASE_IDENTITY).map((identity: any) => identity.glyph);
-	assert.equal(new Set(marks).size, 2, "each reachable phase has its own mark");
-	const roles = Object.values(PHASE_IDENTITY).map((identity: any) => identity.titleRole);
-	assert.equal(new Set(roles).size, 2, "each reachable phase has its own color");
-	assert.notEqual(BASH_IDENTITY.titleRole, PHASE_IDENTITY.exploring.titleRole, "the generic fallback is never a phase look");
+test("bash cards follow the widened check and metadata-probe families", () => {
+	const bash = registeredQuietTools().get("bash");
+	const heading = (command: string) => frameLines(bash.renderCall({ command }, passthroughTheme, routineRenderContext({ args: { command } })), 120)[0] ?? "";
+
+	// A workspace-flagged runner is still the check that decided the phase.
+	assert.match(heading("pnpm -C packages/app test"), /^╭─ ✓ checking · pnpm -C packages\/app test ─+╮$/);
+	// A namespaced script keeps its base family, so it still heads as a check.
+	assert.match(heading("pnpm run test:unit"), /^╭─ ✓ checking · pnpm run test:unit ─+╮$/);
+	// A metadata probe heads as inspection, and a pipeline is never abbreviated.
+	assert.match(heading("locale | head -4"), /^╭─ ⌕ exploring · locale \| head -4 ─+╮$/);
+	// A recipe this classifier cannot name keeps the generic identity.
+	assert.match(heading("make install"), /^╭─ \$ bash · make install ─+╮$/);
+	assert.match(heading("make -j install"), /^╭─ \$ bash · make -j install ─+╮$/);
+	// A hidden substitution is unreadable, so it stays generic rather than inspection.
+	assert.match(heading("git log --oneline `git rev-parse HEAD`"), /^╭─ \$ bash · git log --oneline `git rev-parse HEAD` ─+╮$/);
 });
+
+test("every activity a bash command can imply carries its own card style", async () => {
+	const { BASH_IDENTITY } = await import("../extensions/quiet-tools.ts") as any;
+	const { SHELL_ACTIVITIES, SHELL_ACTIVITY_IDENTITY, inferShellActivity } = await import("../lib/odd-phase-inference.ts");
+	const { ODD_PHASES } = await import("../lib/odd-phase.ts");
+	// Evidence for the table: every activity the classifier can name is styled, and
+	// a command it cannot name leaves the card generic.
+	const reachable = new Set<string>();
+	for (const command of [
+		"git status", "ls -la", "pnpm test", "git commit -m x", "git push", "gh stack submit",
+		"pnpm install", "prettier --write .", "rm -rf build", "node x.mjs",
+		"docker system prune -af", "kubectl delete pod web", "git push --delete origin feat/x",
+	]) {
+		const activity = inferShellActivity(command);
+		if (activity) reachable.add(activity);
+	}
+	assert.deepEqual([...reachable].sort(), ["checking", "destructive", "exploring", "formatting", "preparing", "publishing", "versioning"]);
+	assert.deepEqual(Object.keys(SHELL_ACTIVITY_IDENTITY).sort(), [...SHELL_ACTIVITIES].sort(), "the card styles exactly the activities the classifier names");
+	assert.deepEqual(Object.keys(SHELL_ACTIVITY_IDENTITY).sort(), [...reachable].sort());
+	// Two of them are ODD phases; the rest are card identities, so the global phase
+	// enum keeps its eight labels.
+	assert.deepEqual(Object.keys(SHELL_ACTIVITY_IDENTITY).filter((activity) => (ODD_PHASES as readonly string[]).includes(activity)).sort(), ["checking", "exploring"]);
+	for (const identity of ["versioning", "publishing", "preparing", "formatting", "destructive"]) {
+		assert.equal((ODD_PHASES as readonly string[]).includes(identity), false, identity);
+	}
+	const marks = Object.values(SHELL_ACTIVITY_IDENTITY).map((identity: any) => identity.glyph);
+	assert.equal(new Set(marks).size, 7, "each activity has its own mark");
+	// A mark is one cell, or one cell plus the single-column gap it carries so a font
+	// that paints it two cells wide cannot swallow the word beside it.
+	for (const mark of marks) {
+		const glyph = mark.trimEnd();
+		assert.equal(visibleWidth(glyph), 1, `${glyph} is one cell wide, so the heading's width math holds`);
+		assert.ok(visibleWidth(mark) <= 2, `${mark} carries at most the one gap column it needs`);
+		assert.equal(mark.length - glyph.length, visibleWidth(mark) - 1, `${mark}: the gap is the whole extra width`);
+	}
+	// The theme has six slots a heading can wear, so the two maintenance identities —
+	// installing and reformatting — share the code palette and are told apart by their
+	// mark and their word rather than by a seventh colour no shipped theme defines.
+	const roles = Object.values(SHELL_ACTIVITY_IDENTITY).map((identity: any) => identity.titleRole);
+	assert.equal(new Set(roles).size, 6, "six theme slots, one per distinguishable colour");
+	assert.equal(SHELL_ACTIVITY_IDENTITY.formatting.titleRole, SHELL_ACTIVITY_IDENTITY.preparing.titleRole);
+	assert.notEqual(SHELL_ACTIVITY_IDENTITY.formatting.glyph, SHELL_ACTIVITY_IDENTITY.preparing.glyph);
+	for (const role of new Set(roles)) assert.notEqual(role, BASH_IDENTITY.titleRole, "the generic fallback is never an activity look");
+	// A role has to exist in every shipped theme and stay tellable apart inside it,
+	// or a card would paint an identity that reads as another one. Versioning wears
+	// the theme's warm slot, so it reads orange wherever the theme says orange, and
+	// publishing wears its green slot: the exact emerald value is the theme's own
+	// call — Gentleman-Sexy's success slot is a cool grey — and never hardcoded here.
+	const { readFile } = await import("node:fs/promises");
+	const { fileURLToPath } = await import("node:url");
+	assert.equal(SHELL_ACTIVITY_IDENTITY.versioning.titleRole, "warning");
+	assert.equal(SHELL_ACTIVITY_IDENTITY.publishing.titleRole, "success");
+	for (const name of ["Gentle", "Gentleman-Cute", "Gentleman-Sexy"]) {
+		const path = fileURLToPath(new URL(`../themes/${name}.json`, import.meta.url));
+		const theme = JSON.parse(await readFile(path, "utf8"));
+		const resolve = (role: string) => {
+			assert.ok(Object.hasOwn(theme.colors, role), `${name} defines ${role}`);
+			const value: string = theme.colors[role];
+			return theme.vars?.[value] ?? value;
+		};
+		const colors = roles.map((role: string) => resolve(role));
+		assert.equal(new Set(colors).size, 6, `${name}: ${roles.join(", ")} resolve to six distinct colors, one per mark`);
+		// The destructive identity wears the theme's own error slot, so a deletion reads
+		// red wherever the theme says red.
+		assert.equal(resolve(SHELL_ACTIVITY_IDENTITY.destructive.titleRole), resolve("error"), `${name}: destructive wears the error slot`);
+		// The warm slot is a warm hue in every shipped theme, which is what makes the
+		// versioning card read orange rather than merely different.
+		const hue = hueOf(resolve(SHELL_ACTIVITY_IDENTITY.versioning.titleRole));
+		assert.ok(hue >= 20 && hue <= 60, `${name}: versioning resolves to ${colors[roles.indexOf("warning")]} at hue ${hue}, a warm orange`);
+	}
+});
+
+test("bash cards head local history and remote writes with their own identity", () => {
+	const bash = registeredQuietTools().get("bash");
+	const header = (args: Record<string, unknown>, theme: any = passthroughTheme) =>
+		frameLines(bash.renderCall(args, theme, routineRenderContext({ args })), 120)[0] ?? "";
+	const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+	// The versioning and publishing identities name their own commands, marks and
+	// colours; exploring and checking keep theirs.
+	for (const [command, activity, glyph] of [
+		["git add -A && git commit -m 'feat: x'", "versioning", "⎇"],
+		["git commit --amend --no-edit", "versioning", "⎇"],
+		["gh stack add feat/two", "versioning", "⎇"],
+		["git push origin main", "publishing", "↑"],
+		["gh pr create --title x", "publishing", "↑"],
+		["gh issue edit 7 --add-label bug", "publishing", "↑"],
+		["gh stack submit --auto", "publishing", "↑"],
+		["gh stack view", "exploring", "⌕"],
+	] as const) {
+		assert.match(header({ command }), new RegExp(`^╭─ ${glyph} ${activity} · ${escape(command)} ─+╮$`), command);
+	}
+
+	// The label and the rail it leads carry the activity's own role, while the
+	// frame keeps the call's status.
+	assert.match(header({ command: "git commit -m x" }, statusTheme), /^<warning>╭<\/warning>.*<warning>⎇ versioning<\/warning>/);
+	assert.match(header({ command: "git push" }, statusTheme), /<success>↑ publishing<\/success>/);
+	const railed = (command: string) => frameLines(bash.renderCall({ command }, statusTheme, routineRenderContext({ args: { command }, state: {} })), 80)[1] ?? "";
+	assert.match(railed("git commit -m x"), /^<warning>│<\/warning> /, "the versioning rail matches its label");
+	assert.match(railed("git push"), /^<success>│<\/success> /, "the publishing rail matches its label");
+
+	// A command the classifier cannot name still keeps the generic identity, and a
+	// help flag names the query it is rather than the mutation its verb would do.
+	assert.match(header({ command: "gh stack checkout" }), /^╭─ \$ bash · gh stack checkout ─+╮$/);
+	assert.match(header({ command: "git prune --help" }), /^╭─ ⌕ exploring · git prune --help ─+╮$/);
+
+	// A help flag an option consumed is its value, not a query: the commit and the
+	// comment keep their own activity, while the card still shows the whole command.
+	assert.match(header({ command: "git commit -m --help" }), /^╭─ ⎇ versioning · git commit -m --help ─+╮$/);
+	assert.match(header({ command: "gh issue comment 7 --body --help" }), /^╭─ ↑ publishing · gh issue comment 7 --body --help ─+╮$/);
+	// Escaped whitespace joins the value, so the flag inside it is never a query;
+	// a value that ends before the help flag leaves a genuine one.
+	assert.match(header({ command: "git commit -m foo\\ --help" }), /^╭─ ⎇ versioning · git commit -m foo\\ --help ─+╮$/);
+	assert.match(header({ command: "git commit -m foo\\ bar --help" }), /^╭─ ⌕ exploring · git commit -m foo\\ bar --help ─+╮$/);
+	// A quoted `>` is the program's argument, not a redirect into a file.
+	assert.match(header({ command: `git commit -m "fix: a > b"` }), /^╭─ ⎇ versioning · git commit -m "fix: a > b" ─+╮$/);
+	assert.match(header({ command: "cat src/a > out" }), /^╭─ \$ bash · cat src\/a > out ─+╮$/);
+});
+
+test("bash cards head preparation, reformatting and deletion with their own identity", () => {
+	const bash = registeredQuietTools().get("bash");
+	const header = (args: Record<string, unknown>, theme: any = passthroughTheme) =>
+		frameLines(bash.renderCall(args, theme, routineRenderContext({ args })), 120)[0] ?? "";
+	const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+	// Installing, scaffolding and stored configuration head as preparing; file
+	// creation and a formatter or a lint fixer head as their own identities; a
+	// deletion heads as destructive. The last column is the gap the mark itself
+	// carries for a font that paints it two cells wide: preparing's hammer and pick
+	// needs one, and every one-cell mark already shows the separator beside it.
+	for (const [command, activity, glyph, gap] of [
+		["pnpm install", "preparing", "⚒", 1],
+		["mkdir -p tmp/scratch", "preparing", "⚒", 1],
+		["git config user.name 'A B'", "preparing", "⚒", 1],
+		["prettier --write .", "formatting", "≋", 0],
+		["eslint . --fix", "formatting", "≋", 0],
+		["cargo fmt", "formatting", "≋", 0],
+		["rm -rf build", "destructive", "⚠", 0],
+		["rm -f logo.png", "destructive", "⚠", 0],
+		["git reset --hard HEAD~1", "destructive", "⚠", 0],
+	] as const) {
+		assert.match(header({ command }), new RegExp(`^╭─ ${glyph}${" ".repeat(1 + gap)}${activity} · ${escape(command)} ─+╮$`), command);
+	}
+
+	// The label and the rail it leads wear the activity's own role: a deletion is
+	// red wherever the theme says red, and the frame still states the call's state.
+	assert.match(header({ command: "rm -rf build" }, statusTheme), /<error>⚠ destructive<\/error>/);
+	assert.match(header({ command: "pnpm install" }, statusTheme), /<syntaxFunction>⚒ {2}preparing<\/syntaxFunction>/);
+	assert.match(header({ command: "prettier --write ." }, statusTheme), /<syntaxFunction>≋ formatting<\/syntaxFunction>/);
+	const railed = (command: string) => frameLines(bash.renderCall({ command }, statusTheme, routineRenderContext({ args: { command }, state: {} })), 80)[1] ?? "";
+	assert.match(railed("rm -rf build"), /^<error>│<\/error> /, "the destructive rail matches its label");
+	assert.match(railed("pnpm install"), /^<syntaxFunction>│<\/syntaxFunction> /, "the preparing rail matches its label");
+
+	// A deletion outranks every other identity on the same call, so the card never
+	// hides the one thing the call cannot undo — including one a shell payload, a
+	// pipeline, a container or a cluster command carries.
+	assert.match(header({ command: "pnpm test && rm -rf dist" }), /^╭─ ⚠ destructive · pnpm test && rm -rf dist ─+╮$/);
+	assert.match(header({ command: "git push && rm -rf dist" }), /^╭─ ⚠ destructive · git push && rm -rf dist ─+╮$/);
+	assert.match(header({ command: "rm -rf dist && git commit -m x" }), /^╭─ ⚠ destructive · rm -rf dist && git commit -m x ─+╮$/);
+	assert.match(header({ command: "docker system prune -af" }), /^╭─ ⚠ destructive · docker system prune -af ─+╮$/);
+	assert.match(header({ command: "kubectl delete pod web" }), /^╭─ ⚠ destructive · kubectl delete pod web ─+╮$/);
+	assert.match(header({ command: "git push --delete origin feat/x" }), /^╭─ ⚠ destructive · git push --delete origin feat\/x ─+╮$/);
+	assert.match(header({ command: "psql -c 'DROP TABLE t'" }), /^╭─ ⚠ destructive · psql -c 'DROP TABLE t' ─+╮$/);
+	assert.match(header({ command: "nice -n 5 rm -f logo.png" }), /^╭─ ⚠ destructive · nice -n 5 rm -f logo\.png ─+╮$/);
+	assert.match(header({ command: "env FOO=bar rm -rf dist" }), /^╭─ ⚠ destructive · env FOO=bar rm -rf dist ─+╮$/);
+	assert.match(header({ command: "git checkout ." }), /^╭─ ⚠ destructive · git checkout \. ─+╮$/);
+	// A branch checkout keeps the working tree, so it claims nothing.
+	assert.match(header({ command: "git checkout main" }), /^╭─ \$ bash · git checkout main ─+╮$/);
+
+	// A check beside a segment nothing can name keeps the card generic: the heading
+	// never claims a verification the call did not only do.
+	assert.match(header({ command: "pnpm test && node scripts/release.mjs" }), /^╭─ \$ bash · pnpm test && node scripts\/release\.mjs ─+╮$/);
+
+	// The exemptions keep the identity the call really has: usage is a query, a dry
+	// run and a recovery change nothing this card would warn about, and quoted prose
+	// is prose.
+	assert.match(header({ command: "rm --help" }), /^╭─ ⌕ exploring · rm --help ─+╮$/);
+	assert.match(header({ command: "git clean --help" }), /^╭─ ⌕ exploring · git clean --help ─+╮$/);
+	assert.match(header({ command: "git clean -fd --help" }), /^╭─ \$ bash · git clean -fd --help ─+╮$/, "a help flag behind a flag-like word is its value, so nothing is claimed");
+	assert.match(header({ command: "git clean -n" }), /^╭─ \$ bash · git clean -n ─+╮$/);
+	assert.match(header({ command: "kubectl delete --dry-run=client pod web" }), /^╭─ \$ bash · kubectl delete --dry-run=client pod web ─+╮$/);
+	assert.match(header({ command: "git restore --staged lib/a.ts" }), /^╭─ \$ bash · git restore --staged lib\/a\.ts ─+╮$/);
+	assert.match(header({ command: "git push --dry-run" }), /^╭─ ↑ publishing · git push --dry-run ─+╮$/);
+	assert.match(header({ command: `git commit -m "git reset --hard"` }), /^╭─ ⎇ versioning · git commit -m "git reset --hard" ─+╮$/);
+
+	// `git config <key>` reports a stored value, so it is inspection; only a written
+	// value is preparation.
+	assert.match(header({ command: "git config user.name" }), /^╭─ ⌕ exploring · git config user\.name ─+╮$/);
+	assert.match(header({ command: "git config user.name 'A B'" }), /^╭─ ⚒ {2}preparing · git config user\.name 'A B' ─+╮$/);
+
+	// The read-only half of a formatter stays the check it is.
+	assert.match(header({ command: "prettier --check ." }), /^╭─ ✓ checking · prettier --check \. ─+╮$/);
+	assert.match(header({ command: "eslint . --fix-dry-run" }), /^╭─ ✓ checking · eslint \. --fix-dry-run ─+╮$/);
+	// A verification runner behind a watchdog is still the check it bounds.
+	assert.match(header({ command: "timeout 900 pnpm typecheck 2>&1 | tail -20" }), /^╭─ ✓ checking · timeout 900 pnpm typecheck 2>&1 \| tail -20 ─+╮$/);
+});
+
+// An emoji-fallback font paints U+2692 two cells wide while the terminal advances a
+// single column, so the mark's ink covers the cell after it and a one-space gap is
+// painted inside the glyph itself: the card read `⚒preparing`. The mark therefore
+// carries its own gap, the way the Messaging card's envelope does, and one column
+// always shows at every width in both card styles. The terminal still advances the
+// columns pi-tui counted, so the row's width is unchanged either way.
+const WIDE_INK_MARKS = new Set(["⚒"]);
+
+/** Blank columns that survive the mark's one-cell overhang, i.e. what the eye sees. */
+function visibleGapAfter(row: string, mark: string): number {
+	const cells = [...row];
+	const at = cells.indexOf(mark);
+	if (at < 0) return 0;
+	let spaces = 0;
+	for (let index = at + 1; index < cells.length && cells[index] === " "; index += 1) spaces += 1;
+	return Math.max(0, spaces - (WIDE_INK_MARKS.has(mark) ? 1 : 0));
+}
+
+test("a preparing card keeps one visible column after its mark in both card styles", () => {
+	const bash = registeredQuietTools().get("bash");
+	const command = "pnpm install";
+	const callAt = (style: (typeof CARD_STYLE)[keyof typeof CARD_STYLE], width: number) => {
+		const previous = cardStyle();
+		setCardStyle(style);
+		try {
+			return bash.renderCall({ command }, floatToolTheme, routineRenderContext({ args: { command }, state: {} })).render(width);
+		} finally {
+			setCardStyle(previous);
+		}
+	};
+	for (const style of [CARD_STYLE.NEON, CARD_STYLE.FLOAT] as const) {
+		// The heading row: the top rule outlined, the row below the padding row floated.
+		const headingAt = (width: number) => stripAnsi(callAt(style, width)[style === CARD_STYLE.FLOAT ? 1 : 0] ?? "");
+		for (const width of [20, 24, 40, 60, 120]) {
+			const row = headingAt(width);
+			assert.match(row, /⚒ {2}preparing/, `${style} at ${width}: ${JSON.stringify(row)}`);
+			if (width >= 40) assert.match(row, /⚒ {2}preparing · pnpm install/, `${style} at ${width}: the detail keeps its own column`);
+			assert.doesNotMatch(row, /⚒\S/u, `${style} at ${width}: the mark never joins its word`);
+			assert.equal(visibleGapAfter(row, "⚒"), 1, `${style} at ${width}: ${JSON.stringify(row)} shows one column, not the gap the font paints over`);
+			for (const drawn of callAt(style, width)) {
+				const plain = stripAnsi(drawn);
+				assert.equal(visibleWidth(plain), width, `${style} at ${width}: "${plain}" keeps the card width`);
+			}
+		}
+		// A heading cut down to the mark still never joins the next word: the gap is
+		// part of the mark, so truncation takes the whole gap or nothing.
+		for (const width of [10, 12, 14]) {
+			const row = headingAt(width);
+			assert.doesNotMatch(row, /⚒\S/u, `${style} at ${width}: ${JSON.stringify(row)}`);
+			assert.equal(visibleWidth(row), width, `${style} at ${width}: the card still closes at its width`);
+		}
+	}
+});
+
+// A payload's own JSON escapes are text, not bytes: nothing here decodes a payload
+// into a layout of its own, so the escape stays the characters the call printed and
+// no control byte can be drawn from one.
+const TERMINAL_CONTROL_BYTES = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/;
+
+// The card sanitizes the result it is handed before it draws a row, so a control byte
+// a tool's output carried never reaches the terminal, at either expansion level, while
+// the theme's own escapes are added after.
+const ALL_CONTROL_BYTES = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/;
 
 test("the bash card draws its result below the heading, collapsed or expanded", (t) => {
 	const bash = registeredQuietTools().get("bash");
@@ -1586,7 +1939,7 @@ test("the bash card draws its result below the heading, collapsed or expanded", 
 	const context = routineRenderContext({ args: { command }, executionStarted: true, isPartial: false });
 
 	const rows = frameLines(bash.renderCall({ command }, passthroughTheme, context), 120);
-	assert.match(rows[0] ?? "", /^╭─ ◎ exploring · git status ─+ .*to expand.*╮$/);
+	assert.match(rows[0] ?? "", /^╭─ ⌕ exploring · git status ─+ .*to expand.*╮$/);
 	assert.match(cardHint(rows.join("\n")) ?? "", /to expand$/);
 
 	const collapsed = renderToolResult(bash, textResult("one\ntwo\nthree\nfour"), { expanded: false, isPartial: false }, context);
@@ -1596,7 +1949,7 @@ test("the bash card draws its result below the heading, collapsed or expanded", 
 
 	// Minimal keeps the same heading and only withholds the preview rows.
 	useCardContent(t, CARD_CONTENT.MINIMAL);
-	assert.match(frameLines(bash.renderCall({ command }, passthroughTheme, context), 120)[0] ?? "", /^╭─ ◎ exploring · git status ─+/);
+	assert.match(frameLines(bash.renderCall({ command }, passthroughTheme, context), 120)[0] ?? "", /^╭─ ⌕ exploring · git status ─+/);
 	assert.equal(renderToolResult(bash, textResult("one\ntwo"), { expanded: false, isPartial: false }, context), "");
 });
 
@@ -1608,7 +1961,7 @@ test("a narrow bash card keeps its heading and wraps the call detail below it", 
 	for (const width of [30, 44, 60]) {
 		const rows = frameLines(bash.renderCall({ command }, passthroughTheme, context), width);
 		assert.equal(rows.length, 1, `width ${width}: the collapsed heading is one line`);
-		assert.ok(rows[0]?.includes("◎ exploring"), `width ${width}: ${rows[0]}`);
+		assert.ok(rows[0]?.includes("⌕ exploring"), `width ${width}: ${rows[0]}`);
 		assert.match(rows[0] ?? "", /git st/, `width ${width}: the detail stays readable`);
 		assert.ok(rows.every((row) => visibleWidth(row) <= width));
 	}
@@ -1634,9 +1987,9 @@ function hostView(component: any, width: number) {
 		component,
 		rows: render,
 		expanded: () => component.expanded === true,
-		/** The drawn row that carries the call (`▎ ◎ exploring · git status ── …`). */
+		/** The drawn row that carries the call (`▎ ⌕ exploring · git status ── …`). */
 		heading: () => {
-			const marked = lineOf(/[◎⌗≡$✎☷⌕⌖+]/);
+			const marked = lineOf(/[⌗≡$✎☷⌕⌖+]/);
 			return Math.max(1, marked > 0 ? marked : render().findIndex((row: string) => row.trim() !== ""));
 		},
 		/** The closing row of the card, owned by the result component's click region. */
@@ -1882,7 +2235,9 @@ test("quiet tool calls draw a rounded petal card in the lifecycle tone", () => {
 	]);
 	const failed = bash.renderResult(textResult("boom"), { expanded: true, isPartial: false, isError: true }, statusTheme, { args, isError: true }).render(width);
 	assert.match(failed.at(-1) ?? "", /^<error>╰<\/error><error>─+╯<\/error>$/);
-	assert.ok(failed.slice(0, -1).every((line) => line.startsWith("<error>│</error> ")), failed.join("\n"));
+	// A failed bash card keeps its identity on the left and its status everywhere
+	// else: the rail belongs to the heading, the right rail and the rule to the error.
+	assert.ok(failed.slice(0, -1).every((line) => line.startsWith("<bashMode>│</bashMode> ") && line.endsWith("<error>│</error>")), failed.join("\n"));
 
 	const empty = tools.get("grep").renderResult(textResult("No matches found"), { expanded: false, isPartial: false }, passthroughTheme, {}).render(width);
 	assert.deepEqual(empty, [`╰${"─".repeat(28)}╯`], "an empty result still closes the card");
@@ -2316,6 +2671,30 @@ test("a CodeGraph init card keeps the indexed facts when the log trails into tel
 	assert.match(collapsed, /7 nodes, 8 edges/);
 	assert.doesNotMatch(collapsed, /telemetry|newer version/, "trailing chatter never displaces the facts");
 });
+
+// The init CLI ends its run by stating what it did to the workspace index, in
+// one sentence with two possible outcomes: it built a new index, or it brought
+// the existing one up to date. Those are the only facts the card reads for the
+// collapsed row, and nothing else about the run is claimed from them.
+const CODEGRAPH_INIT_SYNCED_OUTPUT = [
+	'',
+	'┌  Initializing CodeGraph',
+	'│',
+	'Scanning files...',
+	'Parsing code...',
+	'│',
+	'◆  Indexed 1 files',
+	'│',
+	'●  7 nodes, 8 edges in 156ms',
+	'│',
+	'└  Done',
+	'CodeGraph synced the existing .codegraph index at /repo (local).',
+	'',
+].join("\n");
+const CODEGRAPH_INIT_CREATED_OUTPUT = CODEGRAPH_INIT_SYNCED_OUTPUT.replace(
+	'CodeGraph synced the existing .codegraph index at /repo (local).',
+	'CodeGraph initialized a new .codegraph index at /repo (local).',
+);
 
 test("a CodeGraph collapsed heading stays one line and expanding restores the full query", () => {
 	const { card } = codeGraphCard();
