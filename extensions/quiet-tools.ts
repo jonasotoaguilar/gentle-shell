@@ -21,7 +21,7 @@ import { registerCompactCodemode } from "../lib/codemode-renderer.ts";
 import { offerBuiltinCodemodeOptOut, type BuiltinCodemodeOptOutOptions } from "../lib/builtin-codemode-optout.ts";
 import { getGentleAiRenderState, renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import {
-	CARD_TONE, cardAwaitingResult, cardBottom, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopLine, cardTopRows, floatRows, markCardResult,
+	CARD_TONE, cardAwaitingResult, cardBottom, cardElapsed, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopLine, cardTopRows, floatRows, markCardResult,
 	type CardRowContext, type CardTheme,
 } from "../lib/shell-card.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
@@ -734,12 +734,14 @@ class ToolCardBody implements Component {
 	private readonly theme: CardTheme;
 
 	private readonly cacheable: boolean;
+	private readonly elapsed: string | undefined;
 
-	constructor(inner: () => Component, tone: ToolTone, theme: CardTheme, cacheable = true) {
+	constructor(inner: () => Component, tone: ToolTone, theme: CardTheme, cacheable = true, elapsed?: string) {
 		this.inner = inner;
 		this.tone = tone;
 		this.theme = theme;
 		this.cacheable = cacheable;
+		this.elapsed = elapsed;
 	}
 
 	/** Renders the inner component between the card sides and closes the frame, even when the result has no rows. */
@@ -748,7 +750,7 @@ class ToolCardBody implements Component {
 		if (target === 0) return [];
 		const build = () => floatRows(this.tone, this.theme, target, (inner) => ({
 			body: this.inner().render(cardInnerWidth(inner)).map((line) => cardLine(line.trimEnd(), this.tone, this.theme, inner)),
-			bottom: cardBottom(this.tone, this.theme, inner),
+			bottom: cardBottom(this.tone, this.theme, inner, this.elapsed),
 			afterHeading: true,
 		}));
 		return this.cacheable ? this.rows.render(target, false, build) : build();
@@ -845,9 +847,14 @@ export function createQuietToolRenderer(
 				return renderGentleAiLifecycleCall(operationPath, theme, withElapsedTiming(renderContext as GentleAiRenderContext), detail);
 			}
 			const tone = toolTone(renderContext.isPartial !== false, renderContext.isError === true);
-			// Same place and wording as the Gentle AI card: the expand key rides the top rule once the call finished.
+			// Same place and wording as the Gentle AI card: the expand key rides the top
+			// rule once the call finished. Only bash treats a final result as proof of a
+			// finish, because a host replaying a stored transcript never starts the call
+			// in this process; every other quiet card keeps its original start-or-error
+			// signal.
 			const expanded = renderContext.expanded === true;
-			const finished = renderContext.isPartial === false && (renderContext.executionStarted === true || renderContext.isError === true);
+			const finished = renderContext.isPartial === false
+				&& (toolName === "bash" || renderContext.executionStarted === true || renderContext.isError === true);
 			const hint = finished ? stripAnsi(keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")) : undefined;
 			const heading = toolName === "bash"
 				? bashHeading(callArgs, theme, expanded)
@@ -875,7 +882,11 @@ export function createQuietToolRenderer(
 				return renderGentleAiResult(safeResult, { expanded: options.expanded, isPartial: options.isPartial, isError }, theme, renderContext ? withElapsedTiming(renderContext as GentleAiRenderContext) : undefined);
 			}
 			const resultTone = toolTone(options.isPartial === true, isError);
-			const carded = (component: () => Component, cacheable = options.isPartial !== true): Component => new ToolCardBody(component, resultTone, theme, cacheable);
+			// Bash reports how long a finished call took on its closing rule; a partial
+			// call has no duration yet, and every other quiet card keeps the closing
+			// rule it has always had.
+			const elapsed = toolName === "bash" && options.isPartial !== true ? cardElapsed(renderContext?.durationMs) : undefined;
+			const carded = (component: () => Component, cacheable = options.isPartial !== true): Component => new ToolCardBody(component, resultTone, theme, cacheable, elapsed);
 			// Under the minimal Card content preference, every quiet tool draws
 			// the command alone while collapsed; the expand key still reveals
 			// the full result. Failures keep their bounded error tail so a red
