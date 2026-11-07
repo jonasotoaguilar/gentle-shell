@@ -214,6 +214,8 @@ Callers own keyboard policy, theme state, and business actions.
 
 **Bash UI tradeoff:** `quiet-tools` leaves Bash execution and UI to Pi, preserving configured `shellPath` and shell prefixes. Bash no longer uses Gentle's quiet cards or direct-command lifecycle renderer; the six other quiet tool cards and codemode remain unchanged.
 
+**File cards:** a `read`, `edit` or `write` on a skill or an ODD artifact heads as that file (`▤ skill`, `📑 odd`), classified by whole path components rather than substrings. An expanded successful `read` or `write` of any `.md` file renders as Markdown; collapsed previews, failures, non-Markdown files and edit diffs keep their rows.
+
 **Migration note:** Do not enable `pi-tool-cards` and `quiet-tools` together: Pi rejects duplicate `read`, `edit`, and `write` registrations. Disable or remove the standalone package during migration; gentle-pi does not change those package registrations or delete that repository. The global fullscreen setting described below is a separate install-time change.
 
 ## Install
