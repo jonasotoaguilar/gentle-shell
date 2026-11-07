@@ -26,7 +26,7 @@ import { registerCompactCodemode } from "../lib/codemode-renderer.ts";
 import { offerBuiltinCodemodeOptOut, type BuiltinCodemodeOptOutOptions } from "../lib/builtin-codemode-optout.ts";
 import { getGentleAiRenderState, renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import {
-	CARD_TONE, cardAwaitingResult, cardBottom, cardElapsed, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopLine, cardTopRows, floatRows, markCardResult,
+	CARD_TONE, cardAwaitingResult, cardBottom, cardElapsed, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopLine, cardTopRows, diffRows, floatRows, markCardResult,
 	type CardRowContext, type CardTheme,
 } from "../lib/shell-card.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
@@ -442,6 +442,19 @@ function expandedResultText(toolName: QuietToolName, result: AgentToolResult<unk
 		if (typeof diff === "string") return safeText(diff);
 	}
 	return text;
+}
+
+/**
+ * One card's rows in the role they are drawn in. An edit's diff is the one result
+ * whose rows are not all the same kind: its added rows wear the theme's added role
+ * and its removed rows its removed role, while its summary, its context rows and
+ * its hunks' headers keep the role the card already paints them in. Every other
+ * result — and a failed edit, whose rows are its error rather than a diff — keeps
+ * that one role for the whole text.
+ */
+function resultRowsText(toolName: QuietToolName, text: string, theme: CardTheme, role: string, isError: boolean): string {
+	if (text === "") return "";
+	return toolName === "edit" && !isError ? diffRows(text, theme, role) : theme.fg(role, text);
 }
 
 export function formatToolResultOutput(
@@ -1184,10 +1197,10 @@ export function createQuietToolRenderer(
 				), false);
 			}
 			const color = isError ? "error" : expanded ? "toolOutput" : "muted";
-			if (expanded) return carded(() => new Text(expandedRows.text ? theme.fg(color, expandedRows.text) : "", 0, 0));
+			if (expanded) return carded(() => new Text(expandedRows.text ? resultRowsText(toolName, expandedRows.text, theme, color, isError) : "", 0, 0));
 			if (collapsedRows.text) {
 				return carded(() => new BoundedRows([
-					{ text: theme.fg(color, collapsedRows.text), rows: PREVIEW_LINE_LIMIT, tail: collapsedRows.tail },
+					{ text: resultRowsText(toolName, collapsedRows.text, theme, color, isError), rows: PREVIEW_LINE_LIMIT, tail: collapsedRows.tail },
 				], cacheKey));
 			}
 			// The card top rule carries the expand key, so an empty result only closes the frame.
