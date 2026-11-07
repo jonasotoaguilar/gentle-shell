@@ -212,7 +212,7 @@ Pointer input is fullscreen-only. Regions preserve a consuming child's native re
 `Text`, activate on press or wheel, synthesize outside leave events, or alter terminal tracking.
 Callers own keyboard policy, theme state, and business actions.
 
-**Bash UI tradeoff:** `quiet-tools` leaves Bash execution and UI to Pi, preserving configured `shellPath` and shell prefixes. Bash no longer uses Gentle's quiet cards or direct-command lifecycle renderer; the six other quiet tool cards and codemode remain unchanged.
+**Bash UI tradeoff:** `quiet-tools` leaves Bash execution and UI to Pi, preserving configured `shellPath` and shell prefixes. Bash no longer uses Gentle's quiet cards or direct-command lifecycle renderer; the six other quiet tool cards and codemode remain unchanged. The `edit` card among them colors the diff it applied and only what is a change: an added row wears the theme's `toolDiffAdded` role and a removed row its `toolDiffRemoved` role — the roles gentle-changes and the themes already use — at both expansion levels and on every row a wrapped row continues to, while the card's own summary keeps its role and a context row, a patch file header (`+++`/`---`) and a hunk header (`@@`) are never read as changes; every other card paints its whole result in one role and a failed edit keeps its error in the error role.
 
 **Migration note:** Do not enable `pi-tool-cards` and `quiet-tools` together: Pi rejects duplicate `read`, `edit`, and `write` registrations. Disable or remove the standalone package during migration; gentle-pi does not change those package registrations or delete that repository. The global fullscreen setting described below is a separate install-time change.
 
