@@ -14,12 +14,14 @@ import { isAbsolute } from "node:path";
 import { resolveGentleAiDevBinaryOverride, type GentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { CARD_CONTENT, cardContent } from "../lib/card-content-policy.ts";
 import { GentleAiElapsedTimingLedger } from "../lib/gentle-ai-elapsed-store.ts";
+import { inferOddPhase } from "../lib/odd-phase-inference.ts";
+import type { OddPhase } from "../lib/odd-phase.ts";
 import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
 import { registerCompactCodemode } from "../lib/codemode-renderer.ts";
 import { offerBuiltinCodemodeOptOut, type BuiltinCodemodeOptOutOptions } from "../lib/builtin-codemode-optout.ts";
 import { getGentleAiRenderState, renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import {
-	CARD_TONE, cardAwaitingResult, cardBottom, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopRows, floatRows, markCardResult,
+	CARD_TONE, cardAwaitingResult, cardBottom, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopLine, cardTopRows, floatRows, markCardResult,
 	type CardRowContext, type CardTheme,
 } from "../lib/shell-card.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
@@ -50,6 +52,23 @@ const TOOL_GLYPH = {
 	edit: "✎",
 	write: "+",
 } as const satisfies Record<QuietToolName, string>;
+
+// A bash command's phase inference can only return these two phases
+// (lib/odd-phase-inference.ts inferShellPhase: a checker segment checks, every
+// read-only segment explores, anything else is undefined), so a card style
+// exists for exactly those two and generic bash covers the rest. edit, write,
+// todo and the choice tools keep their own existing cards.
+export type BashCardPhase = Extract<OddPhase, "exploring" | "checking">;
+
+// Each reachable phase leads with its own mark and paints itself in its own
+// theme role, so an exploring row never looks like a checking one.
+export const PHASE_IDENTITY = {
+	exploring: { glyph: "◎", titleRole: "mdLink" },
+	checking: { glyph: "✓", titleRole: "mdHeading" },
+} as const satisfies Record<BashCardPhase, { glyph: string; titleRole: string }>;
+
+/** The identity of a command whose phase the inference cannot tell: the tool's own mark and role, never a borrowed phase. */
+export const BASH_IDENTITY = { glyph: TOOL_GLYPH.bash, titleRole: "bashMode" } as const;
 
 const COLLAPSED_COUNT_LABELS: Partial<Record<QuietToolName, string>> = {
 	grep: "matches",
@@ -471,6 +490,88 @@ function lineRangeSuffix(args: Record<string, unknown>, theme: ThemeLike): strin
 	return theme.fg("warning", `:${startLine}${endLine === undefined ? "" : `-${endLine}`}`);
 }
 
+/**
+ * Splits a shell composition into its segments, or undefined when the command
+ * carries quoting, substitution, escapes, or a pipe the card cannot read
+ * safely. It never guesses: an unreadable composition keeps the whole command
+ * visible. A pipeline routes output into another program (`| tee log.txt`,
+ * `| xargs rm`, `|| fallback`), so no single segment is the whole story.
+ */
+function splitShellSegments(command: string): string[] | undefined {
+	if (/['"`]|\$\(|\\|\|/.test(command)) return undefined;
+	return command.split(/&&|\|\||;|\n/).map((segment) => segment.trim()).filter((segment) => segment.length > 0);
+}
+
+// A composition may skip a segment only when it is a harmless no-op whose output
+// nobody reads. Deliberately tiny: anything unlisted makes the card name the
+// whole command, so a consequential action is never hidden behind a test run.
+const BASH_IGNORABLE_SEGMENT = /^(cd|pushd|popd|echo|printf|sleep|true|false|export|set|\[\[?|test)\b/;
+// A no-op stops being harmless the moment it redirects output to a file. Stream
+// merges and discarded output are not writes; anything else is. Quotes and
+// escapes never reach this check (the splitter refuses those commands).
+const BASH_HARMLESS_REDIRECT = /\s*(\d?>&\d|&?\d?>\s*\/dev\/null)/g;
+
+function writesFileSegment(segment: string): boolean {
+	return segment.replace(BASH_HARMLESS_REDIRECT, "").includes(">");
+}
+
+/**
+ * The segment of a shell composition that names the work the phase came from:
+ * the last segment the same classifier also labels with that phase. A single
+ * segment has nothing to abbreviate, an unreadable composition returns
+ * undefined, and so does a composition holding any segment that is neither a
+ * read/verify step nor a harmless no-op — the heading then keeps the whole
+ * command instead of hiding what else runs.
+ */
+function bashPrincipalAction(command: string, phase: BashCardPhase): string | undefined {
+	const segments = splitShellSegments(command);
+	if (!segments || segments.length < 2) return undefined;
+	const safe = segments.every((segment) => {
+		const segmentPhase = inferOddPhase("bash", { command: segment });
+		if (segmentPhase === "exploring" || segmentPhase === "checking") return true;
+		return BASH_IGNORABLE_SEGMENT.test(segment) && !writesFileSegment(segment);
+	});
+	if (!safe) return undefined;
+	return segments.filter((segment) => inferOddPhase("bash", { command: segment }) === phase).at(-1);
+}
+
+/**
+ * The bash heading: the phase its own command implies (with that phase's mark
+ * and color) over the composition's principal action, or the unconditional
+ * generic `bash` fallback with the command itself for anything the inference
+ * does not label. Collapsed it stays one row; expanded it carries the complete
+ * command.
+ */
+function bashHeading(args: Record<string, unknown>, theme: ThemeLike, expanded: boolean): ToolCardHeading {
+	const command = safeText(asString(args.command, "..."));
+	const timeout = typeof args.timeout === "number" ? ` (timeout ${args.timeout}s)` : "";
+	const phase = inferOddPhase("bash", args);
+	const identity = phase === undefined ? BASH_IDENTITY : PHASE_IDENTITY[phase as BashCardPhase];
+	const detail = phase === undefined ? command : bashPrincipalAction(command, phase as BashCardPhase) ?? command;
+	return {
+		title: theme.bold(phase ?? "bash"),
+		subtitle: `${detail}${timeout}`,
+		glyph: identity.glyph,
+		titleRole: identity.titleRole,
+		singleLine: !expanded,
+	};
+}
+
+/** The parts of a tool card heading: what it says, the mark that leads it, the theme role that paints it, and whether it must fit one row. */
+interface ToolCardHeading {
+	title: string;
+	subtitle?: string;
+	glyph: string;
+	titleRole?: string;
+	singleLine?: boolean;
+}
+
+/** One heading at one expansion level, drawn with whatever card chrome is active right now. */
+function headingRows(heading: ToolCardHeading, tone: ToolTone, theme: CardTheme, singleLine: boolean, width: number, hint?: string): string[] {
+	const card = { ...heading, body: [], tone };
+	return singleLine ? [cardTopLine(card, theme, width, hint)] : cardTopRows(card, theme, width, hint);
+}
+
 interface ToolRenderContextLike {
 	args?: Record<string, unknown>;
 	argsComplete?: boolean;
@@ -485,18 +586,11 @@ interface ToolRenderContextLike {
 	durationMs?: number;
 }
 
-function formatToolCall(toolName: QuietToolName, args: Record<string, unknown>, theme: ThemeLike): string {
+function formatToolCall(toolName: Exclude<QuietToolName, "bash">, args: Record<string, unknown>, theme: ThemeLike): string {
 	switch (toolName) {
 		case "read": {
 			const path = safeText(shortenPath(args.path) || "...");
 			return `${theme.fg("toolTitle", theme.bold("read"))} ${theme.fg("accent", path)}${lineRangeSuffix(args, theme)}`;
-		}
-		case "bash": {
-			const command = safeText(asString(args.command, "..."));
-			const timeout = typeof args.timeout === "number" ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
-			// Minimal cards title bash with the bare command; the card glyph supplies the `$` prompt.
-			const title = cardContent() === CARD_CONTENT.MINIMAL ? command : `bash $ ${command}`;
-			return `${theme.fg("toolTitle", theme.bold(title))}${timeout}`;
 		}
 		case "grep": {
 			let text = `${theme.fg("toolTitle", theme.bold("grep"))} ${theme.fg("accent", `/${safeText(asString(args.pattern))}/`)} in ${safeText(shortenPath(args.path) || ".")}`;
@@ -599,29 +693,32 @@ class ToolCardRows {
 
 class ToolCardTop implements Component {
 	private readonly rows = new ToolCardRows();
-	private readonly header: () => string;
-	private readonly glyph: string;
+	private readonly heading: ToolCardHeading;
 	private readonly tone: ToolTone;
 	private readonly theme: CardTheme;
 	private readonly hint: string | undefined;
 	private readonly row: CardRowContext | undefined;
 
-	constructor(header: () => string, tone: ToolTone, theme: CardTheme, glyph: string, hint?: string, row?: CardRowContext) {
-		this.header = header;
-		this.glyph = glyph;
+	constructor(heading: ToolCardHeading, tone: ToolTone, theme: CardTheme, hint?: string, row?: CardRowContext) {
+		this.heading = heading;
 		this.tone = tone;
 		this.theme = theme;
 		this.hint = hint;
 		this.row = row;
 	}
 
-	/** Renders `╭─ <icon> <call> ── <hint> ╮`, reserving applicable hint space before wrapping the call. A call that does not fit the rule (a long or multi-line command) continues on card rows below it, so every line of the command stays visible. */
+	/** The heading at one expansion level; `singleLine` is the collapsed form, and `hint` rides its rule. */
+	private headRows(width: number, singleLine: boolean, hint: string | undefined): string[] {
+		return headingRows(this.heading, this.tone, this.theme, singleLine, width, hint);
+	}
+
+	/** Renders `╭─ <icon> <title> · <detail> ── <hint> ╮`. A single-line heading keeps the card one row and ends an over-wide detail in an ellipsis; an expandable heading continues the complete detail on the rows below so every line of the call stays visible. */
 	render(width: number): string[] {
 		const target = Math.max(0, Math.floor(width));
 		if (target === 0) return [];
 		const running = this.row !== undefined && cardAwaitingResult(this.row);
 		return this.rows.render(target, running, () => floatRows(this.tone, this.theme, target, (inner) => ({
-			head: cardTopRows({ title: this.header(), glyph: this.glyph, body: [], tone: this.tone }, this.theme, inner, this.hint),
+			head: this.headRows(inner, this.heading.singleLine === true, this.hint),
 			body: running ? [cardRunningLine(this.tone, this.theme, inner)] : undefined,
 			bottom: running ? cardBottom(this.tone, this.theme, inner) : undefined,
 		})));
@@ -749,9 +846,13 @@ export function createQuietToolRenderer(
 			}
 			const tone = toolTone(renderContext.isPartial !== false, renderContext.isError === true);
 			// Same place and wording as the Gentle AI card: the expand key rides the top rule once the call finished.
+			const expanded = renderContext.expanded === true;
 			const finished = renderContext.isPartial === false && (renderContext.executionStarted === true || renderContext.isError === true);
-			const hint = finished ? stripAnsi(keyHint("app.tools.expand", renderContext.expanded === true ? "to collapse" : "to expand")) : undefined;
-			return new ToolCardTop(() => formatToolCall(toolName, callArgs, theme), tone, theme, TOOL_GLYPH[toolName], hint, renderContext);
+			const hint = finished ? stripAnsi(keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")) : undefined;
+			const heading = toolName === "bash"
+				? bashHeading(callArgs, theme, expanded)
+				: { title: formatToolCall(toolName, callArgs, theme), glyph: TOOL_GLYPH[toolName] };
+			return new ToolCardTop(heading, tone, theme, hint, renderContext);
 		},
 		/** Builds the card component for this render pass; collapsed cards delegate to the wrapped-line cache keyed by the tool result object. */
 		renderResult(result, options, theme, context) {
@@ -873,14 +974,14 @@ export default function quietTools(
 		registerQuietTool(pi, toolName, resolveOverride, () => elapsedTiming);
 	}
 	// Native Bash keeps pi's execution and schema; only its drawing becomes a
-	// Gentle card while the Card content preference is minimal, so quiet bash
-	// rows match the other tools. The resolver API is newer than this
-	// package's pinned pi types, so it is probed structurally; hosts without it
-	// — and the default content preference — keep pi's native bash rendering.
+	// Gentle card, so quiet bash rows match the other tools at both Card
+	// content levels and can carry the phase inferred from the command. The
+	// resolver API is newer than this package's pinned pi types, so it is
+	// probed structurally; hosts without it keep pi's native bash rendering.
 	const host = pi as typeof pi & { registerToolRenderer?: (resolver: (toolName: string, next: () => unknown) => unknown) => void };
 	if (typeof host.registerToolRenderer === "function") {
 		host.registerToolRenderer((toolName, next) =>
-			toolName === "bash" && cardContent() === CARD_CONTENT.MINIMAL ? createQuietToolRenderer("bash", resolveOverride, () => elapsedTiming) : next());
+			toolName === "bash" ? createQuietToolRenderer("bash", resolveOverride, () => elapsedTiming) : next());
 	}
 	return registerCompactCodemode(pi);
 }
