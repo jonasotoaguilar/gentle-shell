@@ -169,6 +169,7 @@ otherwise `herdr` from `PATH`, without a shell.
 | **Closed choice prompts** | Per-option hover/click/wheel in fullscreen; keyboard selection in either TUI mode. |
 | **Native pointer regions** | Compose hover, press, click, and wheel behavior around public TUI components. |
 | **Agent overlay close control** | Adds a header close button that adapts to available width. |
+| **Agents thread renderer** | `/gentle:customize` → **Cards** → **Card agents** chooses the overlay's own labeled log (default) or the chat's registered tool-card renderers for `/gentle:agents`, saved per config home in `agents-view-style.json` and read when the overlay opens. The log always draws thinking and tool output whole and offers no detail keys; the cards renderer has no Markdown prose or stored edit diff yet. |
 | **Reviewer protection**        | Surfaces review workload risk before a task turns into an oversized PR.                                                                       |
 | **Per-agent model assignment** | Pi-native modal for assigning stronger or cheaper models to packaged and custom agents.                                                       |
 | **Skill discovery registry**   | Maintains `.atl/skill-registry.md` from project and user skills so review/comment/PR workflows do not silently miss the right skill.          |
