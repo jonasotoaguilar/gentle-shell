@@ -309,7 +309,7 @@ Pick which renderer `/gentle:agents` draws its selected thread with in `/gentle:
 | Renderer | What the thread draws |
 |----------|-----------------------|
 | `log` (default) | The overlay's original labelled rows: `Text`, `Thinking`, `Note`, `Tool · <name> · <status>` and `Output`. Thinking and tool output are always whole, and the log offers no detail keybinding or hint of its own. |
-| `cards` | Each retained tool call drawn by the renderer the chat itself was handed — the quiet-tool cards and the `codegraph` card, expanded with `ctrl+o` or a click, in the card style and content level chosen in Customize. A call the chat offers no card for keeps the generic `Tool · …` block. Thinking starts from the chat's hidden/shown state and draws only `Thinking...` while hidden. The cards view does **not** draw Markdown prose or a stored edit diff yet: text keeps the labelled `Text` block it has in the log. |
+| `cards` | Each retained tool call drawn by the renderer the chat itself was handed — the quiet-tool cards, expanded with `ctrl+o` or a click, in the card style and content level chosen in Customize. A call the chat offers no card for keeps the generic `Tool · …` block. Thinking starts from the chat's hidden/shown state and draws only `Thinking...` while hidden. The cards view does **not** draw Markdown prose or a stored edit diff yet: text keeps the labelled `Text` block it has in the log. |
 
 A preference saved under the previous names still resolves to the renderer it selected — `registry` as `log`, `chat` as `cards` — and the next save writes the current name.
 
