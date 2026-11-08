@@ -13,10 +13,10 @@ import test, { after, afterEach, before, mock } from "node:test";
 import type { TestContext } from "node:test";
 import { generateUnifiedPatch, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
-import { visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { visibleWidth, KeybindingsManager, Text, TUI_KEYBINDINGS, TuiAltScreen, getKeybindings, setKeybindings, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { sidebarState } from "../lib/shell-sidebar.ts";
 import { CHILD_PACKAGE_INJECTION_ENV, encodeChildPackageInjection } from "../lib/child-package-injection.ts";
-import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, agentResultPreview, answerThroughUi, childContextExtensionPaths, completionText, createDefaultSessionTransport, legacySubagentsInstalled, PARENT_WAKE_GRACE_MS, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
+import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, agentResultPreview, answerThroughUi, chatOverlayKeys, chatThinkingVisible, chatToolsExpanded, childContextExtensionPaths, completionText, createDefaultSessionTransport, legacySubagentsInstalled, PARENT_WAKE_GRACE_MS, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
 import { ActiveSessionClient, ActiveSessionListener, SessionPresenceError, SessionPresenceRegistry, type PresenceRecord } from "../lib/agents-session-transport.ts";
 import { WindowsActiveSessionClient, WindowsActiveSessionListener } from "../lib/windows-session-transport.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
@@ -32,6 +32,9 @@ import { AgentRunner, REQUESTED_TOOLS_ENV, type TaskRequest } from "../lib/agent
 import { bindSessionRepositoryPreparation } from "../lib/bounded-writer-admission.ts";
 import { bindSessionProfile, resetSessionProfileBindingsForTesting } from "../lib/session-profile-binding.ts";
 import { taskHeader } from "../lib/agents-view.ts";
+import { renderInputMessage } from "../lib/agents-thread-view.ts";
+import { clearAgentToolRenderers, registerAgentToolRenderers } from "../lib/agents-tool-renderers.ts";
+import { writeAgentsViewStyle } from "../lib/agents-view-style-policy.ts";
 import { readFrozenInheritedProfile, resetFrozenInheritedProfilesForTesting } from "../lib/session-profile-freeze.ts";
 import { CHILD_METRICS_EVENT } from "../lib/runtime-metrics-children.ts";
 import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
@@ -88,8 +91,9 @@ function mouse(
 	y: number,
 	width: number,
 	height: number,
+	wheelDelta?: number,
 ): TuiMouseEvent {
-	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false };
+	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false, wheelDelta };
 }
 const root = realpathSync(mkdtempSync(join(tmpdir(), "gentle-agents-ext-")));
 const activeSessionTeardowns = new Set<() => Promise<void>>();
@@ -3714,8 +3718,8 @@ test("the agents task card shows the winning layer next to the model, and render
 		thinking: undefined, sessionPath: null, error: null, result: null, lastStep: "", lastActivityAt: 60_000,
 		turns: 0, toolCalls: 0, tokens: 0, cost: 0,
 	} as TaskRecord;
-	assert.equal(taskHeader({ ...record, modelSource: "binding" }, 61_000), "explore · running · nan/glm5.3 · binding · 1s");
-	assert.equal(taskHeader(record, 61_000), "explore · running · nan/glm5.3 · 1s", "absent modelSource renders exactly as today");
+	assert.equal(taskHeader({ ...record, modelSource: "binding" }, 61_000), "explore · running · nan/glm5.3 · binding · repo · 1s");
+	assert.equal(taskHeader(record, 61_000), "explore · running · nan/glm5.3 · repo · 1s", "absent modelSource renders with the working directory where it always sits");
 });
 
 test("agentsEnabled and agentsCollapseKey read their flags and stay off inside a child", () => {
@@ -4307,6 +4311,155 @@ test("AgentsView production composition observes each pointer event once and acc
 	}
 });
 
+test("the chat-state readers keep the previous presentation only when the host cannot answer", () => {
+	// Both states come from Pi itself: ui.getToolsExpanded() and the
+	// hideThinkingBlock settings key. Nothing here invents a state.
+	assert.equal(chatToolsExpanded({ ui: { getToolsExpanded: () => false } } as unknown as ExtensionContext), false);
+	assert.equal(chatToolsExpanded({ ui: { getToolsExpanded: () => true } } as unknown as ExtensionContext), true);
+	assert.equal(chatToolsExpanded({ ui: {} } as unknown as ExtensionContext), true, "a host without the reader keeps expanded cards");
+	assert.equal(chatToolsExpanded({ ui: { getToolsExpanded: () => { throw new Error("host refused"); } } } as unknown as ExtensionContext), true);
+	assert.equal(chatThinkingVisible({ getSettings: () => ({ hideThinkingBlock: true }) }), false);
+	assert.equal(chatThinkingVisible({ getSettings: () => ({ hideThinkingBlock: false }) }), true);
+	assert.equal(chatThinkingVisible({ getSettings: () => { throw new Error("host refused"); } }), true, "a host that cannot answer keeps thinking visible");
+});
+
+test("the production overlay opens from the chat's presentation and toggles its own", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	// Pi exposes both main-chat states to extensions: the thinking-block setting
+	// and ui.getToolsExpanded(). The overlay reads them once, when it opens.
+	Object.assign(pi as unknown as Record<string, unknown>, { getSettings: () => ({ hideThinkingBlock: true }) });
+	const harness = deps();
+	// These assertions pin the cards view, so they select it the way a session
+	// does: the saved preference the overlay reads when it opens.
+	const styleHome = join(root, "overlay-chat-style-home");
+	writeAgentsViewStyle("cards", { gentlePiConfigHome: styleHome });
+	gentleAgents(pi, { GENTLE_PI_CONFIG_HOME: styleHome }, harness.deps);
+	const { ctx, overlays } = fakeContext();
+	Object.assign(ctx.ui as unknown as Record<string, unknown>, { getToolsExpanded: () => false });
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("mirror", { agent: "explore", task: "inspect", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+
+	let store: TaskStore | undefined;
+	const subscribeSummary = TaskStore.prototype.subscribeSummary;
+	const captureStore = mock.method(TaskStore.prototype, "subscribeSummary", function (this: TaskStore, ...args: Parameters<TaskStore["subscribeSummary"]>) {
+		store ??= this;
+		return subscribeSummary.apply(this, args);
+	});
+	try {
+		const opened = commands.get("gentle:agents")!.handler("", ctx);
+		for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+		const overlay = overlays[0];
+		assert.ok(overlay, "the production extension mounted its fullscreen interaction");
+		const selected = store?.list().find((entry) => entry.status === TASK_STATUS.RUNNING);
+		assert.ok(selected, "the overlay renders the production task store");
+		store!.apply(selected.id, { type: TASK_EVENT.THINKING, text: "private reasoning" }, 2001);
+		store!.apply(selected.id, { type: TASK_EVENT.TOOL_START, callId: "c", name: "bash", args: { command: "pnpm test" } }, 2002);
+		store!.apply(selected.id, { type: TASK_EVENT.TOOL_END, callId: "c", output: Array.from({ length: 8 }, (_, index) => `output ${index}`).join("\n"), isError: false }, 2003);
+		const frame = () => overlay.render(160).map(stripAnsi).join("\n");
+		// The two presentation hints ride last, so only a wide footer shows them.
+		const wide = () => overlay.render(240).map(stripAnsi).join("\n");
+		assert.match(frame(), /✓ checking · pnpm test/, "the retained call reaches the pane as its own phase card");
+		assert.match(frame(), /Thinking\.\.\./, "hidden thinking uses the chat's own label");
+		assert.doesNotMatch(frame(), /private reasoning/, "the overlay never shows a hidden thinking block");
+		assert.doesNotMatch(frame(), /output 7/, "the overlay opens with the chat's collapsed tool cards");
+		// A hint that only says "cards" leaves the reader guessing which way ctrl+o
+		// goes; it names the next action instead, and flips with the pane's state.
+		assert.match(wide(), /ctrl\+o expand/, "the footer advertises what ctrl+o does next");
+		assert.match(wide(), /ctrl\+t show thinking/, "and what ctrl+t does next");
+		// A narrow footer truncates the hint line at its own edge, so the closing
+		// hints are what yield there; the frame itself stays bounded.
+		const narrowHints = frame().split("\n").at(-2) ?? "";
+		assert.match(narrowHints, /…\s*│\s*$/, "a footer too narrow for every hint marks the truncation instead of breaking the frame");
+		assert.doesNotMatch(narrowHints, /esc back/, "the closing hints yield first");
+		// The hints end with leaving the pane: the toggles sit in front of the
+		// two ways out instead of interrupting them.
+		const hintRow = wide().split("\n").find((row) => row.includes("esc back")) ?? "";
+		assert.ok(hintRow.indexOf("ctrl+o expand") < hintRow.indexOf("esc back"), "the toggles come before back");
+		assert.ok(hintRow.indexOf("esc back") < hintRow.indexOf("q close"), "and close ends the line");
+		assert.match(hintRow, /q close\s*│\s*$/);
+		// Pi's own toggle keys work in the pane, and only on the pane.
+		overlay.handleInput("\x0f");
+		overlay.handleInput("\x14");
+		assert.match(frame(), /output 7/, "ctrl+o expands the overlay's cards");
+		assert.match(frame(), /private reasoning/, "ctrl+t shows the overlay's thinking");
+		assert.match(wide(), /ctrl\+o collapse/, "the hint flips as soon as the cards open");
+		assert.match(wide(), /ctrl\+t hide thinking/, "and with the thinking it now shows");
+		assert.equal(ctx.ui.getToolsExpanded(), false, "the chat's own tool expansion is untouched");
+		assert.equal(pi.getSettings().hideThinkingBlock, true, "the chat's own thinking setting is untouched");
+		overlay.handleInput("\x1b");
+		await opened;
+	} finally {
+		captureStore.mock.restore();
+	}
+});
+
+test("the pane's received-message card wears the same agent identity as the chat's Messaging agent card", () => {
+	// The preview borrows the agent card's design for a message a child received,
+	// so both must paint the same iris heading, rail and tint. The extension's
+	// card is the source of that identity; this test pins the pane's copy to it
+	// so the two can never drift into different cards.
+	const { pi, tools } = fakePi();
+	gentleAgents(pi, {}, deps().deps);
+	const registration = tools.get(`subagent_send_message`);
+	assert.ok(registration, "the extension registers the messaging tool");
+	const cardTheme = {
+		fg: (_color: string, text: string) => text,
+		bg: (_color: string, text: string) => `\u001b[48;5;236m${text}\u001b[49m`,
+	};
+	setCardStyle(CARD_STYLE.FLOAT);
+	try {
+		const card = registration.renderCall({ agent: "explore", task_id: "t1", message: "also check the lexer" }, cardTheme, {}).render(80).join("\n");
+		const message = renderInputMessage("also check the lexer", cardTheme, 80).join("\n");
+		for (const sequence of ["\u001b[38;2;185;167;242m", "\u001b[38;2;143;122;217m", "\u001b[48;2;26;21;38m"]) {
+			assert.equal(card.includes(sequence), true, `the chat's card paints ${JSON.stringify(sequence)}`);
+			assert.equal(message.includes(sequence), true, `the pane's message card paints the same ${JSON.stringify(sequence)}`);
+		}
+		assert.match(stripAnsi(card), /✉  Messaging agent/, "the chat's card is the Messaging agent card");
+		assert.match(stripAnsi(message), /✉  Messaging agent · note/, "and the pane names the message it carries");
+		// An emoji-fallback font paints the envelope two cells wide while pi-tui
+		// counts it as one, which would swallow a single space and read as
+		// `✉Messaging`. Both cards carry the envelope's own two-cell gap instead, so
+		// one column always shows and the counted width matches the painted one.
+		for (const row of [stripAnsi(card), stripAnsi(message)]) {
+			assert.match(row, /✉ {2}Messaging/u, "both Messaging cards leave two columns after the envelope");
+			assert.doesNotMatch(row, /✉\S/u, "the envelope never joins the heading it leads");
+		}
+		assert.match(stripAnsi(message), /also check the lexer/, "with the message the child received below it");
+	} finally {
+		setCardStyle(CARD_STYLE.NEON);
+	}
+});
+
+test("the overlay's presentation toggles resolve Pi's own keybindings", () => {
+	const previous = getKeybindings();
+	try {
+		// A host that publishes the actions is authoritative, so a user remap of
+		// app.tools.expand / app.thinking.toggle reaches the overlay too.
+		setKeybindings(new KeybindingsManager({ "app.tools.expand": { defaultKeys: "ctrl+u" }, "app.thinking.toggle": { defaultKeys: ["ctrl+y", "ctrl+shift+y"] } }));
+		const remapped = chatOverlayKeys();
+		assert.equal(remapped.expandsTools("\u0015"), true);
+		assert.equal(remapped.expandsTools("\u000f"), false, "the default key is not also live once the host bound another one");
+		assert.equal(remapped.togglesThinking("\u0019"), true);
+		assert.equal(remapped.expandLabel, "ctrl+u");
+		assert.equal(remapped.thinkingLabel, "ctrl+y/ctrl+shift+y");
+		// An action the host deliberately unbound stays unbound.
+		setKeybindings(new KeybindingsManager({ "app.tools.expand": { defaultKeys: [] }, "app.thinking.toggle": { defaultKeys: "ctrl+t" } }));
+		const unbound = chatOverlayKeys();
+		assert.equal(unbound.expandsTools("\u000f"), false);
+		assert.equal(unbound.expandLabel, "", "an unbound action advertises no key");
+		// A host that publishes neither action still gets Pi's documented defaults.
+		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
+		const fallback = chatOverlayKeys();
+		assert.equal(fallback.expandsTools("\u000f"), true);
+		assert.equal(fallback.togglesThinking("\u0014"), true);
+		assert.equal(fallback.expandLabel, "ctrl+o");
+		assert.equal(fallback.thinkingLabel, "ctrl+t");
+	} finally {
+		setKeybindings(previous);
+	}
+});
+
 test("AgentsView production footer uses rendered bounds and invalidates them before the next frame", async () => {
 	writeFileSync(join(home, ".pi", "agent", "agents", "寿司.md"), "---\ndescription: unicode footer target\nmodel: openai-codex/gpt-5.6-terra\n---\nFooter target.");
 	const { pi, tools, fire, commands } = fakePi();
@@ -4383,6 +4536,120 @@ test("AgentsView production footer uses rendered bounds and invalidates them bef
 	}
 });
 
+// The history file's shape is part of the store's contract, so the child's own
+// tool timing — a display fact the pane draws while the task is live — is not
+// written into it. The stored thread keeps every item it always kept.
+test("a finished task's history keeps its stored shape while the live thread keeps the tool timing", async () => {
+	const { pi, tools, fire } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const started = await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Time me", mode: "background" }, undefined, undefined, ctx);
+	const id = (started.details.gentleAgents as { taskId: string }).taskId;
+	await tick();
+	harness.children[0].emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "pnpm test" } });
+	harness.children[0].emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash", isError: false, result: { content: [{ type: "text", text: "ok" }] }, durationMs: 1234 });
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Kept." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	const tasksDir = join(home, ".pi", "agent", "gentle-agents", "tasks");
+	let stored = await loadHistory(tasksDir);
+	for (let attempt = 0; attempt < 40 && !stored.some((entry) => entry.task.id === id); attempt += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		stored = await loadHistory(tasksDir);
+	}
+	const entry = stored.find((candidate) => candidate.task.id === id);
+	assert.ok(entry, "the finished task is on disk");
+	const tool = entry.thread.items.find((item) => item.kind === "tool");
+	assert.ok(tool && tool.kind === "tool", "the retained call is still stored");
+	assert.equal(tool.name, "bash");
+	assert.equal(tool.output, "ok", "and so is the output it returned");
+	assert.deepEqual(Object.keys(tool).sort(), ["args", "callId", "isError", "kind", "name", "output", "running"], "the stored item is the shape the file always had");
+	const raw = readFileSync(join(tasksDir, `${id}.json`), "utf8");
+	assert.equal(raw.includes("durationMs"), false, "no display-only timing reaches the history file");
+});
+
+// The reported defect, end to end: the child's edit result carries its display
+// diff, and the pane draws the transcript's own edit card with it — counts when
+// collapsed, the diff when expanded — instead of `✓ applied`. The diff is display
+// data for this session's pane, so it is not written into the history file: a
+// task inspected after a restart falls back to the truthful details-free card.
+test("an edit's own diff reaches the live pane and never the history file", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	const editHome = join(root, "edit-details-home");
+	// The cards this test inspects are the cards view's.
+	const styleHome = join(editHome, "config-home");
+	writeAgentsViewStyle("cards", { gentlePiConfigHome: styleHome });
+	mkdirSync(join(editHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(editHome, ".pi", "agent", "agents", "explore.md"), "---\ndescription: maps things\nmodel: openai-codex/gpt-5.6-terra\n---\nYou map things.");
+	writeFileSync(join(editHome, ".pi", "agent", "subagents.json"), JSON.stringify({ max_concurrency: 1 }));
+	harness.deps.home = editHome;
+	gentleAgents(pi, { GENTLE_PI_CONFIG_HOME: styleHome }, harness.deps);
+	const { ctx, overlays } = fakeContext();
+	await fire("session_start", ctx);
+	const started = await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Edit me", mode: "background" }, undefined, undefined, ctx);
+	const id = (started.details.gentleAgents as { taskId: string }).taskId;
+	await tick();
+	const diff = "--- lib/x.ts\n+++ lib/x.ts\n@@ -1 +1 @@\n-1 old\n+1 new";
+	harness.children[0].emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "edit", args: { path: "lib/x.ts", edits: [{ oldText: "old", newText: "new" }] } });
+	harness.children[0].emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "edit", isError: false, result: { content: [{ type: "text", text: "Successfully replaced 1 occurrence" }], details: { diff, patch: "unified-patch-never-shown", firstChangedLine: 1 } } });
+	await tick();
+	// The pane hands the child's call to whatever the chat registered for it, so the
+	// transport is checked here through a stand-in renderer that states the details
+	// it was handed: the transcript's own edit card is promised by
+	// tests/agents-thread-view.test.ts, which draws it row for row.
+	const handed: unknown[] = [];
+	registerAgentToolRenderers({
+		edit: {
+			renderShell: "self" as const,
+			renderCall: () => new Text("edit", 0, 0),
+			renderResult: (result: { details?: { diff?: string } }, options: { expanded: boolean }) => {
+				handed.push(result.details);
+				const diffText = result.details?.diff ?? "no details";
+				return new Text(options.expanded ? diffText : `summary ${diffText.split("\n").slice(3).join(" | ")}`, 0, 0);
+			},
+		},
+	}, { owner: "quiet-tools" });
+	try {
+		const opened = commands.get("gentle:agents")!.handler("", ctx);
+		for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+		const overlay = overlays[0];
+		assert.ok(overlay, "the overlay component was created");
+		const frame = () => stripAnsi(overlay.render(100).join("\n"));
+		// The pane inherits the chat's expansion, which this fixture leaves open.
+		assert.match(frame(), /-1 old[\s\S]*\+1 new/, "the expanded card draws the diff the child produced");
+		assert.equal(frame().includes("unified-patch-never-shown"), false, "no other details field reaches a card");
+		overlay.handleInput("\x0f");
+		assert.match(frame(), /summary -1 old \| \+1 new/, "the collapsed card is drawn from the same diff");
+		overlay.handleInput("\x1b");
+		await opened;
+	} finally {
+		clearAgentToolRenderers();
+		overlays.length = 0;
+	}
+	assert.deepEqual(handed, [{ diff }, { diff }], "the card is handed the child's own diff at both levels, and nothing else");
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Kept." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	const tasksDir = join(editHome, ".pi", "agent", "gentle-agents", "tasks");
+	let stored = await loadHistory(tasksDir);
+	for (let attempt = 0; attempt < 40 && !stored.some((entry) => entry.task.id === id); attempt += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		stored = await loadHistory(tasksDir);
+	}
+	const entry = stored.find((candidate) => candidate.task.id === id);
+	assert.ok(entry, "the finished task is on disk");
+	const tool = entry.thread.items.find((item) => item.kind === "tool");
+	assert.ok(tool && tool.kind === "tool", "the retained call is still stored");
+	assert.equal(tool.output, "Successfully replaced 1 occurrence", "the acknowledgement the call returned is stored");
+	assert.deepEqual(Object.keys(tool).sort(), ["args", "callId", "isError", "kind", "name", "output", "running"], "the stored item is the shape the file always had");
+	const raw = readFileSync(join(tasksDir, `${id}.json`), "utf8");
+	assert.equal(raw.includes("details"), false, "no details field reaches the history file");
+	assert.equal(raw.includes("-1 old"), false, "no diff content is written down");
+});
+
 test("a task that finishes live stays visible as history, in both scopes, and its result also resolves after a restart", async () => {
 	const { pi, tools, fire, commands, shortcuts } = fakePi();
 	const harness = deps();
@@ -4424,6 +4691,52 @@ test("a task that finishes live stays visible as history, in both scopes, and it
 	assert.match(overlay.render(80).map(stripAnsi).join("\n"), /Subagent explore/, "the current session's own history shows under all sessions too");
 	overlay.handleInput("\x1b");
 	await opened;
+});
+
+test("the saved agents view style decides which renderer the overlay opens with", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	const styleHome = join(root, "agents-view-style-home");
+	gentleAgents(pi, { GENTLE_PI_CONFIG_HOME: styleHome }, harness.deps);
+	const { ctx, overlays } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Style me", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	// The overlay renders the production task store; the thread is fed through it
+	// while the task is live, as a child's events would.
+	let store: TaskStore | undefined;
+	const subscribeSummary = TaskStore.prototype.subscribeSummary;
+	const captured = mock.method(TaskStore.prototype, "subscribeSummary", function (this: TaskStore, ...args: Parameters<TaskStore["subscribeSummary"]>) {
+		store ??= this;
+		return subscribeSummary.apply(this, args);
+	});
+	const styleFile = join(styleHome, "agents-view-style.json");
+	const open = async () => {
+		const opened = commands.get("gentle:agents")!.handler("", ctx);
+		for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+		const overlay = overlays.at(-1)!;
+		assert.ok(overlay, "the overlay component was created");
+		const selected = store!.list().find((entry) => entry.status === TASK_STATUS.RUNNING);
+		assert.ok(selected, "the overlay renders the live task");
+		store!.apply(selected.id, { type: TASK_EVENT.TEXT, text: "the child's own answer" }, 2001);
+		const frame = overlay.render(80).map(stripAnsi).map((row: string) => row.trimEnd()).join("\n");
+		overlay.handleInput("\x1b");
+		await opened;
+		return frame;
+	};
+	try {
+		// No preference file: the saved default is the log view, with the child's
+		// prose under the original label.
+		assert.equal(existsSync(styleFile), false, "the fixture starts without a saved style");
+		assert.match(await open(), /│ Text\b/, "the default renderer is the log view");
+		writeAgentsViewStyle("cards", { gentlePiConfigHome: styleHome });
+		const cards = await open();
+		assert.doesNotMatch(cards, /│ Text\b/, "the saved cards view draws the conversation's own prose");
+		assert.match(cards, /the child's own answer/, "the child's answer still reaches the pane");
+	} finally {
+		captured.mock.restore();
+		rmSync(styleFile, { force: true });
+	}
 });
 
 test("the overlay confirms a running task once and reports when it finishes during confirmation", async () => {
@@ -4750,9 +5063,149 @@ test("the production overlay reads terminal rows at render time without a minimu
 	rows = 5;
 	assert.equal(overlay.render(80).length, 5, "a live terminal resize changes the production frame budget");
 	rows = 2;
-	assert.equal(overlay.render(80).length, 1, "tiny terminals retain bounded controls rather than forced chrome");
+	assert.equal(overlay.render(80).length, 2, "a tiny terminal covers its rows too, keeping one bounded control and forcing no chrome");
 	overlay.handleInput("\x1b");
 	await opened;
+});
+
+test("the mounted overlay pages with ctrl+shift keys on Linux and keeps its wheel off the chat", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, overlays } = fakeContext(fakeTui, async () => true, async () => undefined, { terminal: { rows: 12 }, requestRender() {} });
+	Object.assign(ctx.sessionManager, { getSessionId: () => "shift-session" });
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Long job", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	let store: TaskStore | undefined;
+	const subscribeSummary = TaskStore.prototype.subscribeSummary;
+	mock.method(TaskStore.prototype, "subscribeSummary", function (this: TaskStore, ...args: Parameters<TaskStore["subscribeSummary"]>) {
+		store ??= this;
+		return subscribeSummary.apply(this, args);
+	});
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	const overlay = overlays[0]!;
+	assert.ok(store, "the overlay subscribed to the production task store");
+	const selected = store.list().find((entry) => entry.parentSessionId === "shift-session");
+	assert.ok(selected, "the production store holds the running child");
+	for (let index = 0; index < 30; index += 1) store.apply(selected.id, { type: TASK_EVENT.TEXT, text: `line ${index}\n` }, 2000 + index);
+	const window = () => overlay.render(100).map(stripAnsi).slice(2, -2).map((line) => line.split("│")[2]?.trim() ?? "").join("\n");
+	const tail = window();
+	assert.match(tail, /line 29/, "the mounted pane starts on the thread's tail");
+	if (process.platform === "linux") {
+		overlay.handleInput("\x1b[107;6u");
+		assert.notDeepEqual(window(), tail, "ctrl+shift+k pages the mounted pane back on Linux");
+		overlay.handleInput("\x1b[27;6;106~");
+		assert.deepEqual(window(), tail, "ctrl+shift+j returns it with the xterm form as well");
+		// The extra pair works but is never drawn: the footer names one scroll hint
+		// whatever platform and width it is drawn at.
+		const hint = overlay.render(240).map(stripAnsi).at(-2) ?? "";
+		assert.match(hint, /ctrl\+j\/k scroll/, "the footer keeps the scroll hint it always had");
+		assert.doesNotMatch(hint, /ctrl\+shift\+j\/k|\(\+shift\)/, "and never advertises the extra pair");
+	} else {
+		overlay.handleInput("\x1b[107;6u");
+		assert.deepEqual(window(), tail, "off Linux the same bytes move nothing");
+	}
+	overlay.handleInput("\x0b");
+	assert.notDeepEqual(window(), tail, "ctrl+k keeps paging on the mounted pane");
+	overlay.handleInput("\x0a");
+	assert.deepEqual(window(), tail, "ctrl+j keeps returning");
+	// The frame's own cells are inside the overlay's rectangle: an unclaimed wheel
+	// there is what the fullscreen host forwards to the transcript underneath.
+	const rows = overlay.render(100);
+	for (const [x, y, label] of [[0, 2, "left border"], [99, 2, "right border"], [50, 0, "title row"], [50, rows.length - 1, "closing rule"]] as const) {
+		const result = overlay.handleMouse?.(mouse("wheel", "none", x, y, 100, rows.length)) as { handled?: boolean } | undefined;
+		assert.equal(result?.handled, true, `a wheel on the ${label} is claimed by the mounted overlay`);
+	}
+	assert.deepEqual(window(), tail, "and none of those wheels moved the pane");
+	overlay.handleMouse?.(mouse("wheel", "none", 60, 2, 100, rows.length, -1));
+	assert.notDeepEqual(window(), tail, "the mounted pane still owns its own wheel");
+	overlay.handleInput("\x1b");
+	await opened;
+});
+
+test("the fullscreen overlay owns the wheel over the whole screen at every size and gives it back when closed", async () => {
+	// Through pi-tui's real alt-screen dispatch, not the overlay's handler: the host
+	// composites the overlay over the transcript and sends a wheel to whichever
+	// rectangle it lands in, so the fallback frame covers the terminal with blank
+	// rows around its one bounded control. Every wheel position is then the modal's
+	// and the chat behind it never scrolls, at any size.
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	let columns = 11;
+	let rows = 24;
+	const chatWheels: number[] = [];
+	let feed: ((data: string) => void) | undefined;
+	const terminal = {
+		start(callback: (data: string) => void) { feed = callback; },
+		stop() {}, async drainInput() {}, write() {},
+		get columns() { return columns; }, get rows() { return rows; },
+		moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+		kittyProtocolActive: false, getBufferedInput() { return ""; }, hasPendingInput() { return false; },
+	} as never;
+	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+	tui.addChild({
+		render: () => Array.from({ length: rows }, (_, row) => `transcript ${row}`),
+		invalidate() {},
+		handleMouse: (event: TuiMouseEvent) => {
+			if (event.type === "wheel") chatWheels.push(event.screenY);
+			return { handled: true };
+		},
+	} as never);
+	const { ctx, overlays, customOptions } = fakeContext(fakeTui, async () => true, async () => undefined, tui as never);
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Long job", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	const overlay = overlays[0]!;
+	const options = (customOptions[0] as { overlayOptions: Record<string, unknown> }).overlayOptions;
+	const wheel = async (row: number) => {
+		feed?.(`\x1b[<64;5;${row + 1}M`);
+		await tick();
+	};
+	// The screen is where the host actually put things, so the Close row is read
+	// from it rather than assumed.
+	const closeRow = () => tui.getScreenLines().findIndex((line) => stripAnsi(line).includes("Close"));
+	const shownControl = (frame: string[]) => frame.filter((line) => stripAnsi(line).trim().length > 0).length;
+	tui.start();
+	const shown = tui.showOverlay(overlay as never, options as never);
+	tui.requestRender(true);
+	await tick();
+	const fallback = overlay.render(11);
+	assert.equal(fallback.length, 24, "at eleven columns the fallback covers the terminal instead of one bare line");
+	assert.equal(shownControl(fallback), 1, "and still draws exactly one visible control");
+	assert.equal(closeRow(), 11, "the Close control keeps the row a centered single line had");
+	assert.match(stripAnsi(fallback[11] ?? ""), /Close/, "which is the control itself");
+	assert.deepEqual(chatWheels, [], "opening the overlay scrolls nothing behind it");
+	for (let row = 0; row < 24; row += 1) await wheel(row);
+	assert.deepEqual(chatWheels, [], "no wheel anywhere on an eleven-column screen reaches the chat");
+	// A terminal too short for any chrome is the same fallback.
+	rows = 2;
+	tui.requestRender(true);
+	await tick();
+	assert.equal(overlay.render(11).length, 2, "two rows are both covered by the fallback");
+	assert.equal(closeRow(), 0, "and its one control sits on the first of them");
+	for (let row = 0; row < 2; row += 1) await wheel(row);
+	assert.deepEqual(chatWheels, [], "no wheel on either row reaches the chat");
+	// A size with a real frame keeps its own parts, over every row it draws.
+	columns = 80;
+	rows = 24;
+	tui.requestRender(true);
+	await tick();
+	assert.equal(overlay.render(80).length, 24, "the frame covers the terminal again");
+	for (const row of [0, 10, 23]) await wheel(row);
+	assert.deepEqual(chatWheels, [], "no wheel inside the frame reaches the chat, title row and closing rule included");
+	overlay.handleInput?.("q");
+	await opened;
+	shown.hide();
+	tui.requestRender(true);
+	await tick();
+	await wheel(10);
+	assert.deepEqual(chatWheels, [10], "once the overlay closes the chat scrolls again");
+	tui.stop();
 });
 
 

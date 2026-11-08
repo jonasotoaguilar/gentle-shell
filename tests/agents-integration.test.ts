@@ -72,8 +72,10 @@ test("AgentsView integrates flat current-session selection, semantic scrolling, 
 	assert.equal(view.selectedTask()?.id, "first", "returning from details preserves task selection");
 	rows = 2;
 	const fallback = view.render(59).map(stripAnsi);
-	assert.equal(fallback.length, 1, "a two-row terminal uses the one-line fallback");
-	assert.match(fallback[0] ?? "", /^× Close/, "fallback mode keeps a single Close cell");
+	assert.equal(fallback.length, rows, "a two-row terminal covers every one of its rows with the fallback frame, so the wheel cannot reach the chat behind it");
+	assert.equal(fallback.filter((line) => line.trim().length > 0).length, 1, "the covered frame still draws exactly one visible control row");
+	for (const line of fallback) assert.ok(visibleWidth(line) <= 59, "every covered row fits the width it was given");
+	assert.match(fallback[0] ?? "", /^× Close/, "fallback mode keeps a single Close cell on the row the host would centre a one-line overlay on");
 	assert.equal(view.handleMouse(mouse(1, 0, 59, fallback.length)), undefined, "fallback routing outside the Close cell is inert");
 
 	rows = 6;

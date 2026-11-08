@@ -1,8 +1,11 @@
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { measureAgentsViewLayout, type AgentsViewLayout } from "./agents-view-layout.ts";
+import { agentsScrollHintVariants, matchesAgentsScrollAlias } from "./agents-view-input.ts";
+import { measureAgentsViewLayout, agentsViewIsNarrow, type AgentsViewLayout } from "./agents-view-layout.ts";
 import { HOVER_ROLE, paintHoverable } from "./shell-hover.ts";
-import { emptyThread, isFinished, TASK_STATUS, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem } from "./agents-protocol.ts";
-import { renderThreadItem, type AgentsThreadTheme } from "./agents-thread-view.ts";
+import { emptyThread, isFinished, TASK_STATUS, THREAD_ITEM, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem } from "./agents-protocol.ts";
+import { renderInputMessage, renderThreadItem, type AgentsThreadTheme } from "./agents-thread-view.ts";
+import { renderThreadLogItem } from "./agents-thread-log-view.ts";
+import { AGENTS_VIEW_STYLE, type AgentsViewStyle } from "./agents-view-style-policy.ts";
 import { formatElapsed } from "./agents-widget.ts";
 import { createNativePointerScope, type NativePointerRegion } from "./native-pointer-region.ts";
 import { formatCost, formatTokens } from "./shell-bar.ts";
@@ -24,6 +27,21 @@ export const VIEW_SCOPE = {
 
 export type ViewScope = (typeof VIEW_SCOPE)[keyof typeof VIEW_SCOPE];
 
+/**
+ * The chat's two presentation toggles, resolved by the host so a user remap
+ * reaches the overlay too: `app.tools.expand` (ctrl+o by default) and
+ * `app.thinking.toggle` (ctrl+t by default).
+ */
+export interface AgentsViewKeys {
+	/** True when the input data is the chat's own tool-expansion toggle. */
+	expandsTools(data: string): boolean;
+	/** True when the input data is the chat's own thinking toggle. */
+	togglesThinking(data: string): boolean;
+	/** How the host displays that toggle, or "" when the action is unbound. */
+	expandLabel: string;
+	thinkingLabel: string;
+}
+
 export interface AgentsViewDeps {
 	theme: AgentsViewTheme;
 	rows: number | (() => number);
@@ -31,6 +49,38 @@ export interface AgentsViewDeps {
 	sessionId?: string;
 	presence?: { profile: string; target?: Readonly<Target> };
 	now(): number;
+	/**
+	 * The main chat's tool-card expansion state, read once when the overlay opens
+	 * to seed its own; the overlay never writes it back.
+	 */
+	toolsExpanded?(): boolean;
+	/**
+	 * The main chat's thinking visibility, read once when the overlay opens to
+	 * seed its own; the overlay never writes it back.
+	 */
+	thinkingVisible?(): boolean;
+	/** The chat's own toggles for those two states; Pi's defaults when absent. */
+	keys?: AgentsViewKeys;
+	/**
+	 * Which renderer draws the selected thread: the log view -- the pane's
+	 * original labelled rows -- or the cards view that mirrors the conversation's
+	 * own rendering.
+	 *
+	 * The host resolves the saved preference (/gentle:customize, Cards) and hands
+	 * it in, so no renderer depends on process state and either one can be
+	 * selected safely. A caller that names no style predates the preference and
+	 * keeps the rendering it has always had -- the cards view. That fallback is not
+	 * the saved default: a real session always names the preference it resolved,
+	 * and the saved default is the log view (lib/agents-view-style-policy.ts owns
+	 * it), so no session draws cards merely because a style was left out.
+	 */
+	style?: AgentsViewStyle;
+	/**
+	 * The platform whose extra keys the pane offers (`process.platform` by
+	 * default). Only the Linux-only page-scroll pair depends on it: the overlay's
+	 * selection, scrolling, presentation and ways out are the same everywhere.
+	 */
+	platform?: NodeJS.Platform;
 	onCancel(task: TaskRecord): void;
 	canCancel?(task: TaskRecord): boolean;
 	isLocalTask?(task: TaskRecord): boolean;
@@ -83,12 +133,26 @@ const STOP_BUTTON = "[Stop]";
 const SCOPE_BUTTON = "[Scope]";
 const KEYS = [
 	["j/k", "task"],
-	["ctrl+j/k", "scroll"],
 	["f", "follow"],
 	["o", "open session"],
+] as const;
+// The two ways out close the hint line: the footer ends with leaving the pane,
+// after every action hint and the two presentation toggles.
+const EXIT_KEYS = [
 	["esc", "back"],
 	["q", "close"],
 ] as const;
+// Pi's own defaults for the two presentation toggles, used only when the host
+// publishes no binding (see AgentsViewDeps.keys).
+const DEFAULT_EXPAND_KEY = "ctrl+o";
+const DEFAULT_THINKING_KEY = "ctrl+t";
+// The preview keeps one clear row between its header and its text, and one below
+// the last thread row, so neither the header nor the tail sits flush against the
+// frame. The margins are breathing room, not chrome: they appear only while the
+// preview still shows at least six thread rows below its header, so a short pane
+// spends no rows on emptiness.
+const THREAD_MARGIN_ROWS = 1;
+const THREAD_MARGIN_MIN_ROWS = 9;
 
 const EMPTY_COMPONENT: Component = {
 	render: () => [],
@@ -106,6 +170,8 @@ interface PointerLayout extends AgentsViewLayout {
 	closeButton?: PointerButtonLayout;
 	modeButton?: PointerButtonLayout;
 	actions?: Array<PointerButtonLayout & { region: NativePointerRegion }>;
+	/** For each body row, the tool call whose card it shows, when it shows one. */
+	threadCalls?: Array<string | undefined>;
 }
 
 interface SessionGroup {
@@ -119,6 +185,35 @@ type VisibleRow =
 	| { id: string; kind: "heading"; group: SessionGroup }
 	| { id: string; kind: "task"; group: SessionGroup; task: TaskRecord };
 
+/** The thread's rows, plus the tool call each row belongs to when it shows a card. */
+interface ThreadLines {
+	lines: string[];
+	calls: Array<string | undefined>;
+}
+
+/**
+ * Concatenates already-rendered blocks into the thread's rows, carrying each block's
+ * tool call onto the rows it drew. Empty blocks are skipped rather than kept as a
+ * gap. `spaced` keeps one transparent row between two blocks, which is how the cards
+ * view separates neighbouring components; the log view never spaced its items.
+ */
+function joinBlocks(blocks: ReadonlyArray<{ lines: string[]; callId?: string }>, spaced: boolean): ThreadLines {
+	const lines: string[] = [];
+	const calls: Array<string | undefined> = [];
+	for (const block of blocks) {
+		if (block.lines.length === 0) continue;
+		if (spaced && lines.length > 0) {
+			lines.push("");
+			calls.push(undefined);
+		}
+		for (const row of block.lines) {
+			lines.push(row);
+			calls.push(block.callId);
+		}
+	}
+	return { lines, calls };
+}
+
 function rule(length: number): string {
 	return "─".repeat(Math.max(0, length));
 }
@@ -126,6 +221,14 @@ function rule(length: number): string {
 function fit(text: string, width: number): string {
 	const clipped = truncateToWidth(text, width, "…");
 	return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
+}
+
+// The host centres a one-line overlay on the terminal, and the fallback now draws
+// every row of it so the wheel cannot reach the chat behind the modal. Keeping
+// the one bounded control on the row the host would have centred it on leaves it
+// where a reader already found it, with the blank rows it needs on both sides.
+function fallbackControlRow(height: number): number {
+	return Math.max(0, Math.floor((height - 1) / 2));
 }
 
 // Deep equality over presence thread items: validated JSON payloads, so only
@@ -142,15 +245,103 @@ function sameItemValue(a: unknown, b: unknown): boolean {
 	return keys.every((key) => Object.hasOwn(right, key) && sameItemValue(left[key], right[key]));
 }
 
-export function taskHeader(task: TaskRecord, now: number): string {
+// One directory name is bounded by the header itself: a task's cwd can be
+// arbitrarily long or deep, and the tokens, cost and elapsed time that follow it
+// still need room on the line. A name inside the bound is shown whole. A caller
+// that knows the line's own width passes it instead (see `taskHeader`), and the
+// name then takes exactly the room the facts around it leave.
+const CWD_LABEL_MAX_WIDTH = 24;
+const HEADER_SEPARATOR = " · ";
+const HEADER_SEPARATOR_WIDTH = visibleWidth(HEADER_SEPARATOR);
+// An abbreviated name needs its ellipsis and at least one distinguishing cell.
+// With less room than that the segment is dropped, so the line never spends
+// cells on a mark that names nothing.
+const CWD_LABEL_MIN_WIDTH = 2;
+
+/**
+ * The line the preview opens on: which worker ran, where, and what it used.
+ *
+ * Without a `width` the line is composed for a caller that draws it elsewhere,
+ * and the working directory stays inside the header's own bound. Given the
+ * width the line has, the directory takes exactly the cells the other facts
+ * leave over after its own separator -- whole when they fit, otherwise its tail
+ * behind an ellipsis -- so a wide pane never abbreviates a name it has room for,
+ * and the counters keep their segments on a narrow one. A name that cannot fit
+ * with even its own ellipsis is dropped whole rather than shortened into the
+ * line's edge, because a second ellipsis and a cut-off counter say less than the
+ * facts alone. The result fits `width` when one is given, its cut at one edge.
+ */
+export function taskHeader(task: TaskRecord, now: number, width?: number): string {
 	// #2180: the winning profile layer is shown right after the model it supplied;
-	// records without one render exactly as before.
-	const parts = [task.agent, task.status, task.model, ...(task.modelSource === undefined ? [] : [task.modelSource]), task.tokens > 0 ? formatTokens(task.tokens) : "", task.cost > 0 ? formatCost(task.cost) : "", task.startedAt === null ? "" : formatElapsed((task.endedAt ?? now) - task.startedAt)];
-	return parts.filter((part) => part.length > 0).join(" · ");
+	// records without one render exactly as before. The working directory's own last
+	// component follows that layer and leads the usage counters, so the header says
+	// which worker and where before it says how much.
+	const head = [task.agent, task.status, task.model, ...(task.modelSource === undefined ? [] : [task.modelSource])].filter((part) => part.length > 0);
+	const tail = [task.tokens > 0 ? formatTokens(task.tokens) : "", task.cost > 0 ? formatCost(task.cost) : "", task.startedAt === null ? "" : formatElapsed((task.endedAt ?? now) - task.startedAt)].filter((part) => part.length > 0);
+	const directory = cwdName(task.cwd);
+	const compose = (directoryLabel: string) => [...head, directoryLabel, ...tail].filter((part) => part.length > 0).join(HEADER_SEPARATOR);
+	if (directory.length === 0) return width === undefined ? compose("") : truncateToWidth(compose(""), Math.max(0, width), "…");
+	if (width === undefined) return compose(cwdLabel(directory, CWD_LABEL_MAX_WIDTH));
+	// The facts keep the cells they state, and the name is measured against what is
+	// really left: the separators among the facts themselves, one more that would
+	// join the name to them, and then the name. Facts that already overflow the
+	// line leave no room for any name, and asking for one would only spend cells on
+	// a second ellipsis beside the edge cut, so the line is composed of the facts
+	// alone and cut once, at its edge.
+	const facts = [...head, ...tail];
+	const factsWidth = facts.length === 0 ? 0 : facts.reduce((sum, part) => sum + visibleWidth(part), HEADER_SEPARATOR_WIDTH * (facts.length - 1));
+	const room = width - factsWidth - (facts.length === 0 ? 0 : HEADER_SEPARATOR_WIDTH);
+	const label = factsWidth > width ? "" : visibleWidth(directory) <= room ? directory : room >= CWD_LABEL_MIN_WIDTH ? cwdLabel(directory, room) : "";
+	return truncateToWidth(compose(label), Math.max(0, width), "…");
+}
+
+/**
+ * The last directory component of a task's cwd, whole and unmeasured: the
+ * generic component the path ends in, never a classification of its own (whether
+ * that directory is a checkout, a worktree or a plain folder is inferred nowhere).
+ * Both separators count, so a POSIX and a Windows path read alike, and a trailing
+ * separator names the directory it follows. A path that names no component -- an
+ * absent or empty cwd, or a bare root -- names nothing rather than an empty
+ * segment, and `cwdLabel` is what fits the name to its cells.
+ */
+function cwdName(cwd: string | undefined): string {
+	const path = (cwd ?? "").trim();
+	if (path.length === 0) return "";
+	const last = path.split(/[\\/]+/).filter((segment) => segment.length > 0).at(-1);
+	// A bare drive root (`C:\`, `C:`, `C:/`) is the root itself, not a directory
+	// below it, so it names no component either.
+	if (last === undefined || /^[A-Za-z]:$/.test(last)) return "";
+	return last;
+}
+
+/**
+ * One directory name as a header segment, abbreviated to `maxWidth` terminal
+ * cells. An over-long component keeps its tail behind an ellipsis, because
+ * sibling directories share a prefix and differ at the end; a name that fits is
+ * returned whole.
+ */
+function cwdLabel(name: string, maxWidth: number): string {
+	if (visibleWidth(name) <= maxWidth) return name;
+	const budget = Math.max(0, maxWidth - 1);
+	let kept = "";
+	let used = 0;
+	// Walk the component by code point so a wide character is never split and a
+	// surrogate pair is never left half behind.
+	for (const char of [...name].reverse()) {
+		const cells = visibleWidth(char);
+		if (used + cells > budget) break;
+		used += cells;
+		kept = char + kept;
+	}
+	return `…${kept}`;
 }
 
 export class AgentsView {
 	private readonly deps: AgentsViewDeps;
+	/** The platform whose extra page-scroll keys this pane accepts and names. */
+	private readonly platform: NodeJS.Platform;
+	/** The renderer this pane draws its thread with, fixed for the pane's lifetime. */
+	private readonly style: AgentsViewStyle;
 	private tasks: TaskRecord[] = [];
 	private selectedId: string | undefined;
 	private hoveredId: string | undefined;
@@ -183,8 +374,26 @@ export class AgentsView {
 	private unsubscribeTask: (() => void) | undefined;
 	private subscribedTaskId: string | undefined;
 	private readonly unsubscribeSummary: () => void;
-	private cache = new WeakMap<ThreadItem, string[]>();
-	private cacheWidth = -1;
+	private readonly cache = new WeakMap<ThreadItem, { key: string; lines: string[] }>();
+	// The assembled thread rows, kept until one of the three things they depend on
+	// changes: the thread version (the store and the presence poll both replace the
+	// thread object on every event, so its identity is that version), the width, and
+	// the pane's own presentation. Without it a warm frame re-walked every retained
+	// item and rebuilt rows it already had, which is what made a long thread's steady
+	// state cost grow with its size.
+	private assembled: { thread: TaskThread; width: number; prompt: string; presentation: number; rows: ThreadLines } | undefined;
+	// Bumped by every change to the pane's own presentation, so the assembled rows
+	// are rebuilt exactly once per state change and never re-derived per frame.
+	private presentation = 0;
+	// The overlay's own presentation state. It starts from the chat's when the
+	// pane opens and never writes back, so a toggle here leaves the chat alone.
+	private toolsExpanded: boolean;
+	private thinkingVisible: boolean;
+	// A card clicked in the pane keeps its own state, independent of the above.
+	private readonly itemExpanded = new Map<string, boolean>();
+	// The input block is stable until its own text or the width changes.
+	private promptKey = "";
+	private promptLines: string[] = [];
 	private peers: SessionGroup[] = [];
 	private remoteThreads = new Map<string, TaskThread>();
 	private presenceCursor?: PresenceCursor;
@@ -269,12 +478,22 @@ export class AgentsView {
 
 	constructor(deps: AgentsViewDeps) {
 		this.deps = deps;
+		this.platform = deps.platform ?? process.platform;
+		// A caller that names no style keeps the cards rendering it had before the
+		// preference existed -- not the saved default, which is the log view. A real
+		// session always names the style it resolved, so this fallback belongs to
+		// callers without that preference alone.
+		this.style = deps.style === AGENTS_VIEW_STYLE.LOG ? AGENTS_VIEW_STYLE.LOG : AGENTS_VIEW_STYLE.CARDS;
 		this.scope = VIEW_SCOPE.SESSION;
+		// Seed the overlay's presentation once, from the chat's own state.
+		this.toolsExpanded = deps.toolsExpanded?.() !== false;
+		this.thinkingVisible = deps.thinkingVisible?.() !== false;
 		this.listRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
 			onWheel: (event) => this.wheelList(event),
 		});
 		this.threadRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
 			onWheel: (event) => this.wheelThread(event),
+			onClick: (event) => this.clickThread(event),
 		});
 		this.followRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
 			onHover: () => this.hoverControl("follow"),
@@ -308,6 +527,7 @@ export class AgentsView {
 
 	dispose(): void {
 		this.closed = true;
+		this.assembled = undefined;
 		this.stopPresenceRefresh();
 		this.pointerLayout = undefined;
 		this.pointerScope.dispose();
@@ -350,8 +570,14 @@ export class AgentsView {
 		else if (data === "k" || matchesKey(data, Key.up)) this.select(index - 1, rows);
 		else if (matchesKey(data, Key.left) && selected?.kind === "heading") this.setExpanded(selected.group, false);
 		else if (matchesKey(data, Key.right) && selected?.kind === "heading") this.setExpanded(selected.group, true);
-		else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("j"))) this.scrollBy(this.pageRows());
-		else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("k"))) this.scrollBy(-this.pageRows());
+		else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("j")) || matchesAgentsScrollAlias(data, "down", this.platform)) this.scrollBy(this.pageRows());
+		else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("k")) || matchesAgentsScrollAlias(data, "up", this.platform)) this.scrollBy(-this.pageRows());
+		else if (matchesKey(data, Key.ctrl("home"))) this.scrollToStart();
+		else if (matchesKey(data, Key.ctrl("end"))) this.scrollToEnd();
+		// The cards view's own presentation keys, applied to the pane only. The log
+		// view draws neither cards nor a hidden thinking run, so it leaves them alone.
+		else if (this.style === AGENTS_VIEW_STYLE.CARDS && this.matchesToggle(data, "expand")) this.setAllExpanded(!this.toolsExpanded);
+		else if (this.style === AGENTS_VIEW_STYLE.CARDS && this.matchesToggle(data, "thinking")) this.setThinkingVisible(!this.thinkingVisible);
 		else if (data === "f" && task) {
 			this.follow = true;
 			this.deps.requestRender();
@@ -362,12 +588,27 @@ export class AgentsView {
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (this.closed) return undefined;
+		const result = this.pointerEvent(event);
+		if (result || event.type !== "wheel") return result;
+		// A wheel that lands on the frame rather than on a scrolling pane still
+		// belongs to this overlay: the fullscreen host forwards an unclaimed wheel to
+		// the transcript underneath, so the chat would scroll while this pane owns the
+		// screen. Claimed with nothing to move, on every row the pane covers -- its
+		// borders, the title row, the footer row, the closing rule, and the blank rows
+		// the fallback draws around its one control -- and even while the pane's own hit
+		// geometry is out of date.
 		const live = this.layout(event.width);
-		const liveHeight = live.mode === "fallback" ? Math.min(1, live.height) : live.height;
-		if (event.width !== live.width || event.height !== liveHeight) return undefined;
+		return event.y >= 0 && event.y < live.height ? { handled: true, render: false } : undefined;
+	}
+
+	/** The pane a pointer event belongs to, if any. */
+	private pointerEvent(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const live = this.layout(event.width);
+		if (event.width !== live.width || event.height !== live.height) return undefined;
 		const layout = this.pointerLayout;
 		if (!layout || (layout.sourceHeight !== undefined && layout.sourceHeight !== live.height) || event.width !== layout.width || event.height !== layout.height || live.mode !== layout.mode || layout.narrowView !== this.narrowView || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
-		if (event.y === 0) {
+		const controlRow = layout.mode === "fallback" ? fallbackControlRow(layout.height) : 0;
+		if (event.y === controlRow) {
 			if (this.isInButton(event.x, layout.modeButton)) return this.modeRegion.handleMouse(event);
 			if (this.isInButton(event.x, layout.closeButton)) return this.closeRegion.handleMouse(event);
 		}
@@ -375,7 +616,8 @@ export class AgentsView {
 			const row = event.y - 1;
 			if (layout.mode === "narrow" && event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
 				if (event.type === "wheel") return this.narrowView === "list" ? this.listRegion.handleMouse(event) : this.threadRegion.handleMouse(event);
-				const visible = this.narrowView === "list" ? this.visibleRows()[this.listScroll + row] : undefined;
+				if (this.narrowView === "details") return this.threadRegion.handleMouse(event);
+				const visible = this.visibleRows()[this.listScroll + row];
 				return visible ? this.taskRegion(row).handleMouse(event) : undefined;
 			}
 			if (layout.mode === "panes" && event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
@@ -383,7 +625,7 @@ export class AgentsView {
 				const visible = this.visibleRows()[this.listScroll + row];
 				return visible ? this.taskRegion(row).handleMouse(event) : undefined;
 			}
-			if (layout.mode === "panes" && event.x >= layout.threadX && event.x < layout.threadX + layout.threadWidth && event.type === "wheel") return this.threadRegion.handleMouse(event);
+			if (layout.mode === "panes" && event.x >= layout.threadX && event.x < layout.threadX + layout.threadWidth) return this.threadRegion.handleMouse(event);
 		}
 		if (event.y === layout.footerY) {
 			for (const action of layout.actions ?? []) if (this.isInButton(event.x, action)) return action.region.handleMouse(event);
@@ -402,12 +644,19 @@ export class AgentsView {
 			this.clearFooterLayout();
 			this.closeRegion.setDisabled(false);
 			this.closeRegion.render(1);
-			this.pointerLayout = { ...layout, height: 1, sourceHeight: layout.height, narrowView: this.narrowView, closeButton: { x: 0, width: 1 } };
-			return ["×" + fit(" Close Agents", layout.width - 1)];
+			// The host draws an overlay over exactly the rows it returns and gives a
+			// wheel outside them to the transcript behind it. This size has no frame to
+			// speak of, so the pane still owns the screen it was opened on: one bounded
+			// control, on the row the host would centre a single line on, and blank rows
+			// above and below, so the modal -- not the chat behind it -- answers the
+			// pointer and the wheel at every position.
+			const controlRow = fallbackControlRow(layout.height);
+			this.pointerLayout = { ...layout, height: layout.height, sourceHeight: layout.height, narrowView: this.narrowView, closeButton: { x: 0, width: 1 } };
+			const line = "×" + fit(" Close Agents", layout.width - 1);
+			return Array.from({ length: layout.height }, (_, row) => (row === controlRow ? line : ""));
 		}
 		// Retained terminal rows never belong in either live scope.
-		const now = this.deps.now();
-		if (this.tasks.some((task) => !this.inScope(task, now))) this.refreshTasks();
+		if (this.tasks.some((task) => !this.inScope(task))) this.refreshTasks();
 		if (this.pointerLayout && (this.pointerLayout.width !== layout.width || this.pointerLayout.height !== layout.height || this.pointerLayout.mode !== layout.mode || this.pointerLayout.narrowView !== this.narrowView)) this.clearFooterLayout();
 		const theme = this.deps.theme;
 		const inner = layout.width - 2;
@@ -442,8 +691,10 @@ export class AgentsView {
 			else body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.narrowView === "list" ? this.taskLine(row) : detail[row] ?? "", layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")}`);
 		}
 		const keyHints = this.selectedRow()?.kind === "heading" ? [["←/→", "group"] as const, ...this.keys(layout.mode === "narrow")] : this.keys(layout.mode === "narrow");
-		const keys = keyHints.map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
-		const footer = this.footer(keys, inner - 2);
+		// The hint row is fitted inside `footer`, where the room the buttons left is
+		// known: the page-scroll hint has wordings of its own and the narrowest one is
+		// not chosen before the width says it must be.
+		const footer = this.footer((room) => this.hintLine(keyHints, room), inner - 2);
 		const keysLine = `${theme.fg(ROLE.FRAME, "│")} ${fit(footer, inner - 2)} ${theme.fg(ROLE.FRAME, "│")}`;
 		return [top, ...body, keysLine, theme.fg(ROLE.FRAME, `╰${rule(inner)}╯`)];
 	}
@@ -475,7 +726,23 @@ export class AgentsView {
 		const details = narrow && task ? [["tab", this.narrowView === "list" ? "details" : "back"]] as const : [];
 		const stop = task && this.canCancel(task) ? [["s", "Stop selected"]] as const : [];
 		const scope = this.deps.sessionId === undefined ? [] : [["a", SCOPE_KEY[this.scope]]] as const;
-		return [...KEYS.slice(0, 1), ...details, ...KEYS.slice(1, 3), ...stop, ...scope, ...KEYS.slice(3)];
+		// Page scrolling names the platform's own keys: the Linux pair is advertised
+		// only where the pane accepts it, so no footer promises a dead key. This is the
+		// widest wording; `hintLine` steps down to a shorter one when the row is short.
+		const scroll: ReadonlyArray<readonly [string, string]> = [[agentsScrollHintVariants(this.platform)[0], "scroll"]];
+		// The two presentation toggles follow the action hints, and the two ways out
+		// come last. Each presentation hint names the action its key takes next from
+		// the pane's own state, so it flips the moment the reader toggles it. Both
+		// belong to the cards view alone: the log view has no cards to expand and no
+		// thinking to hide, so it never advertises a key that would draw nothing.
+		const expandLabel = this.deps.keys?.expandLabel ?? DEFAULT_EXPAND_KEY;
+		const thinkingLabel = this.deps.keys?.thinkingLabel ?? DEFAULT_THINKING_KEY;
+		const cardsView = this.style === AGENTS_VIEW_STYLE.CARDS;
+		const toggles = cardsView ? [
+			...(expandLabel ? [[expandLabel, this.toolsExpanded ? "collapse" : "expand"] as const] : []),
+			...(thinkingLabel ? [[thinkingLabel, this.thinkingVisible ? "hide thinking" : "show thinking"] as const] : []),
+		] : [];
+		return [...KEYS.slice(0, 1), ...details, ...scroll, ...KEYS.slice(1), ...stop, ...scope, ...toggles, ...EXIT_KEYS];
 	}
 
 	// A new scope reads from the top: selection, list window, and thread reset.
@@ -496,7 +763,7 @@ export class AgentsView {
 		this.deps.requestRender();
 	}
 
-	private inScope(task: TaskRecord, _now: number): boolean {
+	private inScope(task: TaskRecord): boolean {
 		// A local task (this session's own, active or finished history) always
 		// belongs; refreshTasks() is the single authority on which finished ones
 		// survive its own retention cap. A remote (presence) task never keeps
@@ -534,7 +801,7 @@ export class AgentsView {
 	}
 
 	private isNarrow(): boolean {
-		return measureAgentsViewLayout(this.lastRenderedWidth ?? 80, 3).mode !== "panes";
+		return agentsViewIsNarrow(this.lastRenderedWidth ?? 80);
 	}
 
 	private back(): void {
@@ -717,37 +984,163 @@ export class AgentsView {
 		return `Orchestrator ${group.sessionId.slice(0, 8)}`;
 	}
 
-	private threadLines(thread: TaskThread, width: number): string[] {
-		if (this.cacheWidth !== width) {
-			this.cache = new WeakMap();
-			this.cacheWidth = width;
+	private threadLines(task: TaskRecord | undefined, thread: TaskThread, width: number): ThreadLines {
+		const logView = this.style === AGENTS_VIEW_STYLE.LOG;
+		// The message the subagent received comes first, as it does in the chat, and
+		// it is the one input outside the thread that the rows depend on. The log
+		// view never showed it, so it stays the cards view's own block.
+		const prompt = !logView && task?.prompt.trim() ? task.prompt : "";
+		const kept = this.assembled;
+		if (kept !== undefined && kept.thread === thread && kept.width === width && kept.prompt === prompt && kept.presentation === this.presentation) {
+			return kept.rows;
 		}
-		const lines: string[] = [];
-		if (thread.dropped > 0) lines.push(this.deps.theme.fg(ROLE.META, `… ${thread.dropped} earlier items not kept`));
-		for (const item of thread.items) {
-			let rendered = this.cache.get(item);
-			if (!rendered) {
-				rendered = renderThreadItem(item, this.deps.theme, width);
-				this.cache.set(item, rendered);
-			}
-			lines.push(...rendered);
+		// Only the cards view has cards, so only it keeps a card's own state.
+		if (!logView) this.pruneCardExpansion(thread);
+		const blocks: Array<{ lines: string[]; callId?: string }> = [];
+		if (prompt.length > 0) blocks.push({ lines: this.promptBlock(prompt, width) });
+		if (thread.dropped > 0) blocks.push({ lines: [this.deps.theme.fg(ROLE.META, `… ${thread.dropped} earlier items not kept`)] });
+		if (logView) {
+			for (const item of thread.items) blocks.push({ lines: this.logItemRows(item, width) });
+		} else {
+			// The key a card names is the one the host resolved for the chat's own toggle,
+			// the same label the footer shows; a card the chat's renderer draws carries its
+			// own hint and never reads it.
+			const expandLabel = this.deps.keys?.expandLabel ?? DEFAULT_EXPAND_KEY;
+			for (const item of thread.items) blocks.push(this.cardItemRows(item, width, expandLabel));
 		}
-		return lines;
+		// One transparent row between blocks keeps two neighbouring cards from reading as
+		// a single block, the way the chat spaces its own components. The log view never
+		// spaced its items: its rows follow one another.
+		const assembled = joinBlocks(blocks, !logView);
+		this.assembled = { thread, width, prompt, presentation: this.presentation, rows: assembled };
+		return assembled;
+	}
+
+	/**
+	 * One item's rows in the log view: the pane's original renderer, which carries no
+	 * card state and infers nothing, so its rows change only with the width.
+	 */
+	private logItemRows(item: ThreadItem, width: number): string[] {
+		const key = String(width);
+		let cached = this.cache.get(item);
+		if (!cached || cached.key !== key) {
+			cached = { key, lines: renderThreadLogItem(item, this.deps.theme, width) };
+			this.cache.set(item, cached);
+		}
+		return cached.lines;
+	}
+
+	/**
+	 * One item's rows in the cards view, with the tool call they belong to when they are
+	 * a card. Only a card's own state changes its rows, so the key names the width, the
+	 * thinking visibility and that one card's level -- toggling one card leaves every
+	 * other cached render untouched.
+	 */
+	private cardItemRows(item: ThreadItem, width: number, expandLabel: string): { lines: string[]; callId?: string } {
+		const callId = item.kind === THREAD_ITEM.TOOL ? item.callId : undefined;
+		const expanded = callId === undefined ? true : this.isItemExpanded(callId);
+		const key = `${width}:${this.thinkingVisible ? 1 : 0}:${callId === undefined ? "-" : expanded ? 1 : 0}`;
+		let cached = this.cache.get(item);
+		if (!cached || cached.key !== key) {
+			cached = { key, lines: renderThreadItem(item, this.deps.theme, width, { toolsExpanded: expanded, thinkingVisible: this.thinkingVisible, expandLabel }) };
+			this.cache.set(item, cached);
+		}
+		return { lines: cached.lines, callId };
+	}
+
+	/**
+	 * Drops a card's own override once its call is no longer retained: the state only
+	 * matters while the card is on screen, and dropping the rest keeps a long-lived
+	 * overlay bounded by one thread's cards.
+	 */
+	private pruneCardExpansion(thread: TaskThread): void {
+		if (this.itemExpanded.size === 0) return;
+		const retained = new Set(thread.items.flatMap((item) => (item.kind === THREAD_ITEM.TOOL ? [item.callId] : [])));
+		for (const callId of this.itemExpanded.keys()) if (!retained.has(callId)) this.itemExpanded.delete(callId);
+	}
+
+	/** The thread a task's rows are drawn from: the presence copy when one exists, else the store's. */
+	private threadFor(task: TaskRecord): TaskThread {
+		return this.remoteThreads.get(task.id) ?? this.deps.store.thread(task.id);
+	}
+
+	private isItemExpanded(callId: string): boolean {
+		return this.itemExpanded.get(callId) ?? this.toolsExpanded;
+	}
+
+	// One card toggles on its own: the override belongs to that call for as long
+	// as the overlay is open, so a click never changes its siblings or the chat.
+	private toggleItem(callId: string): void {
+		this.itemExpanded.set(callId, !this.isItemExpanded(callId));
+		this.presentation += 1;
+		this.deps.requestRender();
+	}
+
+	private setAllExpanded(expanded: boolean): void {
+		this.toolsExpanded = expanded;
+		this.presentation += 1;
+		this.deps.requestRender();
+	}
+
+	private setThinkingVisible(visible: boolean): void {
+		this.thinkingVisible = visible;
+		this.presentation += 1;
+		this.deps.requestRender();
+	}
+
+	// The two presentation toggles are the chat's own keys. The host resolves them
+	// (`app.tools.expand`, `app.thinking.toggle`), so a user remap reaches the pane
+	// too; a host that publishes neither keeps Pi's own defaults.
+	private matchesToggle(data: string, toggle: "expand" | "thinking"): boolean {
+		const keys = this.deps.keys;
+		if (toggle === "expand") return keys ? keys.expandsTools(data) : matchesKey(data, Key.ctrl("o"));
+		return keys ? keys.togglesThinking(data) : matchesKey(data, Key.ctrl("t"));
+	}
+
+	// One prompt is inspected at a time, so a single memo keeps every frame after
+	// the first from wrapping the same text again.
+	private promptBlock(prompt: string, width: number): string[] {
+		const key = `${width}\u0000${prompt}`;
+		if (this.promptKey !== key) {
+			this.promptKey = key;
+			this.promptLines = renderInputMessage(prompt, this.deps.theme, width);
+		}
+		return this.promptLines;
+	}
+
+	// Blank rows the preview reserves beside its thread, recomputed from the live
+	// body so a resize can restore or drop them without a second source of truth.
+	private threadMargin(rows: number): number {
+		return rows >= THREAD_MARGIN_MIN_ROWS ? THREAD_MARGIN_ROWS : 0;
+	}
+
+	// The thread rows the preview shows below its header and that clear row.
+	// Scrolling and paging both measure this, so they agree with what is drawn.
+	private threadVisibleRows(rows = this.bodyRows()): number {
+		return Math.max(0, rows - 1 - this.threadMargin(rows) * 2);
 	}
 
 	private threadWindow(rows: number, width: number): string[] {
 		const task = this.selectedTask();
-		if (!task) return [this.deps.theme.fg(ROLE.EMPTY, "Select a task to inspect its thread")];
+		const margin = this.threadMargin(rows);
+		const edge = new Array<string>(margin).fill("");
+		// The header leads the preview and the clear row follows it, so the pane
+		// opens on the task's own facts instead of on emptiness; the closing margin
+		// below the last thread row keeps the text off the frame on both sides.
+		if (!task) return [this.deps.theme.fg(ROLE.EMPTY, "Select a task to inspect its thread"), ...edge];
 		const theme = this.deps.theme;
-		const header = theme.fg(ROLE.META, truncateToWidth(taskHeader(task, this.deps.now()), width, "…"));
-		const lines = this.threadLines(this.remoteThreads.get(task.id) ?? this.deps.store.thread(task.id), width);
-		if (lines.length === 0) return [header, theme.fg(ROLE.EMPTY, task.error ?? EMPTY_THREAD)];
-		const visible = Math.max(0, rows - 1);
+		const header = theme.fg(ROLE.META, taskHeader(task, this.deps.now(), width));
+		const { lines, calls } = this.threadLines(task, this.threadFor(task), width);
+		if (lines.length === 0) return [header, ...edge, theme.fg(ROLE.EMPTY, task.error ?? EMPTY_THREAD), ...edge];
+		const visible = this.threadVisibleRows(rows);
 		const maxScroll = Math.max(0, lines.length - visible);
 		if (this.follow) this.scroll = maxScroll;
 		// A taller/wider presentation may clamp its window, not the saved position.
 		const start = Math.min(this.scroll, maxScroll);
-		return [header, ...lines.slice(start, start + visible)];
+		// Each drawn row keeps its own address, margins included: the header and the
+		// blank rows belong to no card, so a click never toggles the wrong one.
+		if (this.pointerLayout) this.pointerLayout.threadCalls = [...new Array<string | undefined>(margin + 1).fill(undefined), ...calls.slice(start, start + visible)];
+		return [header, ...edge, ...lines.slice(start, start + visible), ...edge];
 	}
 
 	private select(index: number, rows = this.visibleRows(), revealSelection = true): void {
@@ -772,19 +1165,33 @@ export class AgentsView {
 		this.deps.requestRender();
 	}
 
-	// One page is the thread area: the body minus its header row.
+	// One page is the thread area: the body minus its header row and margins.
 	private pageRows(): number {
-		return Math.max(1, this.bodyRows() - 1);
+		return Math.max(1, this.threadVisibleRows());
 	}
 
 	private scrollBy(delta: number): void {
 		const task = this.selectedTask();
 		const layout = this.layout();
-		const lines = task ? this.threadLines(this.remoteThreads.get(task.id) ?? this.deps.store.thread(task.id), layout.threadWidth) : [];
-		const maxScroll = Math.max(0, lines.length - Math.max(0, layout.bodyRows - 1));
+		const { lines } = task ? this.threadLines(task, this.threadFor(task), layout.threadWidth) : { lines: [] };
+		const maxScroll = Math.max(0, lines.length - this.threadVisibleRows(layout.bodyRows));
 		this.follow = false;
 		// Clamp the current visible position before moving, including after resize.
 		this.scroll = Math.max(0, Math.min(maxScroll, Math.min(this.scroll, maxScroll) + delta));
+		this.deps.requestRender();
+	}
+
+	// Ctrl+Home leaves follow at the thread's first row, so a live event cannot
+	// pull the reader back down while they are reading from the start.
+	private scrollToStart(): void {
+		this.follow = false;
+		this.scroll = 0;
+		this.deps.requestRender();
+	}
+
+	// Ctrl+End returns to the tail and resumes following it.
+	private scrollToEnd(): void {
+		this.follow = true;
 		this.deps.requestRender();
 	}
 
@@ -794,7 +1201,7 @@ export class AgentsView {
 		this.pointerScope.invalidate();
 	}
 
-	private footer(keys: string, width: number): string {
+	private footer(hintLine: (room: number) => string, width: number): string {
 		const task = this.actionableTask();
 		const controls = [
 			{ label: FOLLOW_BUTTON, short: "Follow", region: this.followRegion, enabled: Boolean(task) },
@@ -824,9 +1231,28 @@ export class AgentsView {
 			more.render(1);
 			actions.push({ x: 2 + width - 1, width: 1, region: more });
 			text = fit(text, width - 1) + ">";
-		} else if (visibleWidth(text) + 1 < width) text += " " + truncateToWidth(keys, width - visibleWidth(text) - 1, "…");
+		} else if (visibleWidth(text) + 1 < width) text += " " + hintLine(width - visibleWidth(text) - 1);
 		if (this.pointerLayout) this.pointerLayout.actions = actions;
 		return text;
+	}
+
+	/**
+	 * The key hints, fitted to the room the buttons left. Only the page-scroll key
+	 * has more than one wording: on Linux it is named in full while the row holds
+	 * it, in its compact form while that fits, and in the platform-neutral wording
+	 * otherwise -- which is the row a non-Linux footer draws -- so an extra key of
+	 * this pane's own never costs another hint, and the two ways out at the end of
+	 * the row keep their cells wherever they had them.
+	 */
+	private hintLine(hints: ReadonlyArray<readonly [string, string]>, room: number): string {
+		const variants = agentsScrollHintVariants(this.platform);
+		const widest = variants[0];
+		const paint = (scrollKey: string) => hints.map(([key, label]) => `${this.deps.theme.fg(ROLE.KEY, key === widest ? scrollKey : key)} ${this.deps.theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
+		for (const scrollKey of variants) {
+			const line = paint(scrollKey);
+			if (visibleWidth(line) <= room) return line;
+		}
+		return truncateToWidth(paint(variants[variants.length - 1]), room, "…");
 	}
 
 	private actionRegion(id: string, action: () => void): NativePointerRegion {
@@ -966,6 +1392,17 @@ export class AgentsView {
 		const delta = event.wheelDelta ?? 0;
 		if (delta === 0) return { handled: true, render: false };
 		this.scrollBy(delta);
+		return { handled: true, render: true };
+	}
+
+	// A click belongs to the card under it, not to the whole pane: only that
+	// card's expansion changes, so a reader can open one call without losing
+	// the collapsed overview around it.
+	private clickThread(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.button !== "left") return undefined;
+		const callId = this.pointerLayout?.threadCalls?.[event.y - 1];
+		if (callId === undefined) return undefined;
+		this.toggleItem(callId);
 		return { handled: true, render: true };
 	}
 }

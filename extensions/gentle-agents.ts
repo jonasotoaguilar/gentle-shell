@@ -21,7 +21,7 @@ import { createMonitorController, mergeMonitorBatches, type MonitorNotice } from
 import { JobsView } from "../lib/jobs-view.ts";
 import { JOBS_FINISHED_TTL_MS } from "../lib/jobs-widget.ts";
 import { JOBS_SIDEBAR_EVENT, JOBS_STATUS_KEY } from "../lib/jobs-sidebar-state.ts";
-import { Text, truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import { Text, getKeybindings, matchesKey, truncateToWidth, type Component, type KeyId, type Keybinding, type TUI } from "@earendil-works/pi-tui";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { sidebarPart, VISUAL_SETTINGS_CHANGED } from "../lib/shell-sidebar.ts";
 import { NativePointerRegion } from "../lib/native-pointer-region.ts";
@@ -34,7 +34,7 @@ import { resolveProfilePin, resolveUnversionedProjectProfile } from "../lib/agen
 import { requireSessionProfileAuthority } from "../lib/session-profile-authority.ts";
 import { resolveBackgroundSubagentsPolicy } from "../lib/background-subagents-policy.ts";
 import { installBackgroundCacheWarming } from "../lib/background-cache-warming.ts";
-import { isFinished, MISSING_TOOLS_NOTE_PREFIX, TASK_EVENT, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
+import { isFinished, MISSING_TOOLS_NOTE_PREFIX, storedThread, TASK_EVENT, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, abortReasonText, REQUESTED_TOOLS_ENV, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
 import { parseChildPackageInjection } from "../lib/child-package-injection.ts";
 import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
@@ -44,7 +44,8 @@ import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, 
 import { inheritedUnsafeGitEnvironmentKeys } from "../lib/review-repository.ts";
 import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
-import { AgentsView } from "../lib/agents-view.ts";
+import { AgentsView, type AgentsViewKeys } from "../lib/agents-view.ts";
+import { resolveAgentsViewStyle } from "../lib/agents-view-style-policy.ts";
 import { withOverlayRepaint } from "../lib/overlay-repaint.ts";
 import { PresencePublisher, sanitizeDisplayLabel, listPresence, sessionHash } from "../lib/orchestrator-presence.ts";
 import { incomingMessageCard, outgoingMessageCall, outgoingMessageResult, type OrchestratorMessageDetails } from "../lib/orchestrator-message-card.ts";
@@ -299,6 +300,56 @@ function legacySubagentsInstalledAt(agentHome: string): boolean {
 
 export { agentsViewKey, agentsCollapseKey, agentsStopKey };
 
+/**
+ * The main chat's tool-card expansion state, which the Agents overlay mirrors
+ * so its preview and the transcript never disagree about how much of a call is
+ * shown. Pi exposes it as `ctx.ui.getToolsExpanded()`; an older host without
+ * that reader keeps the previous presentation (expanded cards) rather than an
+ * invented one.
+ */
+export function chatToolsExpanded(ctx: ExtensionContext): boolean {
+	try {
+		const read = ctx.ui.getToolsExpanded;
+		return typeof read === "function" ? read.call(ctx.ui) !== false : true;
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * The main chat's thinking visibility: Pi keeps it in `hideThinkingBlock`, so
+ * `pi.getSettings()` is the only source. A host that cannot answer keeps the
+ * previous presentation (thinking shown) instead of guessing.
+ */
+export function chatThinkingVisible(pi: Pick<ExtensionAPI, "getSettings">): boolean {
+	try {
+		return pi.getSettings().hideThinkingBlock !== true;
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * The chat's own presentation toggles for the Agents overlay, resolved from
+ * Pi's live keybinding registry so a user remap reaches the pane too:
+ * `app.tools.expand` (ctrl+o by default) and `app.thinking.toggle` (ctrl+t by
+ * default). Only an action the host does not publish at all falls back to Pi's
+ * documented default key; an action deliberately bound to no key stays unbound.
+ */
+export function chatOverlayKeys(): AgentsViewKeys {
+	const registry = getKeybindings();
+	const resolve = (action: Keybinding, fallback: KeyId) => {
+		const known = registry.getDefinition(action) !== undefined;
+		return {
+			matches: (data: string) => (known ? registry.matches(data, action) : matchesKey(data, fallback)),
+			label: known ? registry.getKeys(action).join("/") : fallback,
+		};
+	};
+	const expand = resolve("app.tools.expand", "ctrl+o");
+	const thinking = resolve("app.thinking.toggle", "ctrl+t");
+	return { expandsTools: expand.matches, togglesThinking: thinking.matches, expandLabel: expand.label, thinkingLabel: thinking.label };
+}
+
 function sanitizeTerminalText(value: string): string {
 	return value.replace(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/g, (control) => `\\x${control.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
 }
@@ -442,13 +493,21 @@ const STATUS_CARD_TONE: Record<string, CardTone> = {
 // The per-action identity from the design handoff (agent-tool-cards/04):
 // each agent tool carries its own glyph and reads as a verb, so the transcript
 // feels like working with agents rather than calling functions.
+// U+2709 is drawn two cells wide by an emoji-fallback font while pi-tui counts
+// it as one, so a single space after it is painted inside the glyph's second
+// cell and reads as `✉Messaging`. Both envelope headings — `Messaging agent` and
+// `Replying to agent` — therefore carry the envelope's own gap: the two-cell
+// glyph gap the sidebar widgets keep (lib/agents-widget.ts GLYPH_GAP), so one
+// column always shows whatever the font draws, and the heading's counted width
+// matches what the terminal paints.
+const MESSAGING_GLYPH = "✉ ";
 const ACTION_GLYPH: Record<string, string> = {
 	run: "→",
 	status: "◎",
 	result: "↩",
 	cancel: "⨯",
-	send_message: "✉",
-	reply: "✉",
+	send_message: MESSAGING_GLYPH,
+	reply: MESSAGING_GLYPH,
 	continue: "↻",
 	list_tasks: "☰",
 	list_agents: "☰",
@@ -1006,9 +1065,11 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	};
 
 	// A finished task goes to disk once, after its child is gone; the history
-	// is then trimmed to the configured size. Failures never reach the TUI.
+	// is then trimmed to the configured size. Failures never reach the TUI. The
+	// stored shape is unchanged: the child's display-only tool timing stays in the
+	// live thread the pane draws.
 	const persist = (task: TaskRecord) => {
-		void saveTask(tasksDir, task, store.thread(task.id))
+		void saveTask(tasksDir, task, storedThread(store.thread(task.id)))
 			.then(() => pruneHistory(tasksDir, loadAgentsConfig({ cwd: task.cwd, home: deps.home, agentHome }).historyMaxTasks))
 			.catch(() => {});
 	};
@@ -1762,6 +1823,14 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 						get target() { return presence?.target; },
 					},
 					now: () => deps.now(),
+					// The preview mirrors the chat when it opens, then keeps its own
+					// presentation: toggling a card here never changes the chat.
+					toolsExpanded: () => chatToolsExpanded(ctx),
+					thinkingVisible: () => chatThinkingVisible(pi),
+					keys: chatOverlayKeys(),
+					// The saved preference is read on every open, so a change made in
+					// /gentle:customize applies the next time the pane is opened.
+					style: resolveAgentsViewStyle({ gentlePiConfigHome: visualHome }).style,
 					onCancel: (task) => void stopSelected(task, ctx),
 					canCancel: isOwnedActive,
 					isLocalTask: (task) => !restoredTaskIds.has(task.id),

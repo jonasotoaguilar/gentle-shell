@@ -57,7 +57,78 @@ export interface TextEvent { type: typeof TASK_EVENT.TEXT; text: string }
 export interface ThinkingEvent { type: typeof TASK_EVENT.THINKING; text: string }
 export interface ToolStartEvent { type: typeof TASK_EVENT.TOOL_START; callId: string; name: string; args: Record<string, unknown> }
 export interface ToolUpdateEvent { type: typeof TASK_EVENT.TOOL_UPDATE; callId: string; output: string }
-export interface ToolEndEvent { type: typeof TASK_EVENT.TOOL_END; callId: string; output: string; isError: boolean }
+
+/**
+ * The whole edit's own totals for a diff the thread could not keep whole, counted by the
+ * protocol over the child's complete display diff with the same rule the chat's edit card
+ * counts with. They are structured numbers rather than a line the card would have to parse
+ * back out of the untrusted diff text, and they are what a card states instead of the rows
+ * it happens to hold.
+ */
+export interface ToolDiffTruncation {
+	/** Rows in the child's whole display diff. */
+	readonly rows: number;
+	/** Added and removed rows in the child's whole display diff. */
+	readonly additions: number;
+	readonly removals: number;
+}
+
+/**
+ * The display details a retained call may carry: the parts of a tool result the
+ * chat's own card draws beyond the result's text, kept so the Agents thread pane
+ * can draw that card instead of approximating it.
+ *
+ * Today that is exactly one field — `edit`'s display diff — plus, when that diff had to
+ * be cut to fit its budget, the whole edit's totals (see `ToolDiffTruncation`). An edit's
+ * card counts the rows the diff added and removed (`✓ +2 / -1`) and draws the diff when
+ * expanded, and neither can be derived from the result text. Nothing else travels:
+ * another tool's details belong to its own card, and a payload the pane does not have a
+ * card to read is a payload it does not keep. This is in-process display data only — the
+ * presence activity, the RPC publisher and the history file all project it out (see
+ * `storedThread`).
+ */
+export interface ToolItemDetails {
+	/** The edit's display-oriented diff, as the child computed it. */
+	readonly diff: string;
+	/** The whole edit's totals, present only when `diff` is a prefix of the edit's own
+	 * display diff (see `truncatedDiff`); absent for a diff kept whole, which states its
+	 * own counts. */
+	readonly truncated?: ToolDiffTruncation;
+}
+
+/**
+ * The longest display diff the thread keeps, in characters. A diff that fits is kept
+ * whole, so the edit card counts the rows the edit really produced and its expanded
+ * view is the diff the child computed, row for row — the same card the transcript
+ * draws. A larger one is cut at a row boundary and opens with a marker row that
+ * states the truncation and the edit's whole totals (see `truncatedDiff`), because
+ * dropping it whole made a delegated edit read `✓ applied` with no diff at all in
+ * the pane while the transcript counted and drew the very same change. The retained
+ * diff is inside this budget either way, so a thread of them stays bounded.
+ */
+export const TOOL_DETAIL_MAX_CHARS = 64_000;
+
+/** The tools whose result details the thread keeps. A per-tool field whitelist,
+ * so a new tool has to be added here on purpose. */
+const DETAIL_TOOLS: ReadonlySet<string> = new Set(["edit"]);
+
+export interface ToolEndEvent {
+	type: typeof TASK_EVENT.TOOL_END;
+	callId: string;
+	output: string;
+	isError: boolean;
+	/**
+	 * Milliseconds the child measured for this call, from Pi's monotonic clock and
+	 * carried on its own `tool_execution_end`; absent when the child recorded none
+	 * (an older Pi, a call that did not run). Nothing else knows how long a call
+	 * took, so this is the only elapsed time the pane may draw.
+	 */
+	durationMs?: number;
+	/** The bounded display details the call's result carried (see
+	 * `ToolItemDetails`), absent when the result had none of the fields the pane
+	 * draws or the tool keeps none. */
+	details?: ToolItemDetails;
+}
 export interface TurnEndEvent { type: typeof TASK_EVENT.TURN_END }
 /** Closed terminal-error vocabulary (#2322). A category, never provider text. */
 export const TERMINAL_ERROR_CATEGORY = {
@@ -109,7 +180,23 @@ export type TaskEvent = ResponseObservationEvent | TextEvent | ThinkingEvent | T
 
 export interface TextItem { kind: typeof THREAD_ITEM.TEXT; text: string }
 export interface ThinkingItem { kind: typeof THREAD_ITEM.THINKING; text: string }
-export interface ToolItem { kind: typeof THREAD_ITEM.TOOL; callId: string; name: string; args: Record<string, unknown>; output: string; running: boolean; isError: boolean }
+export interface ToolItem {
+	kind: typeof THREAD_ITEM.TOOL;
+	callId: string;
+	name: string;
+	args: Record<string, unknown>;
+	output: string;
+	running: boolean;
+	isError: boolean;
+	/** The child's own measurement for this call (see `ToolEndEvent.durationMs`).
+	 * Absent while the call runs, when the child recorded none, and on a remote
+	 * presence row, which carries no timing at all. */
+	durationMs?: number;
+	/** The bounded display details this call's result carried, when the tool keeps
+	 * any (see `ToolItemDetails`). Absent for every other call, for a thread
+	 * restored from a history file, and for a remote presence row. */
+	details?: ToolItemDetails;
+}
 export interface NoteItem { kind: typeof THREAD_ITEM.NOTE; text: string }
 
 export type ThreadItem = TextItem | ThinkingItem | ToolItem | NoteItem;
@@ -320,6 +407,146 @@ function childResponse(message: Raw): ChildResponseObservation | undefined {
 
 const ARGUMENT_PROGRESS_MAX = 4096;
 
+/** The row separator of a display diff, and the mark a cut row ends with. */
+const DIFF_ROW_SEPARATOR = "\n";
+const DIFF_ROW_ELLIPSIS = "…";
+const ADDED_ROW_CODE = "+".charCodeAt(0);
+const REMOVED_ROW_CODE = "-".charCodeAt(0);
+
+/** One display diff's rows, and the added and removed rows among them. */
+interface DisplayDiffCounts { rows: number; additions: number; removals: number }
+
+/**
+ * Counts a display diff the way the chat's edit card counts it (`✓ +2 / -1`): a row
+ * is an addition when it starts with `+` and is not a patch's `+++` file header, and a
+ * removal when it starts with `-` and is not a `---` one. The marker row below is
+ * built from these numbers, so it has to agree with the card's own rule exactly, and
+ * the scan walks the string without allocating a row array for it.
+ */
+function displayDiffCounts(diff: string): DisplayDiffCounts {
+	const counts: DisplayDiffCounts = { rows: 1, additions: 0, removals: 0 };
+	let start = 0;
+	for (;;) {
+		const end = diff.indexOf(DIFF_ROW_SEPARATOR, start);
+		const rowEnd = end < 0 ? diff.length : end;
+		const mark = diff.charCodeAt(start);
+		const header = rowEnd - start >= 3 && diff.charCodeAt(start + 1) === mark && diff.charCodeAt(start + 2) === mark;
+		if (mark === ADDED_ROW_CODE && !header) counts.additions += 1;
+		else if (mark === REMOVED_ROW_CODE && !header) counts.removals += 1;
+		if (end < 0) return counts;
+		counts.rows += 1;
+		start = end + 1;
+	}
+}
+
+/**
+ * The one row that opens a cut diff: a context row, so it never adds to or removes
+ * from the counts the card reads, stating how much of the diff is shown and the whole
+ * edit's own totals — the numbers the shown rows cannot state themselves. It opens the
+ * diff so the expanded card says, before the rows it does show, that they are a prefix
+ * of the edit. A collapsed card previews change rows only, so there the summary counts
+ * the rows the pane was given and this marker is the expanded card's answer to that.
+ */
+function truncationMarker(shownRows: number, whole: DisplayDiffCounts): string {
+	return ` ${DIFF_ROW_ELLIPSIS} diff truncated: ${shownRows} of ${whole.rows} rows shown; the whole edit is +${whole.additions} / -${whole.removals}`;
+}
+
+/**
+ * Cuts a display diff that is over the budget: the marker row, then whole rows from the
+ * diff's head, with the whole edit's totals beside them as structured numbers. Nothing
+ * retained is half a row, except when the diff's own first row is longer than the whole
+ * budget — there the row is cut but keeps its mark and line number, so the card still
+ * counts the row the edit produced, and ends with the same ellipsis the marker uses. The
+ * result is always inside `TOOL_DETAIL_MAX_CHARS`.
+ */
+function truncatedDiff(diff: string): { diff: string; truncated: ToolDiffTruncation } {
+	const whole = displayDiffCounts(diff);
+	const truncated: ToolDiffTruncation = Object.freeze({ rows: whole.rows, additions: whole.additions, removals: whole.removals });
+	const cutSuffix = ` ${DIFF_ROW_ELLIPSIS}`;
+	// Reserve the longest marker this diff can produce (it names at most every row as
+	// shown) plus the marks a cut adds, so the retained text fits whatever the real
+	// counts turn out to be, in both branches below.
+	const reserve = truncationMarker(whole.rows, whole).length + DIFF_ROW_SEPARATOR.length + cutSuffix.length;
+	const head = diff.slice(0, Math.max(0, TOOL_DETAIL_MAX_CHARS - reserve));
+	const boundary = head.lastIndexOf(DIFF_ROW_SEPARATOR);
+	if (boundary > 0) {
+		const kept = head.slice(0, boundary);
+		return { diff: `${truncationMarker(displayDiffCounts(kept).rows, whole)}${DIFF_ROW_SEPARATOR}${kept}`, truncated };
+	}
+	const firstRow = head.split(DIFF_ROW_SEPARATOR, 1)[0];
+	if (firstRow.length === 0) return { diff: truncationMarker(0, whole), truncated };
+	return { diff: `${truncationMarker(1, whole)}${DIFF_ROW_SEPARATOR}${firstRow}${cutSuffix}`, truncated };
+}
+
+/** The one row a cut diff opens with, as the layout above writes it. */
+const TRUNCATION_MARKER_PREFIX = ` ${DIFF_ROW_ELLIPSIS} diff truncated:`;
+
+function diffTotal(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * The whole edit's totals as an item claims them, or `undefined` when this boundary cannot
+ * stand behind the claim. A claim is a truncation only for a diff that opens with the marker
+ * row this module writes — a diff kept whole states its own counts, so a claim handed with one
+ * is dropped rather than allowed to override them — and its three numbers have to be whole,
+ * non-negative, able to describe rows that include them, and never fewer than the rows the
+ * retained diff still shows.
+ */
+function diffTruncation(value: unknown, diff: string): ToolDiffTruncation | undefined {
+	if (!diff.startsWith(TRUNCATION_MARKER_PREFIX)) return undefined;
+	const claim = value as { rows?: unknown; additions?: unknown; removals?: unknown } | null | undefined;
+	if (claim === null || typeof claim !== "object") return undefined;
+	const rows = diffTotal(claim.rows);
+	const additions = diffTotal(claim.additions);
+	const removals = diffTotal(claim.removals);
+	if (rows === undefined || additions === undefined || removals === undefined) return undefined;
+	if (additions + removals > rows) return undefined;
+	const kept = displayDiffCounts(diff);
+	if (kept.additions > additions || kept.removals > removals) return undefined;
+	return Object.freeze({ rows, additions, removals });
+}
+
+/**
+ * The child's own tool duration, or `undefined` when the value it sent is not a
+ * measurement. Pi times each call with a monotonic clock and rounds the result;
+ * anything else (a missing field, a string, a negative or non-finite number) is
+ * not a duration, and the parent never substitutes one of its own.
+ */
+function toolDuration(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * The display details to keep for one finished call, or `undefined` when the call
+ * keeps none. Both boundaries that hand details to a renderer call this — the RPC
+ * normalizer below and the pane's reused renderer — because an item restored from
+ * disk or built by another writer is not evidence that what it carries is a
+ * bounded, sanitized diff.
+ *
+ * Two rules, in order: the tool has to be one that keeps details, and `diff` has to
+ * be a string. Untrusted bytes are then removed with the same sanitizer the store
+ * applies to every retained string, which is also the one the chat's card applies
+ * before it counts, so both places count the same rows; the budget is judged on that
+ * cleaned text, which is what the card reads. A diff inside the budget is kept whole and
+ * carries no truncation claim; a larger one opens with a marker row and carries the whole
+ * edit's totals as structured numbers (see `truncatedDiff`), so a large real diff is never
+ * silently dropped and no card has to read a count back out of the diff text.
+ *
+ * The sanitized copy and the row scan are proportional to the diff the child already
+ * sent on its own event; only the value the thread retains is bounded.
+ */
+export function toolItemDetails(toolName: string, details: unknown): ToolItemDetails | undefined {
+	if (!DETAIL_TOOLS.has(toolName)) return undefined;
+	const source = details as { diff?: unknown; truncated?: unknown } | null | undefined;
+	const diff = source?.diff;
+	if (typeof diff !== "string") return undefined;
+	const text = clean(diff);
+	if (text.length > TOOL_DETAIL_MAX_CHARS) return Object.freeze(truncatedDiff(text));
+	const truncated = diffTruncation(source?.truncated, text);
+	return Object.freeze(truncated === undefined ? { diff: text } : { diff: text, truncated });
+}
+
 /** Per-child liveness evidence, separate from display events and usage.
  * RPC deltas have no sequence number. Reject duplicate fingerprints rather
  * than claiming indistinguishable repeated bytes are fresh progress. Retain
@@ -398,8 +625,15 @@ export function normalizeRpcEvent(raw: unknown, options: { observeResponses?: bo
 			return [{ type: TASK_EVENT.TOOL_START, callId: String(event.toolCallId ?? ""), name: clean(event.toolName), args: (event.args as Record<string, unknown>) ?? {} }];
 		case "tool_execution_update":
 			return [{ type: TASK_EVENT.TOOL_UPDATE, callId: String(event.toolCallId ?? ""), output: contentText((event.partialResult as Raw | undefined)?.content) }];
-		case "tool_execution_end":
-			return [{ type: TASK_EVENT.TOOL_END, callId: String(event.toolCallId ?? ""), output: contentText((event.result as Raw | undefined)?.content), isError: event.isError === true }];
+		case "tool_execution_end": {
+			const durationMs = toolDuration(event.durationMs);
+			// The child's own measurement rides the event as it arrived; a call it did
+			// not time carries none, so the pane draws no elapsed time for it. The
+			// display details are the result's own, kept only for a tool the pane has a
+			// card to read them with.
+			const details = toolItemDetails(clean(event.toolName), (event.result as Raw | undefined)?.details);
+			return [{ type: TASK_EVENT.TOOL_END, callId: String(event.toolCallId ?? ""), output: contentText((event.result as Raw | undefined)?.content), isError: event.isError === true, ...(durationMs === undefined ? {} : { durationMs }), ...(details === undefined ? {} : { details }) }];
+		}
 		case "message_end": {
 			const message = event.message as Raw | undefined;
 			const usage = message?.role === "assistant" ? (message.usage as Raw | undefined) : undefined;
@@ -447,6 +681,30 @@ export function emptyThread(limits: Partial<ThreadLimits> = {}): TaskThread {
 	return { items: [], dropped: 0, version: 0, limits: { ...DEFAULT_LIMITS, ...limits } };
 }
 
+/**
+ * The thread as the finished-task history file keeps it, for the one writer that
+ * puts a thread on disk (extensions/gentle-agents.ts). That file's shape is part
+ * of the contract with every reader — this version's and an older Pi's — so the
+ * live thread's display-only facts are projected out on the way out: the child's
+ * tool timing and any tool details it kept never reach disk. A thread that carries
+ * neither is returned as it is, so the common case allocates nothing; an item
+ * without them is kept by identity, because a projection is not an edit.
+ */
+export function storedThread(thread: TaskThread): TaskThread {
+	const projects = (item: ThreadItem): item is ToolItem => item.kind === THREAD_ITEM.TOOL && (item.durationMs !== undefined || item.details !== undefined);
+	if (!thread.items.some(projects)) return thread;
+	return {
+		...thread,
+		items: thread.items.map((item): ThreadItem => {
+			if (!projects(item)) return item;
+			// A field whitelist, like the presence and RPC projections: a new display fact
+			// has to be added here on purpose before it can reach a stored file.
+			const stored: ToolItem = { kind: item.kind, callId: item.callId, name: item.name, args: item.args, output: item.output, running: item.running, isError: item.isError };
+			return stored;
+		}),
+	};
+}
+
 function withItems(thread: TaskThread, items: ThreadItem[], dropped = thread.dropped): TaskThread {
 	return { ...thread, items, dropped, version: thread.version + 1 };
 }
@@ -492,8 +750,15 @@ export function applyTaskEvent(thread: TaskThread, event: TaskEvent): TaskThread
 			return push(thread, { kind: THREAD_ITEM.TOOL, callId: event.callId, name: event.name, args: event.args, output: "", running: true, isError: false });
 		case TASK_EVENT.TOOL_UPDATE:
 			return updateTool(thread, event.callId, { output: event.output });
-		case TASK_EVENT.TOOL_END:
-			return updateTool(thread, event.callId, { output: event.output, running: false, isError: event.isError });
+		case TASK_EVENT.TOOL_END: {
+			// The duration is carried only when the child measured one, and the details
+			// only when its result had them, so a call without either keeps no field
+			// instead of a placeholder the pane might draw.
+			const patch: Partial<ToolItem> = { output: event.output, running: false, isError: event.isError };
+			if (event.durationMs !== undefined) patch.durationMs = event.durationMs;
+			if (event.details !== undefined) patch.details = event.details;
+			return updateTool(thread, event.callId, patch);
+		}
 		case TASK_EVENT.ERROR:
 			return push(thread, { kind: THREAD_ITEM.NOTE, text: `error: ${event.message}` });
 		case TASK_EVENT.ASK:

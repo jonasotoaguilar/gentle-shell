@@ -36,6 +36,7 @@ import { listVisualProfiles, saveVisualProfile } from "../lib/visual-profiles.ts
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
 import { resolveCardStyle, writeCardStyle } from "../lib/card-style-policy.ts";
+import { AGENTS_VIEW_STYLE_SCHEMA, resolveAgentsViewStyle } from "../lib/agents-view-style-policy.ts";
 import { CARD_CONTENT, cardContent, resolveCardContent, setCardContent, writeCardContent } from "../lib/card-content-policy.ts";
 import { claimNotificationOwner } from "../lib/notification-service.ts";
 import { DEFAULT_NOTIFICATION_SETTINGS } from "../lib/notification-policy.ts";
@@ -3263,7 +3264,7 @@ test("customize Cards rows persist the card style and switch live conversation c
 	const pending = commands.get("gentle:customize")!.handler("", ctx);
 	await overlayReady;
 	assert.ok(findCustomizeRow(ui, "Card style: float (current)"));
-	assert.match(ui.overlayView!.render(90).join("\n"), /Cards · 2\/4/);
+	assert.match(ui.overlayView!.render(90).join("\n"), /Cards · 2\/6/);
 	assert.ok(findCustomizeRow(ui, "Card style: neon"));
 	assert.ok(!ui.overlayView!.render(90).some((line) => line.includes("▸ Card style: neon (current)")), "neon is not current without a saved preference");
 	assert.equal(existsSync(join(home, "card-style.json")), false, "highlighting never applies");
@@ -3310,6 +3311,48 @@ test("customize Cards rows persist the card content level and switch the live qu
 	await customizeAction(ui, "Card content: default");
 	assert.equal(resolveCardContent({ gentlePiConfigHome: home }).content, "default");
 	assert.equal(cardContent(), CARD_CONTENT.DEFAULT);
+	ui.overlayView!.handleInput("\x1b"); await pending;
+});
+
+test("customize Cards rows choose the agents view style and persist it", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const { pi, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	assert.equal(resolveAgentsViewStyle({ gentlePiConfigHome: home }).style, "log", "no preference file means the log view");
+	const { ctx, ui, overlayReady } = fakeContext();
+	const pending = commands.get("gentle:customize")!.handler("", ctx);
+	await overlayReady;
+	assert.ok(findCustomizeRow(ui, "Card agents: log (current)"), "the default is the log view");
+	assert.match(ui.overlayView!.render(90).join("\n"), /Cards · agents log[\s\S]*= Text · Thinking · Note · Tool rows · no cards/, "the log row previews the rows it really draws");
+	assert.ok(findCustomizeRow(ui, "Card agents: cards"), "the cards view is the second option, under Cards");
+	assert.match(ui.overlayView!.render(90).join("\n"), /Cards · agents cards[\s\S]*= cards \+ markdown · expand per card · real diff/, "the cards row previews the cards it really draws");
+	assert.equal(existsSync(join(home, "agents-view-style.json")), false, "opening or highlighting never writes the preference");
+	await customizeAction(ui, "Card agents: cards");
+	assert.equal(resolveAgentsViewStyle({ gentlePiConfigHome: home }).style, "cards");
+	assert.deepEqual(JSON.parse(readFileSync(join(home, "agents-view-style.json"), "utf8")), { schema: AGENTS_VIEW_STYLE_SCHEMA, style: "cards" });
+	assert.match(ui.notices.at(-1)!, /Card agents: cards/);
+	assert.ok(findCustomizeRow(ui, "Card agents: cards (current)"));
+	assert.ok(findCustomizeRow(ui, "Card agents: log"));
+	await customizeAction(ui, "Card agents: log");
+	assert.equal(resolveAgentsViewStyle({ gentlePiConfigHome: home }).style, "log");
+	ui.overlayView!.handleInput("\x1b"); await pending;
+});
+
+test("customize Cards rows refuse to overwrite a malformed agents view style", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	writeFileSync(join(home, "agents-view-style.json"), "{");
+	const { pi, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	const { ctx, ui, overlayReady } = fakeContext();
+	const pending = commands.get("gentle:customize")!.handler("", ctx);
+	await overlayReady;
+	assert.ok(findCustomizeRow(ui, "Card agents: log"));
+	assert.match(ui.overlayView!.render(90).join("\n"), /malformed or unreadable file/i);
+	ui.overlayView!.handleInput("\r");
+	for (let attempt = 0; attempt < 100 && !ui.notices.some(n => /malformed or unreadable agents view style/i.test(n)); attempt++) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+	assert.ok(ui.notices.some(n => /Cannot update malformed or unreadable agents view style preference/i.test(n)), ui.notices.join("\n"));
+	assert.equal(readFileSync(join(home, "agents-view-style.json"), "utf8"), "{");
+	assert.equal(resolveAgentsViewStyle({ gentlePiConfigHome: home }).style, "log");
 	ui.overlayView!.handleInput("\x1b"); await pending;
 });
 

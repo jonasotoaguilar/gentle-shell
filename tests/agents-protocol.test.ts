@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+// The delegated transport is pinned against the child's real tool: the native edit
+// executes on a real file, and the event it produced is what the runner normalizes.
+import { createEditTool } from "@earendil-works/pi-coding-agent";
 import {
 	applyTaskEvent,
 	emptyThread,
@@ -9,11 +15,15 @@ import {
 	TASK_EVENT,
 	TASK_STATUS,
 	taskLabel,
+	storedThread,
 	TaskStore,
 	TERMINAL_RETENTION,
 	THREAD_ITEM,
+	TOOL_DETAIL_MAX_CHARS,
 	isFinished,
+	toolItemDetails,
 	type TaskRecord,
+	type ToolItem,
 } from "../lib/agents-protocol.ts";
 
 function terminalError(message: Record<string, unknown>) {
@@ -166,6 +176,285 @@ test("normalizeRpcEvent maps pi RPC events to task deltas and ignores the rest",
 	assert.deepEqual(normalizeRpcEvent({ type: "message_end", message: { role: "user" } }), []);
 	assert.deepEqual(normalizeRpcEvent({ type: "queue_update" }), []);
 	assert.deepEqual(normalizeRpcEvent("garbage"), []);
+});
+
+// Pi times every tool call with a monotonic clock and puts the measurement on
+// the call's own `tool_execution_end`; nothing else in the protocol knows how
+// long a call took, so that number is carried through exactly as it arrived and
+// never derived from the parent's clock.
+test("normalizeRpcEvent carries the child's own tool duration and never invents one", () => {
+	const end = (durationMs: unknown) => normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "bash", isError: false, result: { content: [{ type: "text", text: "ok" }] }, durationMs });
+	assert.deepEqual(end(1234), [{ type: TASK_EVENT.TOOL_END, callId: "c1", output: "ok", isError: false, durationMs: 1234 }]);
+	// Zero is a measurement (a call faster than a millisecond), not an absence.
+	assert.deepEqual(end(0), [{ type: TASK_EVENT.TOOL_END, callId: "c1", output: "ok", isError: false, durationMs: 0 }]);
+	for (const notAMeasurement of [undefined, null, "1200", Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+		assert.deepEqual(end(notAMeasurement), [{ type: TASK_EVENT.TOOL_END, callId: "c1", output: "ok", isError: false }], `${String(notAMeasurement)} is not a measurement`);
+		assert.equal(Object.hasOwn(end(notAMeasurement)[0] as object, "durationMs"), false, `${String(notAMeasurement)} leaves the event without a time`);
+	}
+});
+
+test("applyTaskEvent retains the measured duration on the finished tool item and on nothing else", () => {
+	let thread = emptyThread();
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_START, callId: "c1", name: "bash", args: { command: "ls" } });
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_UPDATE, callId: "c1", output: "partial" });
+	assert.equal((thread.items[0] as ToolItem).durationMs, undefined, "a call still running has no measured duration");
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_END, callId: "c1", output: "ok", isError: false, durationMs: 321 });
+	assert.equal((thread.items[0] as ToolItem).durationMs, 321);
+	assert.equal((thread.items[0] as ToolItem).running, false);
+	assert.equal((thread.items[0] as ToolItem).output, "ok");
+	// A later update never overwrites the measurement, and never invents one.
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_UPDATE, callId: "c1", output: "ok again" });
+	assert.equal((thread.items[0] as ToolItem).durationMs, 321);
+	// A child that reported no measurement leaves the field absent, so the pane
+	// has nothing to draw instead of a made-up elapsed time.
+	let unmeasured = applyTaskEvent(emptyThread(), { type: TASK_EVENT.TOOL_START, callId: "c2", name: "bash", args: {} });
+	unmeasured = applyTaskEvent(unmeasured, { type: TASK_EVENT.TOOL_END, callId: "c2", output: "ok", isError: false });
+	assert.equal(Object.hasOwn(unmeasured.items[0] as object, "durationMs"), false, "no timing is invented for a call the child did not measure");
+});
+
+// The Agents pane draws a tool call with the chat's own card, and one card reads
+// more than the result text: an edit's card counts the rows its display diff added
+// and removed (`✓ +2 / -1`) and draws that diff when expanded. None of that can be
+// derived from the text the thread used to keep alone, so the diff is the one
+// details field that travels — per tool, bounded, and sanitized at the boundary.
+test("normalizeRpcEvent transports an edit's own display diff and no other result details", () => {
+	const end = (toolName: string, details: unknown) => normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName, isError: false, result: { content: [{ type: "text", text: "Successfully replaced 1 occurrence" }], details } });
+	const diff = "--- a.ts\n+++ a.ts\n@@ -1 +1 @@\n-1 old\n+1 new";
+	// The display diff travels; the patch and every other field stay in the child.
+	assert.deepEqual(end("edit", { diff, patch: "the whole patch", firstChangedLine: 1 }), [{ type: TASK_EVENT.TOOL_END, callId: "c1", output: "Successfully replaced 1 occurrence", isError: false, details: { diff } }]);
+	// The field is a per-tool allowlist: another tool's details are its own card's
+	// business and never enter the thread.
+	for (const toolName of ["bash", "write", "read", "codemode", "subagent_run", ""]) {
+		const [event] = end(toolName, { diff, childCalls: [{ name: "bash" }], fullOutputPath: "/tmp/x" });
+		assert.equal(Object.hasOwn(event as object, "details"), false, `${toolName || "an unnamed tool"} carries no details`);
+	}
+});
+
+test("a malformed or untrusted diff never becomes retained details", () => {
+	const end = (details: unknown) => normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "edit", isError: false, result: { content: [], details } })[0] as { details?: unknown };
+	assert.deepEqual(end({ diff: "-1 old\n+1 new" }).details, { diff: "-1 old\n+1 new" }, "a well-formed diff travels unchanged");
+	assert.deepEqual(end({ diff: "" }).details, { diff: "" }, "an empty diff is still the diff the call produced");
+	for (const details of [undefined, null, "diff", 7, true, [], {}, { diff: 7 }, { diff: null }, { diff: ["-1"] }, { diff: { text: "-1" } }, { patch: "x" }]) {
+		assert.equal(Object.hasOwn(end(details), "details"), false, `${JSON.stringify(details)?.slice(0, 40)} is not a diff`);
+	}
+	// Untrusted bytes are removed at the boundary, and the text they sat in stays:
+	// the same sanitizer the store applies to every retained string.
+	assert.deepEqual(end({ diff: "\u001b[31m-1 old\u001b[0m\n+1 new\u0007" }).details, { diff: "-1 old\n+1 new" });
+	assert.deepEqual(end({ diff: "\u009b31m-1 old" }).details, { diff: "-1 old" }, "a raw C1 CSI sequence is removed whole, not decoded");
+	assert.deepEqual(end({ diff: "\u001b]0;title\u0007-1 old" }).details, { diff: "-1 old" }, "a whole OSC sequence goes, not just its introducer");
+});
+
+/** A realistic TypeScript source, one function per line, as a child would edit it. */
+function source(lines: number): string {
+	const rows = Array.from({ length: lines }, (_row, index) => `export function fn${index}(value: number): number { return value + ${index}; }`);
+	return `${rows.join("\n")}\n`;
+}
+
+/** The rows and the added/removed counts an edit card reads off a display diff. */
+function counted(diff: string): { rows: number; additions: number; removals: number } {
+	const rows = diff.split("\n");
+	let additions = 0;
+	let removals = 0;
+	for (const row of rows) {
+		if (row.startsWith("+") && !row.startsWith("+++")) additions += 1;
+		if (row.startsWith("-") && !row.startsWith("---")) removals += 1;
+	}
+	return { rows: rows.length, additions, removals };
+}
+
+/** Runs the child's own edit tool over a real file and returns the result it produced. */
+async function realEdit(t: { after(fn: () => Promise<void>): void }, lines: number, blocks: number) {
+	const dir = await mkdtemp(join(tmpdir(), "gentle-edit-diff-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	await writeFile(join(dir, "src.ts"), source(lines), "utf8");
+	const edits = Array.from({ length: blocks }, (_block, index) => ({
+		oldText: `export function fn${index}(value: number): number { return value + ${index}; }`,
+		newText: `export function fn${index}(value: number): number {\n  const scaled = value * ${index};\n  return scaled + ${index};\n}`,
+	}));
+	return createEditTool(dir).execute("call-1", { path: "src.ts", edits } as never, undefined, undefined);
+}
+
+// The reported failure: a delegated edit whose diff is large read `✓ applied` in the
+// Agents pane while the transcript counted and drew the very same change, because the
+// transport dropped any diff over its budget whole. A realistic edit's diff is well
+// over that budget, so the real diff — not a fixture — has to survive the transport.
+test("a realistic large diff from the child's own edit tool survives the transport whole", async (t) => {
+	const result = await realEdit(t, 400, 60);
+	const childDiff = (result.details as { diff: string }).diff;
+	assert.ok(childDiff.length > 8_000, `the fixture is the reported case: ${childDiff.length} characters of real diff`);
+	const [event] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "call-1", toolName: "edit", result, isError: false });
+	assert.equal(event?.type, TASK_EVENT.TOOL_END);
+	const details = (event as { details?: { diff: string } }).details;
+	assert.equal(details?.diff, childDiff, "the pane draws the child's own diff, row for row");
+	assert.deepEqual(counted(details!.diff), counted(childDiff), "so the card counts the rows the edit really produced");
+	assert.equal(counted(details!.diff).additions, 240, "60 replaced blocks became 240 added rows");
+	assert.equal(counted(details!.diff).removals, 60, "and 60 removed rows");
+	// The store keeps it on the finished item, which is what the pane draws.
+	const thread = [
+		{ type: TASK_EVENT.TOOL_START, callId: "call-1", name: "edit", args: { path: "src.ts", edits: [] } },
+		event!,
+	].reduce((current, next) => applyTaskEvent(current, next as never), emptyThread());
+	assert.equal((thread.items[0] as ToolItem).details?.diff, childDiff);
+});
+
+// The budget is still a bound: what exceeds it is cut at a row boundary and closed by
+// one marker row, so the pane states the truncation and the edit's whole totals instead
+// of falling back to an acknowledgement, and never half a row.
+test("a diff over the budget is truncated at a row boundary and says what it left out", async (t) => {
+	const result = await realEdit(t, 2_000, 400);
+	const childDiff = (result.details as { diff: string }).diff;
+	assert.ok(childDiff.length > TOOL_DETAIL_MAX_CHARS, `the fixture is over the budget: ${childDiff.length} characters`);
+	const [event] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "call-1", toolName: "edit", result, isError: false });
+	const kept = (event as { details?: { diff: string; truncated?: unknown } }).details!;
+	assert.ok(kept.diff.length <= TOOL_DETAIL_MAX_CHARS, `the retained diff stays inside its budget (${kept.diff.length})`);
+	const rows = kept.diff.split("\n");
+	const marker = rows[0]!;
+	const shown = rows.slice(1);
+	const whole = counted(childDiff);
+	// The whole edit's totals travel as structured numbers the protocol counted, so no
+	// card has to parse them back out of the untrusted diff text.
+	assert.deepEqual(kept.truncated, { rows: whole.rows, additions: whole.additions, removals: whole.removals }, "the cut diff carries the whole edit's own totals as metadata");
+	assert.equal(whole.rows, 2005);
+	assert.equal(whole.additions, 1600);
+	assert.equal(whole.removals, 400);
+	// Every retained row is a whole row of the child's diff, in the child's order.
+	assert.deepEqual(shown, childDiff.split("\n").slice(0, shown.length), "the retained rows are the diff's own head, whole rows only");
+	// The marker is a context row: it never adds to or removes from the counts.
+	assert.equal(marker.startsWith("+") || marker.startsWith("-"), false, "the marker is not a change row");
+	assert.match(marker, /diff truncated/, "the truncation is stated, not silent");
+	assert.match(marker, new RegExp(`${shown.length} of ${whole.rows} rows`), "it states how much of the diff is shown");
+	assert.match(marker, new RegExp(`\\+${whole.additions} / -${whole.removals}`), "and the whole edit's own totals, which the shown rows cannot state");
+	assert.ok(whole.additions > counted(shown.join("\n")).additions, "the shown rows really are fewer than the edit made");
+});
+
+// A whole diff states its own counts, so it carries no truncation metadata; a diff the
+// thread kept whole never claims to be a prefix.
+test("a diff inside the budget carries no truncation metadata and is kept whole", async (t) => {
+	const result = await realEdit(t, 400, 60);
+	const childDiff = (result.details as { diff: string }).diff;
+	const [event] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "call-1", toolName: "edit", result, isError: false });
+	const details = (event as { details?: { diff: string; truncated?: unknown } }).details!;
+	assert.equal(details.diff, childDiff);
+	assert.equal(Object.hasOwn(details, "truncated"), false, "a complete diff claims no truncation");
+});
+
+// The metadata is a claim, and the drawing boundary re-checks it: an item restored from
+// disk, copied from a hand-built thread or written by a later version is not evidence
+// that its numbers are a real diff's totals.
+test("truncation metadata is re-validated where it is drawn, so no item can claim invented totals", () => {
+	const handed = (details: unknown) => toolItemDetails("edit", details);
+	const diff = " … diff truncated: 1 of 5 rows shown; the whole edit is +2 / -1\n+1 new";
+	const totals = { rows: 5, additions: 2, removals: 1 };
+	assert.deepEqual(handed({ diff, truncated: totals }), { diff, truncated: totals }, "a consistent claim is kept");
+	assert.deepEqual(handed({ diff, truncated: { ...totals, future: "x" } }), { diff, truncated: totals }, "a later version's extra field is dropped, not the claim");
+	assert.deepEqual(handed({ diff: "-1 old\n+1 new", truncated: totals }), { diff: "-1 old\n+1 new" }, "a complete diff keeps no claim, whatever it was handed");
+	for (const truncated of [
+		{ rows: "5", additions: 2, removals: 1 }, { rows: 5.5, additions: 2, removals: 1 },
+		{ rows: -5, additions: 2, removals: 1 }, { rows: 5, additions: -2, removals: 1 },
+		{ rows: 5, additions: 2 }, { rows: 2, additions: 2, removals: 1 },
+		[5, 2, 1], "truncated", 7, null, true,
+	]) {
+		const kept = handed({ diff, truncated });
+		assert.equal(Object.hasOwn(kept!, "truncated"), false, `${JSON.stringify(truncated)} is not a whole edit's totals`);
+		assert.equal(kept!.diff, diff, "the diff itself is still kept");
+	}
+	// A claim that understates the rows it is drawn with is not that diff's totals.
+	const twoAdditions = " … diff truncated: 2 of 5 rows shown; the whole edit is +2 / -1\n+1 a\n+2 b";
+	assert.deepEqual(handed({ diff: twoAdditions, truncated: { rows: 5, additions: 1, removals: 0 } }), { diff: twoAdditions });
+});
+
+// Nothing about a cut diff reaches the history file: the file's shape is a contract, and
+// the structured totals are a live display fact like the diff they describe.
+test("storedThread projects truncation metadata out with the diff it describes", () => {
+	let thread = applyTaskEvent(emptyThread(), { type: TASK_EVENT.TOOL_START, callId: "c1", name: "edit", args: { path: "a.ts" } });
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_END, callId: "c1", output: "ok", isError: false, details: { diff: "-1 old\n+1 new", truncated: { rows: 9, additions: 6, removals: 3 } } });
+	const stored = storedThread(thread);
+	assert.deepEqual(Object.keys(stored.items[0] as object).sort(), ["args", "callId", "isError", "kind", "name", "output", "running"], "the stored item keeps the shape the file always had");
+	assert.equal(JSON.stringify(stored).includes("truncated"), false, "no truncation metadata reaches the stored form");
+	assert.equal(JSON.stringify(stored).includes("diff"), false, "and no diff either");
+	assert.deepEqual((thread.items[0] as ToolItem).details, { diff: "-1 old\n+1 new", truncated: { rows: 9, additions: 6, removals: 3 } }, "the live thread keeps both");
+});
+
+// Untrusted bytes are removed before anything is counted or drawn, and the totals the
+// marker and the card state are counted over the cleaned text.
+test("a cut diff is sanitized before it is measured, so untrusted bytes cannot reach a count", () => {
+	const noisy = `${Array.from({ length: 6_000 }, (_row, index) => `+${index} \u001b[31madded ${index}\u001b[0m`).join("\n")}\u001b]0;title\u0007`;
+	const details = toolItemDetails("edit", { diff: noisy })!;
+	assert.equal(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(details.diff), false, "no control byte survives into the retained diff");
+	assert.equal(details.diff.includes("\u001b"), false, "and no escape sequence either");
+	assert.match(details.diff, /diff truncated/);
+	assert.deepEqual(details.truncated, { rows: 6_000, additions: 6_000, removals: 0 }, "the totals are the rows the cleaned diff has");
+});
+test("the budget is exact and a diff cut inside its first row keeps that row's sign", () => {
+	const end = (diff: string) => (normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "edit", isError: false, result: { content: [], details: { diff } } })[0] as { details?: { diff: string } }).details!.diff;
+	const full = Array.from({ length: 40 }, (_row, index) => `+${index} added row ${index}`).join("\n");
+	const exact = full.length <= TOOL_DETAIL_MAX_CHARS ? `${full}${"x".repeat(TOOL_DETAIL_MAX_CHARS - full.length)}` : full;
+	assert.equal(exact.length, TOOL_DETAIL_MAX_CHARS);
+	assert.equal(end(exact), exact, "a diff exactly at the budget is kept whole");
+	const kept = end(`${exact}y`);
+	assert.ok(kept.length <= TOOL_DETAIL_MAX_CHARS);
+	assert.match(kept, /diff truncated/);
+	assert.deepEqual(toolItemDetails("edit", { diff: `${exact}y` })!.truncated, { rows: 40, additions: 40, removals: 0 });
+	// One row longer than the budget: the head row is cut, keeps its `+` so the card
+	// still counts one addition, and says on the row itself that it was cut.
+	const single = end(`+1 ${"z".repeat(TOOL_DETAIL_MAX_CHARS)}`);
+	assert.ok(single.length <= TOOL_DETAIL_MAX_CHARS);
+	assert.equal(single.split("\n")[1].startsWith("+1 "), true, "the cut row keeps its sign and line number");
+	assert.match(single.split("\n")[1], / …$/, "and says on the row itself that it was cut");
+	assert.match(single, /diff truncated/);
+	assert.match(single, /1 of 1 rows/, "it never claims more rows than the diff has");
+});
+
+test("applyTaskEvent keeps an edit's details on its finished item and never invents or later replaces them", () => {
+	const diff = "-1 old\n+1 new";
+	let thread = applyTaskEvent(emptyThread(), { type: TASK_EVENT.TOOL_START, callId: "c1", name: "edit", args: { path: "a.ts" } });
+	assert.equal((thread.items[0] as ToolItem).details, undefined, "a running call has no result details yet");
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_UPDATE, callId: "c1", output: "half" });
+	assert.equal((thread.items[0] as ToolItem).details, undefined, "a partial update never carries details");
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_END, callId: "c1", output: "Successfully replaced 1 occurrence", isError: false, details: { diff } });
+	assert.deepEqual((thread.items[0] as ToolItem).details, { diff });
+	// A later update replaces the output and leaves the details the result carried.
+	const finished = thread;
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_UPDATE, callId: "c1", output: "later output" });
+	assert.notStrictEqual(thread, finished);
+	assert.deepEqual((thread.items[0] as ToolItem).details, { diff });
+	// A call whose result carried no details keeps none, so the pane has nothing to
+	// state instead of a diff it would have had to invent.
+	let plain = applyTaskEvent(emptyThread(), { type: TASK_EVENT.TOOL_START, callId: "c2", name: "edit", args: { path: "b.ts" } });
+	plain = applyTaskEvent(plain, { type: TASK_EVENT.TOOL_END, callId: "c2", output: "ok", isError: false });
+	assert.equal(Object.hasOwn(plain.items[0] as object, "details"), false);
+});
+
+// A display detail is retained for the live pane and for nothing that leaves this
+// process: the history file's shape is a contract with every reader, present and
+// older, and a diff is file content the child never asked to have written down.
+test("storedThread projects display details out so the history file keeps the shape it always had", () => {
+	let thread = applyTaskEvent(emptyThread(), { type: TASK_EVENT.TOOL_START, callId: "c1", name: "edit", args: { path: "a.ts" } });
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_END, callId: "c1", output: "ok", isError: false, details: { diff: "-1 old\n+1 new" } });
+	const stored = storedThread(thread);
+	assert.deepEqual(Object.keys(stored.items[0] as object).sort(), ["args", "callId", "isError", "kind", "name", "output", "running"], "the stored item keeps the shape the file always had");
+	assert.equal(JSON.stringify(stored).includes("diff"), false, "no display detail reaches the stored form");
+	assert.deepEqual((thread.items[0] as ToolItem).details, { diff: "-1 old\n+1 new" }, "the live thread keeps the diff the pane draws");
+	assert.equal(stored.version, thread.version, "projection is not an edit");
+	assert.equal(stored.dropped, thread.dropped);
+});
+
+// The finished-task history file on disk is not a place to grow new fields, so
+// the thread is projected on the way out: the child's display-only tool timing
+// stays in the live thread, which is what the pane draws.
+test("storedThread keeps the history file's shape and never strips the live thread", () => {
+	let thread = emptyThread();
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_START, callId: "c1", name: "bash", args: { command: "ls" } });
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TEXT, text: "done" });
+	assert.strictEqual(storedThread(thread), thread, "a thread that carries no timing is stored as it is");
+	thread = applyTaskEvent(thread, { type: TASK_EVENT.TOOL_END, callId: "c1", output: "ok", isError: false, durationMs: 1234 });
+	const stored = storedThread(thread);
+	assert.deepEqual(Object.keys(stored.items[0] as object).sort(), ["args", "callId", "isError", "kind", "name", "output", "running"], "the stored item keeps the shape the file always had");
+	assert.equal(JSON.stringify(stored).includes("durationMs"), false, "no timing reaches the stored form");
+	assert.equal((thread.items[0] as ToolItem).durationMs, 1234, "the live thread keeps the measurement the pane draws");
+	assert.equal(stored.items[1], thread.items[1], "an item without timing is kept as it is");
+	assert.equal(stored.version, thread.version, "projection is not an edit");
+	assert.equal(stored.dropped, thread.dropped);
 });
 
 // #1690: Pi drops unknown --tools names silently, so the child reports them
