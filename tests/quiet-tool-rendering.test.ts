@@ -4,18 +4,20 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initTheme, keyHint } from "@earendil-works/pi-coding-agent";
-import { imageFallback, visibleWidth } from "@earendil-works/pi-tui";
+import { foregroundAnsi, getTerminalColorMode, imageFallback, parseColor, visibleWidth } from "@earendil-works/pi-tui";
 import { cardBody, cardHint, cardTitle, cardTone } from "./gentle-card-text.ts";
 // The real host row: pi builds the call and result components and wraps each in
 // the click region that owns expansion, so click behaviour is only proven by
 // driving that component. The package export map does not expose it, so the test
 // reads the shipped file directly (other suites do the same for pi internals).
 import { ToolExecutionComponent } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js";
+import { loadThemeFromPath } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { CARD_CONTENT, cardContent, setCardContent } from "../lib/card-content-policy.ts";
 import piPretty from "../extensions/pi-pretty.ts";
 import productionQuietTools, {
+	AGENTS_PREVIEW_EXCLUSIONS,
 	createQuietToolRenderer,
 	countNonEmptyLines,
 	extractTextContent,
@@ -23,6 +25,7 @@ import productionQuietTools, {
 	gentleAiRoutineCommand,
 	tailLines,
 } from "../extensions/quiet-tools.ts";
+import { agentToolRendererNames, clearAgentToolRenderers, renderAgentToolItem } from "../lib/agents-tool-renderers.ts";
 
 const passthroughTheme = {
 	bold(value: string) {
@@ -67,12 +70,24 @@ function routineRenderContext(overrides: Record<string, unknown> = {}) {
 // helpers, and the quiet card tests assert the raw frame via frameLines.
 // A pending call's `running…` row is frame chrome too, asserted separately.
 const TAG = "(?:</?[a-zA-Z]+>)*";
-const CARD_TOP = new RegExp(`^${TAG}╭─ ${TAG}[✿≡$⌕⌖☷✎+⚿◎❖⚖▣✓◼]${TAG} (.*?) ${TAG}─+${TAG}(?: .*? )?${TAG}╮${TAG}$`);
+const CARD_TOP = new RegExp(`^${TAG}╭─ ${TAG}[✿≡$⌕⌖☷✎+⚿❖⚖▣✓◼⎇↑▤📑⚠⚒≋]${TAG} (.*?) ${TAG}─+${TAG}(?: .*? )?${TAG}╮${TAG}$`);
 const CARD_SIDE = new RegExp(`^${TAG}│${TAG} (.*) ${TAG}│${TAG}$`);
 const CARD_BOTTOM = new RegExp(`^${TAG}╰${TAG}─*${TAG}╯${TAG}$`);
 
 function frameLines(component: { render(width: number): string[] }, width = 120): string[] {
 	return component.render(width).map((line) => line.trimEnd());
+}
+
+/** HSL hue of a `#rrggbb` color, so a role can be asserted warm or green rather than merely different. */
+function hueOf(hex: string): number {
+	const match = /^#([0-9a-f]{6})$/i.exec(hex);
+	if (!match) throw new Error(`not a hex color: ${hex}`);
+	const [r, g, b] = [0, 2, 4].map((at) => parseInt(match[1].slice(at, at + 2), 16) / 255);
+	const max = Math.max(r, g, b);
+	const delta = max - Math.min(r, g, b);
+	if (delta === 0) return 0;
+	const hue = max === r ? ((g - b) / delta) % 6 : max === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
+	return (hue * 60 + 360) % 360;
 }
 
 const QUIET_CARD_COMPONENTS = new Set(["ToolCardTop", "ToolCardBody"]);
@@ -364,13 +379,36 @@ test("quiet tool rendering keeps compact collapsed summaries for search and list
 	assert.equal(formatToolResultOutput("ls", textResult("Directory is empty") as any, { expanded: false }), "");
 	assert.equal(formatToolResultOutput("read", textResult("a\nb\n") as any, { expanded: false }), "\na\nb");
 	assert.equal(formatToolResultOutput("bash", textResult("a\nb\n") as any, { expanded: false }), "\na\nb");
-	assert.equal(formatToolResultOutput("bash", textResult("a\nb\n") as any, { expanded: false, args: { command: "git diff" } }), "\na\nb\n");
-	assert.equal(formatToolResultOutput("bash", textResult("a\nb\n") as any, { expanded: false, args: { command: "git -C repo status" } }), "\na\nb\n");
+	assert.equal(formatToolResultOutput("bash", textResult("a\nb\n") as any, { expanded: false, args: { command: "git diff" } }), "\na\nb");
+	assert.equal(formatToolResultOutput("bash", textResult("a\nb\n") as any, { expanded: false, args: { command: "git -C repo status" } }), "\na\nb");
 	assert.equal(formatToolResultOutput("bash", textResult("a\nb\n") as any, { expanded: false, args: { command: "echo git diff" } }), "\na\nb");
 	assert.equal(formatToolResultOutput("edit", textResult("updated") as any, { expanded: false }), "\n✓ applied");
 	assert.equal(formatToolResultOutput("write", textResult("wrote") as any, { expanded: false }), "\n✓ written");
 	assert.equal(formatToolResultOutput("grep", textResult("a\nb\n") as any, { expanded: true }), "\na\nb\n");
 	assert.equal(formatToolResultOutput("read", textResult("ENOENT: missing file") as any, { expanded: false, isError: true }), "\nENOENT: missing file");
+});
+
+test("a collapsed git preview drops the trailing newline artifact instead of spending a row on it", () => {
+	const git = { command: "git status" };
+	const output = " M a.ts\n M b.ts\n M c.ts\n";
+	// A command's own final newline is not a row. Keeping it would spend one of the
+	// three collapsed preview rows on nothing, so the preview drops only the empty
+	// rows at the end of its own copy of the text.
+	assert.equal(formatToolResultOutput("bash", textResult(output) as any, { expanded: false, args: git }), "\n M a.ts\n M b.ts\n M c.ts");
+	// Real output and the blank rows inside it are untouched.
+	assert.equal(formatToolResultOutput("bash", textResult(" M a.ts\n\n M c.ts\n") as any, { expanded: false, args: git }), "\n M a.ts\n\n M c.ts");
+	// Expanded output is still the result itself, byte for byte.
+	assert.equal(formatToolResultOutput("bash", textResult(output) as any, { expanded: true, args: git }), `\n${output}`);
+
+	// Drawn collapsed, the card shows three useful rows and no empty one.
+	const bash = registeredQuietTools().get("bash");
+	const context = routineRenderContext({ args: git, executionStarted: true, isPartial: false });
+	const body = frameLines(bash.renderResult(textResult(output), { expanded: false, isPartial: false }, passthroughTheme, context), 80)
+		.slice(0, -1)
+		.map((row) => stripAnsi(row.replace(/^│ /, "").replace(/ *│$/, "")).trimEnd());
+	assert.deepEqual(body, [" M a.ts", " M b.ts", " M c.ts"]);
+	// Expanded, the card keeps the result exactly as the call produced it.
+	assert.ok(renderToolResult(bash, textResult(output), { expanded: true, isPartial: false }, context).endsWith(output));
 });
 
 test("quiet search and placeholder summaries preserve exact-result behavior", async (t) => {
@@ -549,7 +587,11 @@ test("quiet tool rendering refuses to compact composed Gentle AI shell commands"
 		assert.equal(gentleAiRoutineCommand({ command }), undefined, command);
 		const call = renderToString(tools.get("bash").renderCall({ command }, passthroughTheme, {}));
 		const output = renderToString(tools.get("bash").renderResult(textResult("command output"), { expanded: true, isPartial: false }, passthroughTheme, { args: { command } }));
-		assert.equal(call.replace(/[ \t]+$/gm, "").trimEnd(), `bash · ${command.trimEnd().replace(/\n/g, " ")}`);
+		const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		// The card still never compacts the composition: it keeps the tool's own
+		// identity, or the deletion it also runs, and the whole command after it.
+		const heading = call.replace(/[ \t]+$/gm, "").trimEnd();
+		assert.ok(new RegExp(`^(bash|destructive) · ${escapeRegExp(command.trimEnd().replace(/\n/g, " "))}$`).test(heading), `${command} renders ${JSON.stringify(heading)}`);
 		assert.match(output, /command output/);
 	}
 });
@@ -561,7 +603,6 @@ test("quiet tool rendering previews direct Gentle AI results and preserves expan
 	const rose = "\u{1F339}";
 	const tool = tools.get("bash");
 	const failureText = "review status failed: authority unavailable\x1b[31m\nlineage=secret";
-	const expandHint = keyHint("app.tools.expand", "to expand");
 
 	const call = renderToString(tool.renderCall({ command }, passthroughTheme, {}));
 	const collapsed = renderToString(tool.renderResult(textResult('{"next_transition":"stop"}'), { expanded: false, isPartial: false }, passthroughTheme, { args: { command } }));
@@ -987,6 +1028,10 @@ test("quiet tool rendering keeps collapsed git bash result tails", () => {
 
 	assert.equal(formatToolResultOutput("bash", textResult(text) as any, { expanded: false, args: { command: "git diff" } }), `\n${tailLines(text, 10)}`);
 	assert.equal(formatToolResultOutput("bash", textResult(text) as any, { expanded: false, args: { command: "git status --short" } }), `\n${tailLines(text, 10)}`);
+	// Publishing is not versioning: a push keeps the tail preview it always had, and
+	// so does a call whose segments the classifier cannot all name.
+	assert.equal(formatToolResultOutput("bash", textResult(text) as any, { expanded: false, args: { command: "git push origin main" } }), `\n${tailLines(text, 10)}`);
+	assert.equal(formatToolResultOutput("bash", textResult(text) as any, { expanded: false, args: { command: "git commit -m x && git push" } }), `\n${tailLines(text, 10)}`);
 });
 
 test("quiet tool rendering keeps concise collapsed edit and write summaries", () => {
@@ -995,6 +1040,32 @@ test("quiet tool rendering keeps concise collapsed edit and write summaries", ()
 	assert.equal(tailLines(text, 10), Array.from({ length: 10 }, (_, index) => `line ${index + 3}`).join("\n"));
 	assert.equal(formatToolResultOutput("edit", textResult(text, { diff: "@@\n-old\n+new" }) as any, { expanded: false }), "\n✓ +1 / -1");
 	assert.equal(formatToolResultOutput("write", textResult("Successfully wrote 12 bytes\n" + text) as any, { expanded: false }), "\n✓ wrote 12 bytes");
+});
+
+// A diff the Agents pane had to cut to its budget arrives with the whole edit's totals as
+// structured numbers, counted by the protocol over the child's own diff. The summary states
+// those totals and the truncation itself, so the rows this card happens to hold are never
+// presented as the edit's own — and the card reads no number back out of the diff text.
+test("a truncated edit states the whole edit's totals and its truncation, never a partial count", () => {
+	const diff = " … diff truncated: 2 of 9 rows shown; the whole edit is +6 / -3\n-1 old\n+1 new";
+	const totals = { rows: 9, additions: 6, removals: 3 };
+	assert.equal(formatToolResultOutput("edit", textResult("Applied", { diff, truncated: totals }) as any, { expanded: false }), "\n✓ +6 / -3 · truncated");
+	// The claim is not tied to a marker row: the protocol passes the whole edit's totals as
+	// structured numbers, so a cut diff states them even when the marker is not in the text.
+	assert.equal(formatToolResultOutput("edit", textResult("Applied", { diff: "-1 old\n+1 new", truncated: totals }) as any, { expanded: false }), "\n✓ +6 / -3 · truncated");
+	// The same diff without a claim is a diff the card counts itself: nothing is invented.
+	assert.equal(formatToolResultOutput("edit", textResult("Applied", { diff }) as any, { expanded: false }), "\n✓ +1 / -1");
+	// A claim that is not three whole numbers, or that understates the rows it is drawn with,
+	// is not a total: the card falls back to counting the diff it was given.
+	for (const truncated of [
+		{ rows: "9", additions: 6, removals: 3 }, { rows: 9, additions: 6 },
+		{ rows: -9, additions: 6, removals: 3 }, { rows: 9, additions: 0, removals: 3 },
+		[9, 6, 3], "truncated", null, 7,
+	]) {
+		assert.equal(formatToolResultOutput("edit", textResult("Applied", { diff, truncated }) as any, { expanded: false }), "\n✓ +1 / -1", `${JSON.stringify(truncated)} is not a whole edit's totals`);
+	}
+	// Expansion draws the diff itself, its marker row included, whatever the summary states.
+	assert.equal(formatToolResultOutput("edit", textResult("Applied", { diff, truncated: totals }) as any, { expanded: true }), `\n${diff}`);
 });
 
 test("quiet write expansion shows the complete written content without changing the compact summary", () => {
@@ -1092,6 +1163,281 @@ test("quiet tool rendering call rows show tool calls without result output", () 
 	assert.match(bashCall, /bash · printf noisy \(timeout 5s\)/);
 	assert.match(grepCall, /grep \/needle\/ in src \(\*\.ts\)/);
     });
+
+// A call that touches a skill or an ODD artifact heads as that file instead of
+// as a plain tool row: the same card, with the file kind's own name, mark and
+// color, and the range it reads or writes beside the path.
+// A card's heading text, mark included: the raw top rule, read the way the
+// transcript paints it.
+function callCardTitle(tool: any, args: Record<string, unknown>, theme: any = passthroughTheme): string {
+	return cardTitle(tool.renderCall(args, theme, {}).render(120).join("\n"));
+}
+
+test("quiet tool rendering heads a skill file as skill, in the read card's own colors", () => {
+	const tools = registeredQuietTools();
+	const read = tools.get("read");
+	const skill = { path: "skills/gentle-ai/SKILL.md", offset: 2, limit: 3 };
+	assert.equal(callCardTitle(read, skill), "▤ skill · read skills/gentle-ai/SKILL.md:2-4");
+	// A skill keeps the read card's colors: only the name and the mark change.
+	const tagged = read.renderCall(skill, statusTheme, {}).render(120).join("\n");
+	assert.match(tagged, /<toolTitle>▤ skill<\/toolTitle>/);
+	assert.match(tagged, /<accent>skills\/gentle-ai\/SKILL\.md<\/accent><warning>:2-4<\/warning>/);
+	// The range is the one the read asked for, wherever in the file it starts.
+	assert.equal(callCardTitle(read, { path: "skills/gentle-ai/SKILL.md", offset: 142, limit: 4 }), "▤ skill · read skills/gentle-ai/SKILL.md:142-145");
+	// A SKILL.md is a skill without a skills folder too.
+	assert.equal(callCardTitle(read, { path: "/repo/SKILL.md" }), "▤ skill · read /repo/SKILL.md");
+	// A folder that only starts with the word is an ordinary read.
+	assert.equal(callCardTitle(read, { path: "lib/skillset/x.ts" }), "≡ read lib/skillset/x.ts");
+});
+
+test("quiet tool rendering names one read line range in both cards", () => {
+	const read = registeredQuietTools().get("read");
+	// The Agents preview heads the same call from its own renderer, so a range that
+	// only one of the two cards shows would read as two different calls.
+	const previewTitle = (args: Record<string, unknown>): string => {
+		const item = { kind: "tool" as const, callId: "call-1", name: "read", args, output: "one", running: false, isError: false };
+		const rows = renderAgentToolItem(item, passthroughTheme, 120, { expanded: false });
+		assert.ok(rows, "the read card is drawn by the chat's own renderer, not the preview's");
+		return cardTitle(rows.join("\n"));
+	};
+	// A one-row range is still a range, and it ends where it starts.
+	const cases: Array<[Record<string, unknown>, string]> = [
+		[{ path: "lib/x.ts", offset: 5, limit: 1 }, "≡ read lib/x.ts:5-5"],
+		[{ path: "lib/x.ts", offset: 1, limit: 4 }, "≡ read lib/x.ts:1-4"],
+		[{ path: "lib/x.ts", limit: 4 }, "≡ read lib/x.ts:1-4"],
+		// Half a range, an empty range and a start before the first line state nothing:
+		// the card names the file alone rather than lines the call never asked for.
+		[{ path: "lib/x.ts", offset: "2", limit: 3 }, "≡ read lib/x.ts"],
+		[{ path: "lib/x.ts", offset: 2, limit: 0 }, "≡ read lib/x.ts"],
+		[{ path: "lib/x.ts", offset: 0, limit: 2 }, "≡ read lib/x.ts"],
+	];
+	for (const [args, title] of cases) {
+		assert.equal(callCardTitle(read, args), title, JSON.stringify(args));
+		assert.equal(previewTitle(args), title, `${JSON.stringify(args)} reads the same in the pane`);
+	}
+});
+
+test("quiet tool rendering heads an ODD artifact as odd, in the theme's purple", () => {
+	const tools = registeredQuietTools();
+	// An edit and a write name no line range: how many lines they write is not
+	// where in the file those lines land, so a count never wears the range's
+	// clothes. Only a read states a range, because only a read asks for one.
+	const edit = callCardTitle(tools.get("edit"), { path: "odd/work/feat/design.md", oldText: "a", newText: "one\ntwo" });
+	const write = callCardTitle(tools.get("write"), { path: "odd/work/feat/design.md", content: "one\ntwo\nthree" });
+	// Collapsed, an ODD card names the file itself; the path is what expanding it states.
+	assert.equal(edit, "📑 odd · edit design.md");
+	assert.equal(write, "📑 odd · write design.md");
+	assert.doesNotMatch(edit, /:\d/, "a line count never reads as a file line number");
+	assert.doesNotMatch(write, /:\d/, "a line count never reads as a file line number");
+	// A Windows path is the same path components.
+	assert.equal(callCardTitle(tools.get("read"), { path: "C:\\repo\\odd\\work\\x.md" }), "📑 odd · read x.md", "a Windows path names the same file");
+	// The heading wears the theme's own `mdHeading` role — not the warm role, not the
+	// rose `checking` paints and not a code-syntax slot — and the frame keeps the state.
+	const tagged = tools.get("read").renderCall({ path: "odd/work/x.md" }, statusTheme, {}).render(120).join("\n");
+	assert.match(tagged, /<mdHeading>📑 odd<\/mdHeading>/);
+	assert.doesNotMatch(tagged, /<warning>📑 odd/);
+	for (const role of ["syntaxFunction", "syntaxVariable", "syntaxKeyword", "mdHr", "toolTitle"]) {
+		assert.doesNotMatch(tagged, new RegExp(`<${role}>📑 odd`), `the identity is not the theme's ${role}`);
+	}
+	assert.match(tagged, /<accent>x\.md<\/accent>/, "collapsed it names the file, and expanding it is what states the path");
+	// An unrelated file keeps the plain read card.
+	assert.equal(callCardTitle(tools.get("read"), { path: "docs/oddity.md" }), "≡ read docs/oddity.md");
+});
+
+test("a file card's left rail carries the ODD role, so the line and its label agree", () => {
+	const tools = registeredQuietTools();
+	const args = { path: "odd/work/design.md" };
+	// The label wears the label's own role; the left edge wears the call's state, so a
+	// running call states it there while the frame and the label keep their own roles.
+	const running = frameLines(tools.get("read").renderCall(args, statusTheme, routineRenderContext({ args, state: {} })), 80);
+	assert.match(running[0]!, /^<warning>╭<\/warning>.*<mdHeading>📑 odd<\/mdHeading>/);
+	assert.match(running[1]!, /^<warning>│<\/warning> .*<warning>│<\/warning>$/, "a running call states itself on both rails");
+	const finished = frameLines(tools.get("read").renderResult(textResult("one"), { expanded: false, isPartial: false }, statusTheme, routineRenderContext({ args, executionStarted: true, isPartial: false, state: {} })), 80);
+	assert.match(finished[0]!, /^<mdHeading>│<\/mdHeading> /);
+	assert.match(finished.at(-1)!, /^<mdHeading>╰<\/mdHeading><success>─+╯<\/success>$/);
+	// A skill keeps the read card's rail: only the name and the mark change.
+	const skill = { path: "skills/a/SKILL.md" };
+	const skillRows = frameLines(tools.get("read").renderCall(skill, statusTheme, routineRenderContext({ args: skill, state: {} })), 80);
+	assert.match(skillRows[1]!, /^<warning>│<\/warning> /);
+});
+
+test("the ODD card wears the theme's mdHeading in every shipped theme, heading and rail alike", async () => {
+	// The end-to-end claim, measured where a user sees it: with each theme the project
+	// actually ships, the heading and the rail that leads the rows carry the same role, so
+	// the theme decides the color — no card-local hex, and nothing for a theme to repaint.
+	const { readFile } = await import("node:fs/promises");
+	const { fileURLToPath } = await import("node:url");
+	const tools = registeredQuietTools();
+	const args = { path: "odd/work/design.md" };
+	const mode = getTerminalColorMode();
+	for (const name of ["Gentle", "Gentleman-Cute", "Gentleman-Sexy"]) {
+		const path = fileURLToPath(new URL(`../themes/${name}.json`, import.meta.url));
+		const theme = loadThemeFromPath(path, mode);
+		const shipped = JSON.parse(await readFile(path, "utf8"));
+		const resolve = (role: string) => shipped.vars?.[shipped.colors[role]] ?? shipped.colors[role];
+		const expected = foregroundAnsi(parseColor(resolve("mdHeading")), mode);
+		assert.ok(expected.length > 0, `${name}: the role resolves to a painted color`);
+		const heading = frameLines(tools.get("read").renderCall(args, theme, routineRenderContext({ args, state: {} })), 100)
+			.find((line) => stripAnsi(line).includes("odd ·")) ?? "";
+		assert.ok(heading.includes(expected), `${name}: the heading wears mdHeading`);
+		const rail = frameLines(tools.get("read").renderResult(textResult("one"), { expanded: false, isPartial: false }, theme, routineRenderContext({ args, executionStarted: true, isPartial: false, state: {} })), 100)
+			.find((line) => stripAnsi(line).includes("one")) ?? "";
+		assert.ok(rail.includes(expected), `${name}: the rail wears the same mdHeading`);
+	}
+});
+
+test("a collapsed file card previews three rows and expanding keeps every one", () => {
+	const tools = registeredQuietTools();
+	const output = ["## Design", "one", "two", "three", "four", "five"].join("\n");
+	const args = { path: "odd/work/design.md" };
+	const context = routineRenderContext({ args, executionStarted: true, isPartial: false });
+	const collapsed = renderToolResult(tools.get("read"), textResult(output), { expanded: false, isPartial: false }, context);
+	assert.deepEqual(cardBody(collapsed).split("\n").filter((row) => row.trim().length > 0), ["## Design", "one", "two"], "three rows, no more");
+	const expanded = renderToolResult(tools.get("read"), textResult(output), { expanded: true, isPartial: false }, context);
+	for (const row of ["Design", "one", "two", "three", "four", "five"]) assert.match(expanded, new RegExp(row), `expanding keeps "${row}"`);
+});
+
+test("an expanded read of any Markdown file renders as Markdown; any other file stays plain", () => {
+	const tools = registeredQuietTools();
+	const source = "## Handoff\n\nSome **bold** text with `code`.";
+	// Markdown is the shape of the document, not a property of the folder holding it:
+	// a skill's file, an ODD artifact and a project's own notes read the same way.
+	for (const path of ["skills/a/SKILL.md", "odd/work/design.md", "docs/design.md", "README.md", "notes/plan.MD"]) {
+		const expanded = renderToolResult(tools.get("read"), textResult(source), { expanded: true, isPartial: false }, { args: { path } });
+		assert.doesNotMatch(expanded, /## Handoff/, `${path}: the heading renders instead of its source`);
+		assert.match(expanded, /Handoff/);
+		assert.doesNotMatch(expanded, /\*\*/, `${path}: emphasis renders instead of its source`);
+		// Collapsed keeps the raw first rows: the preview is the file, not a render of it.
+		assert.match(renderToolResult(tools.get("read"), textResult(source), { expanded: false, isPartial: false }, { args: { path } }), /## Handoff/, path);
+	}
+	// A file that is not Markdown is the ordinary read output.
+	for (const path of ["skills/a/notes.txt", "lib/x.ts", "odd/work/design.markdown.txt"]) {
+		assert.match(renderToolResult(tools.get("read"), textResult(source), { expanded: true, isPartial: false }, { args: { path } }), /## Handoff/, path);
+	}
+	// A failed read keeps its cause rather than drawing an empty document.
+	const failed = renderToolResult(tools.get("read"), textResult("## not a document"), { expanded: true, isPartial: false, isError: true }, { args: { path: "docs/design.md" }, isError: true });
+	assert.match(failed, /## not a document/, "a failure's rows are its error, not a render of them");
+});
+
+test("a file card keeps the diff an edit applied, the content a write wrote, and a failure's cause", () => {
+	const tools = registeredQuietTools();
+	const edit = renderToolResult(tools.get("edit"), textResult("Applied", { diff: "@@ -1 +1 @@\n-old\n+new" }), { expanded: true, isPartial: false }, { args: { path: "odd/work/x.md", oldText: "old", newText: "new" } });
+	assert.match(edit, /-old\n\+new/);
+	// An expanded write of a Markdown document renders the content it wrote through
+	// the same Markdown renderer a read of it uses, whatever folder holds the file.
+	const write = renderToolResult(tools.get("write"), textResult("Successfully wrote 21 bytes"), { expanded: true, isPartial: false }, { args: { path: "odd/work/x.md", content: "## written as it is" } });
+	assert.match(write, /written as it is/);
+	assert.doesNotMatch(write, /## written as it is/, "an expanded Markdown write renders instead of echoing its source");
+	// A failed read says why; a missing file is never drawn as an empty Markdown card.
+	const failed = renderToolResult(tools.get("read"), textResult("ENOENT: no such file or directory"), { expanded: true, isPartial: false, isError: true }, { args: { path: "odd/work/missing.md" }, isError: true });
+	assert.match(failed, /ENOENT/);
+	assert.equal(renderToolResult(tools.get("read"), textResult("ENOENT: no such file"), { expanded: false, isPartial: false, isError: true }, { args: { path: "odd/work/missing.md" }, isError: true }).includes("ENOENT"), true, "a collapsed failure keeps its cause too");
+});
+
+test("an expanded write of any Markdown file renders what it wrote; every other write stays plain", () => {
+	const tools = registeredQuietTools();
+	const source = "## Handoff\n\nSome **bold** text with `code`.";
+	const write = (path: string, extra: Record<string, unknown> = {}) => renderToolResult(tools.get("write"), textResult("Successfully wrote 44 bytes"), { expanded: true, isPartial: false }, { args: { path, content: source, ...extra } });
+	for (const path of ["odd/work/design.md", "skills/a/SKILL.md", "docs/design.md", "CHANGELOG.md"]) {
+		const rendered = write(path);
+		assert.doesNotMatch(rendered, /## Handoff/, `${path}: the heading renders instead of its source`);
+		assert.match(rendered, /Handoff/);
+		assert.doesNotMatch(rendered, /\*\*/, `${path}: emphasis renders instead of its source`);
+		assert.match(rendered, /code/, `${path}: the whole content is kept`);
+	}
+	// A non-Markdown file keeps the content as it was written.
+	for (const path of ["skills/a/notes.txt", "odd/work/notes.txt", "lib/x.ts"]) assert.match(write(path), /## Handoff/, path);
+	// Collapsed keeps the write's own summary, never a rendering of the body.
+	const collapsed = renderToolResult(tools.get("write"), textResult("Successfully wrote 44 bytes"), { expanded: false, isPartial: false }, { args: { path: "odd/work/design.md", content: source } });
+	assert.match(collapsed, /wrote 44 bytes/);
+	assert.doesNotMatch(collapsed, /Handoff/);
+	// A failed write says why, and a write whose call carried no content keeps the
+	// result it has rather than an empty Markdown card.
+	const failed = renderToolResult(tools.get("write"), textResult("EACCES: permission denied"), { expanded: true, isPartial: false, isError: true }, { args: { path: "odd/work/design.md", content: source }, isError: true });
+	assert.match(failed, /EACCES/);
+	assert.doesNotMatch(failed, /Handoff/);
+	const empty = renderToolResult(tools.get("write"), textResult("Successfully wrote 0 bytes"), { expanded: true, isPartial: false }, { args: { path: "odd/work/design.md", content: "" } });
+	assert.match(empty, /wrote 0 bytes/);
+});
+
+test("an edit card colors only the rows its diff added or removed", () => {
+	// The diff pi's edit tool reports is one row per changed or shown line, each
+	// opening with the mark that says which it is. The card paints the added rows in
+	// the theme's added role and the removed rows in its removed role, at both
+	// expansion levels, while its own summary keeps the role it always had and a
+	// context row, a patch file header and a hunk header are never read as changes.
+	const tools = registeredQuietTools();
+	const edit = tools.get("edit");
+	const context = routineRenderContext({ args: { path: "lib/x.ts", edits: [{ oldText: "const b = 2;", newText: "const b = 3;" }] }, isPartial: false });
+	const diff = ["@@ -1,2 +1,2 @@", "-1 const b = 2;", "+1 const b = 3;", " 1 const a = 1;"];
+	const result = textResult("Applied", { diff: diff.join("\n") });
+
+	assert.deepEqual(renderLines(edit.renderResult(result, { expanded: true, isPartial: false }, statusTheme, context)), [
+		"<toolOutput>@@ -1,2 +1,2 @@</toolOutput>",
+		"<toolDiffRemoved>-1 const b = 2;</toolDiffRemoved>",
+		"<toolDiffAdded>+1 const b = 3;</toolDiffAdded>",
+		"<toolOutput> 1 const a = 1;</toolOutput>",
+	]);
+	// Collapsed keeps its concise summary and the changed rows it previewed, now
+	// told apart by the same two roles.
+	assert.deepEqual(renderLines(edit.renderResult(result, { expanded: false, isPartial: false }, statusTheme, context)), [
+		"<muted>✓ +1 / -1</muted>",
+		"<toolDiffRemoved>-1 const b = 2;</toolDiffRemoved>",
+		"<toolDiffAdded>+1 const b = 3;</toolDiffAdded>",
+	]);
+});
+
+test("a result that is not an edit's diff keeps one role at both expansion levels", () => {
+	// Only the edit card reads the diff's marks. Every other result — and an edit
+	// that failed, whose rows are its error rather than a diff — is painted in the
+	// one role it always was, even when its text happens to open with `+` or `-`.
+	const tools = registeredQuietTools();
+	const text = "-1 not a diff\n+2 still text";
+	const cases = [
+		["read", { path: "lib/x.ts" }, textResult(text)],
+		["write", { path: "lib/x.ts", content: text }, textResult("Successfully wrote 21 bytes")],
+		["grep", { pattern: "x", path: "lib" }, textResult(text)],
+	] as const;
+	for (const [toolName, args, result] of cases) {
+		const tool = tools.get(toolName);
+		for (const expanded of [true, false]) {
+			const rows = renderLines(tool.renderResult(result, { expanded, isPartial: false }, statusTheme, routineRenderContext({ args, isPartial: false })), 60);
+			assert.doesNotMatch(rows.join("\n"), /toolDiff(?:Added|Removed)/, `${toolName} expanded=${expanded}`);
+			assert.ok(rows.some((row) => row.length > 0), `${toolName} expanded=${expanded} draws its rows`);
+		}
+	}
+	const failed = renderLines(tools.get("edit").renderResult(
+		textResult("-1 the edit failed"),
+		{ expanded: true, isPartial: false, isError: true },
+		statusTheme,
+		routineRenderContext({ args: { path: "lib/x.ts" }, isPartial: false, isError: true }),
+	), 60);
+	assert.doesNotMatch(failed.join("\n"), /toolDiff(?:Added|Removed)/, "a failed edit keeps its error in the error role");
+	assert.match(failed.join("\n"), /<error>-1 the edit failed<\/error>/);
+});
+
+test("a colored edit row keeps its own role on every row it wraps to at a narrow width", () => {
+	// The roles are painted per row before the card wraps it, so a long added row
+	// stays green on each row it continues to and a long removed row stays red — and
+	// every drawn row still fits the width it was given.
+	const paint = (role: string) => ({ toolDiffAdded: "\x1b[32m", toolDiffRemoved: "\x1b[31m", toolOutput: "\x1b[37m", muted: "\x1b[2m" })[role] ?? "\x1b[39m";
+	const ansiTheme = { ...passthroughTheme, fg: (role: string, text: string) => `${paint(role)}${text}\x1b[0m` };
+	const tools = registeredQuietTools();
+	const line = "x".repeat(60);
+	const diff = [`-1 ${line}`, `+2 ${line}`, " 3 tail"].join("\n");
+	const width = 24;
+	const rows = frameLines(tools.get("edit").renderResult(
+		textResult("Applied", { diff }),
+		{ expanded: true, isPartial: false },
+		ansiTheme,
+		routineRenderContext({ args: { path: "lib/x.ts" }, isPartial: false }),
+	), width);
+	assert.ok(rows.length > 3, "the long rows wrap onto more rows than the diff has lines");
+	for (const row of rows) assert.ok(visibleWidth(row) <= width, `"${stripAnsi(row)}" fits ${width}`);
+	assert.ok(rows.filter((row) => row.includes("\x1b[32m")).length > 1, "an added row stays added on every row it wraps to");
+	assert.ok(rows.filter((row) => row.includes("\x1b[31m")).length > 1, "a removed row stays removed on every row it wraps to");
+	assert.ok(rows.some((row) => row.includes("\x1b[37m")), "a context row keeps the role the card already used");
+});
 
 test("quiet tool rendering limits collapsed visual rows at the actual width", () => {
 	const tools = registeredQuietTools();
@@ -1476,61 +1822,133 @@ test("bash cards head with the ODD phase their command implies and keep the call
 
 	// The phase names the card, its own mark leads it, and the command rides beside it.
 	for (const [command, phase, glyph] of [
-		["git status --short", "exploring", "◎"],
-		["ls -la src", "exploring", "◎"],
+		["git status --short", "exploring", "⌕"],
+		["ls -la src", "exploring", "⌕"],
 		// A verification runner checks, even alongside inspection.
 		["pnpm test", "checking", "✓"],
-		// A composition names the segment that decided its phase.
+		// A composition keeps its whole command, and its phase still names the card.
 		["git log --oneline && pnpm test", "checking", "✓"],
 	] as const) {
-		const detail = command === "git log --oneline && pnpm test" ? "pnpm test" : command;
-		assert.match(header({ command }), new RegExp(`^╭─ ${glyph} ${phase} · ${escape(detail)} ─+╮$`), command);
+		assert.match(header({ command }), new RegExp(`^╭─ ${glyph} ${phase} · ${escape(command)} ─+╮$`), command);
 	}
 
 	// Each label paints itself in its own color while the frame keeps the call's status.
-	assert.match(header({ command: "git status" }, statusTheme), /^<warning>╭<\/warning>.*<mdLink>◎ exploring<\/mdLink>/);
+	assert.match(header({ command: "git status" }, statusTheme), /^<warning>╭<\/warning>.*<mdLink>⌕ exploring<\/mdLink>/);
 	assert.match(header({ command: "pnpm test" }, statusTheme), /<mdHeading>✓ checking<\/mdHeading>/);
 	// The timeout chip stays part of the call detail.
 	assert.match(header({ command: "git status", timeout: 5 }), /· git status \(timeout 5s\) ─+╮$/);
 });
 
-test("bash cards name the principal action of a shell composition", () => {
-	const bash = registeredQuietTools().get("bash");
-	const heading = (command: string) => frameLines(bash.renderCall({ command }, passthroughTheme, routineRenderContext({ args: { command } })), 120)[0] ?? "";
+// A float-capable theme that still tells theme roles apart: the accent bar's own
+// role is what the rail tests read, and the float panel needs a real background
+// reset to paint at all.
+const RAIL_FG: Record<string, number> = { mdLink: 111, mdHeading: 178, bashMode: 114, warning: 221, success: 114, error: 203, muted: 245, toolTitle: 114, accent: 114, toolOutput: 245 };
+const phaseRailTheme = {
+	bold(value: string) {
+		return value;
+	},
+	fg(color: string, value: string) {
+		return `\x1b[38;5;${RAIL_FG[color] ?? 250}m${value}\x1b[39m`;
+	},
+	bg(color: string, value: string) {
+		return `\x1b[48;5;${color === "toolErrorBg" ? 52 : color === "toolPendingBg" ? 58 : 22}m${value}\x1b[49m`;
+	},
+};
 
-	assert.match(heading("git status"), /^╭─ ◎ exploring · git status ─+╮$/, "a single command has nothing to abbreviate");
-	assert.match(heading("cd repo && git diff"), /^╭─ ◎ exploring · git diff ─+╮$/, "the neutral segment is dropped");
-	assert.match(heading("git log --oneline && pnpm test"), /^╭─ ✓ checking · pnpm test ─+╮$/, "checking names the runner that decided it");
-	assert.match(heading("npx vitest run src"), /^╭─ ✓ checking · npx vitest run src ─+╮$/);
-	// An unreadable composition keeps the whole command instead of guessing at it.
-	assert.match(heading('git diff "$(cat list.txt)"'), /^╭─ ◎ exploring · git diff "\$\(cat list\.txt\)" ─+╮$/);
+test("a bash card's left rail carries the phase's own color while the frame keeps the call's status", () => {
+	const bash = registeredQuietTools().get("bash");
+	const args = { command: "git status" };
+	// Running: the frame and the left edge are the pending tone — a state the card must
+	// state from every corner — while the label keeps the phase's own color.
+	const running = frameLines(bash.renderCall(args, statusTheme, routineRenderContext({ args, state: {} })), 80);
+	assert.match(running[0]!, /^<warning>╭<\/warning>.*<mdLink>⌕ exploring<\/mdLink>/);
+	assert.match(running[1]!, /^<warning>│<\/warning> .*<warning>│<\/warning>$/, "a running call states itself on both rails");
+	assert.match(running.at(-1)!, /^<warning>╰<\/warning><warning>─+╯<\/warning>$/);
+
+	// Finished, the status turns success and the rail keeps the phase color; failed,
+	// the frame turns red for the same rail.
+	const finished = frameLines(bash.renderResult(textResult("clean"), { expanded: false, isPartial: false }, statusTheme, routineRenderContext({ args, executionStarted: true, isPartial: false, state: {} })), 80);
+	assert.match(finished[0]!, /^<mdLink>│<\/mdLink> /);
+	assert.match(finished.at(-1)!, /^<mdLink>╰<\/mdLink><success>─+╯<\/success>$/);
+
+	const failed = frameLines(bash.renderResult(textResult("boom"), { expanded: false, isPartial: false, isError: true }, statusTheme, routineRenderContext({ args, executionStarted: true, isPartial: false, isError: true, state: {} })), 80);
+	assert.match(failed[0]!, /^<error>│<\/error> /);
+	assert.match(failed.at(-1)!, /^<error>╰<\/error><error>─+╯<\/error>$/);
+
+	// A checking phase keeps its own color on a finished call, and the generic fallback
+	// its own, so the rail never claims a phase the heading does not name.
+	const finishedCall = (command: string) => frameLines(bash.renderResult(textResult("ok"), { expanded: false, isPartial: false }, statusTheme, routineRenderContext({ args: { command }, executionStarted: true, isPartial: false, state: {} })), 80);
+	assert.match(finishedCall("pnpm test")[0]!, /^<mdHeading>│<\/mdHeading> /);
+	assert.match(finishedCall("printf output")[0]!, /^<bashMode>│<\/bashMode> /);
+
+	// Every other quiet tool keeps the rail it always had: the tone, not a phase.
+	const read = registeredQuietTools().get("read");
+	const readRows = frameLines(read.renderCall({ path: "a.md" }, statusTheme, routineRenderContext({ args: { path: "a.md" }, state: {} })), 80);
+	assert.match(readRows[1]!, /^<warning>│<\/warning> /, "a non-phase tool never borrows a phase color");
+
+	// The float style draws one continuous bar: a finished call paints it in the phase's
+	// color, while a running one keeps the pending bar its background tint already states.
+	const floated = withFloatCards(() => [
+		...bash.renderResult(textResult("clean"), { expanded: false, isPartial: false }, phaseRailTheme, routineRenderContext({ args, executionStarted: true, isPartial: false, state: {} })).render(40),
+	]);
+	assert.ok(floated.length > 2);
+	for (const row of floated) {
+		assert.equal(visibleWidth(row), 40);
+		assert.ok(row.includes("\x1b[38;5;111m▎"), `every bar cell keeps the rail color: ${JSON.stringify(row)}`);
+	}
+	const runningFloat = withFloatCards(() => [...bash.renderCall(args, phaseRailTheme, routineRenderContext({ args, state: {} })).render(40)]);
+	assert.ok(runningFloat.length > 2);
+	for (const row of runningFloat) {
+		assert.equal(visibleWidth(row), 40);
+		assert.ok(!row.includes("\x1b[38;5;111m▎"), `a running call never claims the phase bar: ${JSON.stringify(row)}`);
+	}
 });
 
-test("a composition with a consequential extra action keeps the whole command", () => {
+test("a bash card heads with the complete command its composition runs", () => {
 	const bash = registeredQuietTools().get("bash");
-	const heading = (command: string) => frameLines(bash.renderCall({ command }, passthroughTheme, routineRenderContext({ args: { command } })), 120)[0] ?? "";
+	const heading = (command: string) => frameLines(bash.renderCall({ command }, passthroughTheme, routineRenderContext({ args: { command } })), 160)[0] ?? "";
 
-	// A mutation or an unknown program must never be hidden behind a test run.
-	assert.match(heading("pnpm test && rm -rf dist"), /✓ checking · pnpm test && rm -rf dist/);
-	assert.match(heading("pnpm test && npm install"), /✓ checking · pnpm test && npm install/);
-	// A mutation makes the whole command ambiguous, so it is generic and shows all of it.
-	assert.match(heading("git status && node scripts/deploy.mjs"), /\$ bash · git status && node scripts\/deploy\.mjs/);
+	// The phase is inferred from the composition, but the detail is the command
+	// itself: no segment is ever dropped or shortened into a substitute.
+	assert.match(heading("git status"), /^╭─ ⌕ exploring · git status ─+╮$/, "a single command is its own detail");
+	assert.match(heading("cd repo && git diff"), /^╭─ ⌕ exploring · cd repo && git diff ─+╮$/, "a neutral segment is never dropped");
+	assert.match(heading("git log --oneline && pnpm test"), /^╭─ ✓ checking · git log --oneline && pnpm test ─+╮$/, "the runner that decided the phase keeps its neighbours");
+	assert.match(heading("npx vitest run src"), /^╭─ ✓ checking · npx vitest run src ─+╮$/);
 
-	// A redirection in an otherwise neutral segment writes a file: show everything.
-	assert.match(heading("pnpm test && echo ok > out.txt"), /✓ checking · pnpm test && echo ok > out\.txt/);
-	assert.match(heading("pnpm test; echo done >> test.log"), /✓ checking · pnpm test; echo done >> test\.log/);
+	// A consequential or unreadable segment is part of the command, not a reason to
+	// abbreviate it: everything the call runs stays visible, a deletion names the
+	// card, and a segment nothing can name keeps the card generic rather than
+	// claiming the check that ran beside it (the working label still follows it).
+	assert.match(heading("pnpm test && rm -rf dist"), /⚠ destructive · pnpm test && rm -rf dist ─+/);
+	assert.match(heading("pnpm test && echo ok > out.txt"), /^╭─ \$ bash · pnpm test && echo ok > out\.txt ─+╮$/);
+	assert.match(heading("pnpm test && echo done | tee log.txt"), /^╭─ \$ bash · pnpm test && echo done \| tee log\.txt ─+╮$/);
+	assert.match(heading("git status || pnpm test"), /✓ checking · git status \|\| pnpm test ─+/);
+	assert.match(heading('git diff "$(cat list.txt)"'), /^╭─ ⌕ exploring · git diff "\$\(cat list\.txt\)" ─+╮$/);
 
-	// A pipeline routes output into another program, so no part of it is the whole story.
-	assert.match(heading("pnpm test && echo done | tee log.txt"), /✓ checking · pnpm test && echo done \| tee log\.txt/);
-	assert.match(heading("git status || pnpm test"), /✓ checking · git status \|\| pnpm test/);
+	// A composition no single phase labels keeps the generic identity and all of it.
+	assert.match(heading("git status && node scripts/deploy.mjs"), /^╭─ \$ bash · git status && node scripts\/deploy\.mjs ─+╮$/);
+});
 
-	// Harmless no-ops may still be skipped, and the preserved cases stay abbreviated.
-	assert.match(heading("pnpm test && echo done"), /✓ checking · pnpm test ─+/);
-	assert.match(heading("git log --oneline && pnpm test"), /✓ checking · pnpm test ─+/);
-	assert.match(heading("cd repo && git diff"), /◎ exploring · git diff ─+/);
-	// Discarded output and stream merges are not writes, so they may still be skipped.
-	assert.match(heading("pnpm test && echo ok 2>/dev/null"), /✓ checking · pnpm test ─+/);
-	assert.match(heading("cd repo && echo ok 2>&1"), /\$ bash|◎ exploring|✓ checking/);
+test("a wide bash command collapses to one ellipsized row and expands to the whole command", () => {
+	const bash = registeredQuietTools().get("bash");
+	const command = "git log --oneline --decorate --graph --all && pnpm --filter packages/app test -- --runInBand";
+	const width = 72;
+	const context = (expanded: boolean) => routineRenderContext({ args: { command }, executionStarted: true, isPartial: false, expanded });
+
+	const collapsed = frameLines(bash.renderCall({ command }, passthroughTheme, context(false)), width);
+	assert.equal(collapsed.length, 1, "the collapsed heading stays one row");
+	assert.ok(collapsed[0]!.includes("✓ checking"), collapsed[0]);
+	assert.ok(collapsed[0]!.includes("…"), `an over-wide command ends in an ellipsis: ${collapsed[0]}`);
+	assert.ok(!collapsed[0]!.includes("--runInBand"), `the collapsed row never keeps one segment instead of the command: ${collapsed[0]}`);
+	assert.ok(visibleWidth(collapsed[0]!) <= width);
+
+	// Expanded, the same command is complete across the rows below the rule.
+	const expanded = frameLines(bash.renderCall({ command }, passthroughTheme, context(true)), width);
+	assert.ok(expanded.length > 1, "the complete command continues below the rule");
+	const shown = expanded.map((row) => stripAnsi(row).replace(/[│╭╮╰╯]/g, " ").replace(/─+/g, " ")).join(" ").replace(/\s+/g, " ").trim();
+	assert.ok(shown.includes(command), `expanded rows carry the whole command: ${shown}`);
+	assert.ok(!shown.includes("…"), "expanding removes the ellipsis");
+	assert.ok(expanded.every((row) => visibleWidth(row) <= width));
 });
 
 test("the elapsed time rides the closing rule when the host reports it", () => {
@@ -1553,31 +1971,563 @@ test("a command with no inferable phase heads as the generic bash card", () => {
 		frameLines(bash.renderCall(args, theme, routineRenderContext({ args })), 120)[0] ?? "";
 
 	// Ambiguous commands keep the generic bash identity: its mark, its title, its color.
-	for (const command of ["printf output", "rm -rf build", "node scripts/release.mjs"]) {
+	for (const command of ["printf output", "node scripts/release.mjs", "make install"]) {
 		const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		assert.match(header({ command }), new RegExp(`^╭─ \\$ bash · ${escaped} ─+╮$`), command);
 	}
 	assert.match(header({ command: "printf output" }, statusTheme), /<bashMode>\$ bash<\/bashMode>/);
 });
 
-test("only the phases a bash command can produce carry a card style", async () => {
-	const { PHASE_IDENTITY, BASH_IDENTITY } = await import("../extensions/quiet-tools.ts") as any;
-	const { inferOddPhase } = await import("../lib/odd-phase-inference.ts");
+test("bash cards follow the widened check and metadata-probe families", () => {
+	const bash = registeredQuietTools().get("bash");
+	const heading = (command: string) => frameLines(bash.renderCall({ command }, passthroughTheme, routineRenderContext({ args: { command } })), 120)[0] ?? "";
+
+	// A workspace-flagged runner is still the check that decided the phase.
+	assert.match(heading("pnpm -C packages/app test"), /^╭─ ✓ checking · pnpm -C packages\/app test ─+╮$/);
+	// A namespaced script keeps its base family, so it still heads as a check.
+	assert.match(heading("pnpm run test:unit"), /^╭─ ✓ checking · pnpm run test:unit ─+╮$/);
+	// A metadata probe heads as inspection, and a pipeline is never abbreviated.
+	assert.match(heading("locale | head -4"), /^╭─ ⌕ exploring · locale \| head -4 ─+╮$/);
+	// A recipe this classifier cannot name keeps the generic identity.
+	assert.match(heading("make install"), /^╭─ \$ bash · make install ─+╮$/);
+	assert.match(heading("make -j install"), /^╭─ \$ bash · make -j install ─+╮$/);
+	// A hidden substitution is unreadable, so it stays generic rather than inspection.
+	assert.match(heading("git log --oneline `git rev-parse HEAD`"), /^╭─ \$ bash · git log --oneline `git rev-parse HEAD` ─+╮$/);
+});
+
+test("every activity a bash command can imply carries its own card style", async () => {
+	const { BASH_IDENTITY } = await import("../extensions/quiet-tools.ts") as any;
+	const { SHELL_ACTIVITIES, SHELL_ACTIVITY_IDENTITY, inferShellActivity } = await import("../lib/odd-phase-inference.ts");
 	const { ODD_PHASES } = await import("../lib/odd-phase.ts");
-	// Evidence for the narrow table: shell inference can only return these two.
+	// Evidence for the table: every activity the classifier can name is styled, and
+	// a command it cannot name leaves the card generic.
 	const reachable = new Set<string>();
-	for (const command of ["git status", "ls -la", "pnpm test", "npx vitest run", "rm -rf build", "node x.mjs", "printf hi"]) {
-		const phase = inferOddPhase("bash", { command });
-		if (phase) reachable.add(phase);
+	for (const command of [
+		"git status", "ls -la", "pnpm test", "git commit -m x", "git push", "gh stack submit",
+		"pnpm install", "prettier --write .", "rm -rf build", "node x.mjs",
+		"docker system prune -af", "kubectl delete pod web", "git push --delete origin feat/x",
+	]) {
+		const activity = inferShellActivity(command);
+		if (activity) reachable.add(activity);
 	}
-	assert.deepEqual([...reachable].sort(), ["checking", "exploring"]);
-	assert.deepEqual(Object.keys(PHASE_IDENTITY).sort(), [...reachable].sort(), "the card styles exactly the reachable phases");
-	assert.deepEqual(Object.keys(PHASE_IDENTITY).filter((phase) => !(ODD_PHASES as readonly string[]).includes(phase)), []);
-	const marks = Object.values(PHASE_IDENTITY).map((identity: any) => identity.glyph);
-	assert.equal(new Set(marks).size, 2, "each reachable phase has its own mark");
-	const roles = Object.values(PHASE_IDENTITY).map((identity: any) => identity.titleRole);
-	assert.equal(new Set(roles).size, 2, "each reachable phase has its own color");
-	assert.notEqual(BASH_IDENTITY.titleRole, PHASE_IDENTITY.exploring.titleRole, "the generic fallback is never a phase look");
+	assert.deepEqual([...reachable].sort(), ["checking", "destructive", "exploring", "formatting", "preparing", "publishing", "versioning"]);
+	assert.deepEqual(Object.keys(SHELL_ACTIVITY_IDENTITY).sort(), [...SHELL_ACTIVITIES].sort(), "the card styles exactly the activities the classifier names");
+	assert.deepEqual(Object.keys(SHELL_ACTIVITY_IDENTITY).sort(), [...reachable].sort());
+	// Two of them are ODD phases; the rest are card identities, so the global phase
+	// enum keeps its eight labels.
+	assert.deepEqual(Object.keys(SHELL_ACTIVITY_IDENTITY).filter((activity) => (ODD_PHASES as readonly string[]).includes(activity)).sort(), ["checking", "exploring"]);
+	for (const identity of ["versioning", "publishing", "preparing", "formatting", "destructive"]) {
+		assert.equal((ODD_PHASES as readonly string[]).includes(identity), false, identity);
+	}
+	const marks = Object.values(SHELL_ACTIVITY_IDENTITY).map((identity: any) => identity.glyph);
+	assert.equal(new Set(marks).size, 7, "each activity has its own mark");
+	// A mark is one cell, or one cell plus the single-column gap it carries so a font
+	// that paints it two cells wide cannot swallow the word beside it.
+	for (const mark of marks) {
+		const glyph = mark.trimEnd();
+		assert.equal(visibleWidth(glyph), 1, `${glyph} is one cell wide, so the heading's width math holds`);
+		assert.ok(visibleWidth(mark) <= 2, `${mark} carries at most the one gap column it needs`);
+		assert.equal(mark.length - glyph.length, visibleWidth(mark) - 1, `${mark}: the gap is the whole extra width`);
+	}
+	// The theme has six slots a heading can wear, so the two maintenance identities —
+	// installing and reformatting — share the code palette and are told apart by their
+	// mark and their word rather than by a seventh colour no shipped theme defines.
+	const roles = Object.values(SHELL_ACTIVITY_IDENTITY).map((identity: any) => identity.titleRole);
+	assert.equal(new Set(roles).size, 6, "six theme slots, one per distinguishable colour");
+	assert.equal(SHELL_ACTIVITY_IDENTITY.formatting.titleRole, SHELL_ACTIVITY_IDENTITY.preparing.titleRole);
+	assert.notEqual(SHELL_ACTIVITY_IDENTITY.formatting.glyph, SHELL_ACTIVITY_IDENTITY.preparing.glyph);
+	for (const role of new Set(roles)) assert.notEqual(role, BASH_IDENTITY.titleRole, "the generic fallback is never an activity look");
+	// A role has to exist in every shipped theme and stay tellable apart inside it,
+	// or a card would paint an identity that reads as another one. Versioning wears
+	// the theme's warm slot, so it reads orange wherever the theme says orange, and
+	// publishing wears its green slot: the exact emerald value is the theme's own
+	// call — Gentleman-Sexy's success slot is a cool grey — and never hardcoded here.
+	const { readFile } = await import("node:fs/promises");
+	const { fileURLToPath } = await import("node:url");
+	assert.equal(SHELL_ACTIVITY_IDENTITY.versioning.titleRole, "warning");
+	assert.equal(SHELL_ACTIVITY_IDENTITY.publishing.titleRole, "success");
+	for (const name of ["Gentle", "Gentleman-Cute", "Gentleman-Sexy"]) {
+		const path = fileURLToPath(new URL(`../themes/${name}.json`, import.meta.url));
+		const theme = JSON.parse(await readFile(path, "utf8"));
+		const resolve = (role: string) => {
+			assert.ok(Object.hasOwn(theme.colors, role), `${name} defines ${role}`);
+			const value: string = theme.colors[role];
+			return theme.vars?.[value] ?? value;
+		};
+		const colors = roles.map((role: string) => resolve(role));
+		assert.equal(new Set(colors).size, 6, `${name}: ${roles.join(", ")} resolve to six distinct colors, one per mark`);
+		// The destructive identity wears the theme's own error slot, so a deletion reads
+		// red wherever the theme says red.
+		assert.equal(resolve(SHELL_ACTIVITY_IDENTITY.destructive.titleRole), resolve("error"), `${name}: destructive wears the error slot`);
+		// The warm slot is a warm hue in every shipped theme, which is what makes the
+		// versioning card read orange rather than merely different.
+		const hue = hueOf(resolve(SHELL_ACTIVITY_IDENTITY.versioning.titleRole));
+		assert.ok(hue >= 20 && hue <= 60, `${name}: versioning resolves to ${colors[roles.indexOf("warning")]} at hue ${hue}, a warm orange`);
+	}
+});
+
+test("bash cards head local history and remote writes with their own identity", () => {
+	const bash = registeredQuietTools().get("bash");
+	const header = (args: Record<string, unknown>, theme: any = passthroughTheme) =>
+		frameLines(bash.renderCall(args, theme, routineRenderContext({ args })), 120)[0] ?? "";
+	const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+	// The versioning and publishing identities name their own commands, marks and
+	// colours; exploring and checking keep theirs.
+	for (const [command, activity, glyph] of [
+		["git add -A && git commit -m 'feat: x'", "versioning", "⎇"],
+		["git commit --amend --no-edit", "versioning", "⎇"],
+		["gh stack add feat/two", "versioning", "⎇"],
+		["git push origin main", "publishing", "↑"],
+		["gh pr create --title x", "publishing", "↑"],
+		["gh issue edit 7 --add-label bug", "publishing", "↑"],
+		["gh stack submit --auto", "publishing", "↑"],
+		["gh stack view", "exploring", "⌕"],
+	] as const) {
+		assert.match(header({ command }), new RegExp(`^╭─ ${glyph} ${activity} · ${escape(command)} ─+╮$`), command);
+	}
+
+	// The label and the rail it leads carry the activity's own role, while the
+	// frame keeps the call's status.
+	assert.match(header({ command: "git commit -m x" }, statusTheme), /^<warning>╭<\/warning>.*<warning>⎇ versioning<\/warning>/);
+	assert.match(header({ command: "git push" }, statusTheme), /<success>↑ publishing<\/success>/);
+	const railed = (command: string) => frameLines(bash.renderResult(textResult("done"), { expanded: false, isPartial: false }, statusTheme, routineRenderContext({ args: { command }, executionStarted: true, isPartial: false, state: {} })), 80)[0] ?? "";
+	assert.match(railed("git commit -m x"), /^<warning>│<\/warning> /, "a finished history change heads its rail in the label's own role");
+	assert.match(railed("git push"), /^<success>│<\/success> /, "the publishing rail matches its label");
+
+	// A command the classifier cannot name still keeps the generic identity, and a
+	// help flag names the query it is rather than the mutation its verb would do.
+	assert.match(header({ command: "gh stack checkout" }), /^╭─ \$ bash · gh stack checkout ─+╮$/);
+	assert.match(header({ command: "git prune --help" }), /^╭─ ⌕ exploring · git prune --help ─+╮$/);
+
+	// A help flag an option consumed is its value, not a query: the commit and the
+	// comment keep their own activity, while the card still shows the whole command.
+	assert.match(header({ command: "git commit -m --help" }), /^╭─ ⎇ versioning · git commit -m --help ─+╮$/);
+	assert.match(header({ command: "gh issue comment 7 --body --help" }), /^╭─ ↑ publishing · gh issue comment 7 --body --help ─+╮$/);
+	// Escaped whitespace joins the value, so the flag inside it is never a query;
+	// a value that ends before the help flag leaves a genuine one.
+	assert.match(header({ command: "git commit -m foo\\ --help" }), /^╭─ ⎇ versioning · git commit -m foo\\ --help ─+╮$/);
+	assert.match(header({ command: "git commit -m foo\\ bar --help" }), /^╭─ ⌕ exploring · git commit -m foo\\ bar --help ─+╮$/);
+	// A quoted `>` is the program's argument, not a redirect into a file.
+	assert.match(header({ command: `git commit -m "fix: a > b"` }), /^╭─ ⎇ versioning · git commit -m "fix: a > b" ─+╮$/);
+	assert.match(header({ command: "cat src/a > out" }), /^╭─ \$ bash · cat src\/a > out ─+╮$/);
+});
+
+test("bash cards head preparation, reformatting and deletion with their own identity", () => {
+	const bash = registeredQuietTools().get("bash");
+	const header = (args: Record<string, unknown>, theme: any = passthroughTheme) =>
+		frameLines(bash.renderCall(args, theme, routineRenderContext({ args })), 120)[0] ?? "";
+	const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+	// Installing, scaffolding and stored configuration head as preparing; file
+	// creation and a formatter or a lint fixer head as their own identities; a
+	// deletion heads as destructive. The last column is the gap the mark itself
+	// carries for a font that paints it two cells wide: preparing's hammer and pick
+	// needs one, and every one-cell mark already shows the separator beside it.
+	for (const [command, activity, glyph, gap] of [
+		["pnpm install", "preparing", "⚒", 1],
+		["mkdir -p tmp/scratch", "preparing", "⚒", 1],
+		["git config user.name 'A B'", "preparing", "⚒", 1],
+		["prettier --write .", "formatting", "≋", 0],
+		["eslint . --fix", "formatting", "≋", 0],
+		["cargo fmt", "formatting", "≋", 0],
+		["rm -rf build", "destructive", "⚠", 0],
+		["rm -f logo.png", "destructive", "⚠", 0],
+		["git reset --hard HEAD~1", "destructive", "⚠", 0],
+	] as const) {
+		assert.match(header({ command }), new RegExp(`^╭─ ${glyph}${" ".repeat(1 + gap)}${activity} · ${escape(command)} ─+╮$`), command);
+	}
+
+	// The label and the rail it leads wear the activity's own role: a deletion is
+	// red wherever the theme says red, and the frame still states the call's state.
+	assert.match(header({ command: "rm -rf build" }, statusTheme), /<error>⚠ destructive<\/error>/);
+	assert.match(header({ command: "pnpm install" }, statusTheme), /<syntaxFunction>⚒ {2}preparing<\/syntaxFunction>/);
+	assert.match(header({ command: "prettier --write ." }, statusTheme), /<syntaxFunction>≋ formatting<\/syntaxFunction>/);
+	const railed = (command: string) => frameLines(bash.renderResult(textResult("done"), { expanded: false, isPartial: false }, statusTheme, routineRenderContext({ args: { command }, executionStarted: true, isPartial: false, state: {} })), 80)[0] ?? "";
+	assert.match(railed("rm -rf build"), /^<error>│<\/error> /, "the destructive rail matches its label");
+	assert.match(railed("pnpm install"), /^<syntaxFunction>│<\/syntaxFunction> /, "the preparing rail matches its label");
+
+	// A deletion outranks every other identity on the same call, so the card never
+	// hides the one thing the call cannot undo — including one a shell payload, a
+	// pipeline, a container or a cluster command carries.
+	assert.match(header({ command: "pnpm test && rm -rf dist" }), /^╭─ ⚠ destructive · pnpm test && rm -rf dist ─+╮$/);
+	assert.match(header({ command: "git push && rm -rf dist" }), /^╭─ ⚠ destructive · git push && rm -rf dist ─+╮$/);
+	assert.match(header({ command: "rm -rf dist && git commit -m x" }), /^╭─ ⚠ destructive · rm -rf dist && git commit -m x ─+╮$/);
+	assert.match(header({ command: "docker system prune -af" }), /^╭─ ⚠ destructive · docker system prune -af ─+╮$/);
+	assert.match(header({ command: "kubectl delete pod web" }), /^╭─ ⚠ destructive · kubectl delete pod web ─+╮$/);
+	assert.match(header({ command: "git push --delete origin feat/x" }), /^╭─ ⚠ destructive · git push --delete origin feat\/x ─+╮$/);
+	assert.match(header({ command: "psql -c 'DROP TABLE t'" }), /^╭─ ⚠ destructive · psql -c 'DROP TABLE t' ─+╮$/);
+	assert.match(header({ command: "nice -n 5 rm -f logo.png" }), /^╭─ ⚠ destructive · nice -n 5 rm -f logo\.png ─+╮$/);
+	assert.match(header({ command: "env FOO=bar rm -rf dist" }), /^╭─ ⚠ destructive · env FOO=bar rm -rf dist ─+╮$/);
+	assert.match(header({ command: "git checkout ." }), /^╭─ ⚠ destructive · git checkout \. ─+╮$/);
+	// A branch checkout keeps the working tree, so it claims nothing.
+	assert.match(header({ command: "git checkout main" }), /^╭─ \$ bash · git checkout main ─+╮$/);
+
+	// A check beside a segment nothing can name keeps the card generic: the heading
+	// never claims a verification the call did not only do.
+	assert.match(header({ command: "pnpm test && node scripts/release.mjs" }), /^╭─ \$ bash · pnpm test && node scripts\/release\.mjs ─+╮$/);
+
+	// The exemptions keep the identity the call really has: usage is a query, a dry
+	// run and a recovery change nothing this card would warn about, and quoted prose
+	// is prose.
+	assert.match(header({ command: "rm --help" }), /^╭─ ⌕ exploring · rm --help ─+╮$/);
+	assert.match(header({ command: "git clean --help" }), /^╭─ ⌕ exploring · git clean --help ─+╮$/);
+	assert.match(header({ command: "git clean -fd --help" }), /^╭─ \$ bash · git clean -fd --help ─+╮$/, "a help flag behind a flag-like word is its value, so nothing is claimed");
+	assert.match(header({ command: "git clean -n" }), /^╭─ \$ bash · git clean -n ─+╮$/);
+	assert.match(header({ command: "kubectl delete --dry-run=client pod web" }), /^╭─ \$ bash · kubectl delete --dry-run=client pod web ─+╮$/);
+	assert.match(header({ command: "git restore --staged lib/a.ts" }), /^╭─ \$ bash · git restore --staged lib\/a\.ts ─+╮$/);
+	assert.match(header({ command: "git push --dry-run" }), /^╭─ ↑ publishing · git push --dry-run ─+╮$/);
+	assert.match(header({ command: `git commit -m "git reset --hard"` }), /^╭─ ⎇ versioning · git commit -m "git reset --hard" ─+╮$/);
+
+	// `git config <key>` reports a stored value, so it is inspection; only a written
+	// value is preparation.
+	assert.match(header({ command: "git config user.name" }), /^╭─ ⌕ exploring · git config user\.name ─+╮$/);
+	assert.match(header({ command: "git config user.name 'A B'" }), /^╭─ ⚒ {2}preparing · git config user\.name 'A B' ─+╮$/);
+
+	// The read-only half of a formatter stays the check it is.
+	assert.match(header({ command: "prettier --check ." }), /^╭─ ✓ checking · prettier --check \. ─+╮$/);
+	assert.match(header({ command: "eslint . --fix-dry-run" }), /^╭─ ✓ checking · eslint \. --fix-dry-run ─+╮$/);
+	// A verification runner behind a watchdog is still the check it bounds.
+	assert.match(header({ command: "timeout 900 pnpm typecheck 2>&1 | tail -20" }), /^╭─ ✓ checking · timeout 900 pnpm typecheck 2>&1 \| tail -20 ─+╮$/);
+});
+
+// An emoji-fallback font paints U+2692 two cells wide while the terminal advances a
+// single column, so the mark's ink covers the cell after it and a one-space gap is
+// painted inside the glyph itself: the card read `⚒preparing`. The mark therefore
+// carries its own gap, the way the Messaging card's envelope does, and one column
+// always shows at every width in both card styles. The terminal still advances the
+// columns pi-tui counted, so the row's width is unchanged either way.
+const WIDE_INK_MARKS = new Set(["⚒"]);
+
+/** Blank columns that survive the mark's one-cell overhang, i.e. what the eye sees. */
+function visibleGapAfter(row: string, mark: string): number {
+	const cells = [...row];
+	const at = cells.indexOf(mark);
+	if (at < 0) return 0;
+	let spaces = 0;
+	for (let index = at + 1; index < cells.length && cells[index] === " "; index += 1) spaces += 1;
+	return Math.max(0, spaces - (WIDE_INK_MARKS.has(mark) ? 1 : 0));
+}
+
+test("a preparing card keeps one visible column after its mark in both card styles", () => {
+	const bash = registeredQuietTools().get("bash");
+	const command = "pnpm install";
+	const callAt = (style: (typeof CARD_STYLE)[keyof typeof CARD_STYLE], width: number) => {
+		const previous = cardStyle();
+		setCardStyle(style);
+		try {
+			return bash.renderCall({ command }, floatToolTheme, routineRenderContext({ args: { command }, state: {} })).render(width);
+		} finally {
+			setCardStyle(previous);
+		}
+	};
+	for (const style of [CARD_STYLE.NEON, CARD_STYLE.FLOAT] as const) {
+		// The heading row: the top rule outlined, the row below the padding row floated.
+		const headingAt = (width: number) => stripAnsi(callAt(style, width)[style === CARD_STYLE.FLOAT ? 1 : 0] ?? "");
+		for (const width of [20, 24, 40, 60, 120]) {
+			const row = headingAt(width);
+			assert.match(row, /⚒ {2}preparing/, `${style} at ${width}: ${JSON.stringify(row)}`);
+			if (width >= 40) assert.match(row, /⚒ {2}preparing · pnpm install/, `${style} at ${width}: the detail keeps its own column`);
+			assert.doesNotMatch(row, /⚒\S/u, `${style} at ${width}: the mark never joins its word`);
+			assert.equal(visibleGapAfter(row, "⚒"), 1, `${style} at ${width}: ${JSON.stringify(row)} shows one column, not the gap the font paints over`);
+			for (const drawn of callAt(style, width)) {
+				const plain = stripAnsi(drawn);
+				assert.equal(visibleWidth(plain), width, `${style} at ${width}: "${plain}" keeps the card width`);
+			}
+		}
+		// A heading cut down to the mark still never joins the next word: the gap is
+		// part of the mark, so truncation takes the whole gap or nothing.
+		for (const width of [10, 12, 14]) {
+			const row = headingAt(width);
+			assert.doesNotMatch(row, /⚒\S/u, `${style} at ${width}: ${JSON.stringify(row)}`);
+			assert.equal(visibleWidth(row), width, `${style} at ${width}: the card still closes at its width`);
+		}
+	}
+});
+
+// The versioning card previews the output its own family prints instead of the
+// tail of whatever it printed: a commit's summary and diffstat rather than its
+// file list, nothing at all for a silent add, and the raw rows for a sentence or
+// a stack the card refuses to read. Everything the preview leaves out stays one
+// expansion away, and a failure keeps its own cause.
+test("a versioning card previews its own family's output and expands to the whole result", () => {
+	const bash = registeredQuietTools().get("bash");
+	const output = [
+		"[main 1a2b3c4] feat: add the thing",
+		" 2 files changed, 5 insertions(+), 1 deletion(-)",
+		" create mode 100644 src/a.ts",
+		" create mode 100644 src/b.ts",
+	].join("\n");
+	const row = hostRow(bash, { command: "git commit -m 'feat: add the thing'" }, textResult(output));
+
+	const collapsed = row.rows().join("\n");
+	assert.match(collapsed, /\[main 1a2b3c4\] feat: add the thing/);
+	assert.match(collapsed, /2 files changed, 5 insertions\(\+\), 1 deletion\(-\)/);
+	assert.doesNotMatch(collapsed, /create mode/, "the file list stays behind the key");
+	assert.match(collapsed, /to expand/, "the card says more is there");
+
+	row.component.setExpanded(true);
+	const expanded = row.rows().join("\n");
+	for (const line of output.split("\n")) assert.ok(expanded.includes(line), `expanding keeps "${line}"`);
+});
+
+test("a versioning card offers no key when its result is already whole", () => {
+	const bash = registeredQuietTools().get("bash");
+	// A rebase prints one sentence; expanding it would draw the same row again.
+	const rebase = hostRow(bash, { command: "git rebase main" }, textResult("Successfully rebased and updated refs/heads/main.\n")).rows().join("\n");
+	assert.match(rebase, /Successfully rebased and updated refs\/heads\/main\./);
+	assert.doesNotMatch(rebase, /to expand/, "one row of output has nothing to expand");
+
+	// A silent add prints nothing, so the card claims nothing: no rows, no key.
+	for (const output of ["", "\n"]) {
+		const add = hostRow(bash, { command: "git add -A" }, textResult(output)).rows().join("\n");
+		assert.doesNotMatch(add, /to expand/, JSON.stringify(output));
+		assert.doesNotMatch(add, /staged|added|created|files? changed/i, `a silent add claims nothing: ${JSON.stringify(output)}`);
+	}
+});
+
+test("a versioning card's failure keeps its cause and claims no success", () => {
+	const bash = registeredQuietTools().get("bash");
+	const output = [
+		"[main 1a2b3c4] feat: add the thing",
+		" create mode 100644 src/a.ts",
+		"",
+		"error: pre-commit hook exited with code 1",
+	].join("\n");
+	const failed = hostRow(bash, { command: "git commit -m x" }, textResult(output), { isError: true }).rows().join("\n");
+	assert.match(failed, /pre-commit hook exited with code 1/);
+	assert.doesNotMatch(failed, /2 files changed|insertions\(\+\)/, "a failed commit claims no summary");
+});
+
+test("a failed versioning card states its cause and exit status ahead of the advice", () => {
+	const bash = registeredQuietTools().get("bash");
+	// A conflict prints the cause, then a translated advice block, then the exit
+	// status the host appended. The collapsed card must not spend its three rows on
+	// advice and leave a reader without the cause; expanding still shows every row.
+	const output = [
+		"Auto-merging src/a.ts",
+		"CONFLICT (content): Merge conflict in src/a.ts",
+		"error: could not apply 1a2b3c4... feat: x",
+		"hint: After resolving the conflicts, mark them with",
+		'hint: "git add/rm <pathspec>", then run',
+		'hint: run "git cherry-pick --abort".',
+		"",
+		"Command exited with code 1",
+	].join("\n");
+	// `isError` on the result marks the finished call failed; the helper's option of
+	// the same name marks a *partial* one, which is a different card path.
+	const row = hostRow(bash, { command: "git cherry-pick 1a2b3c4" }, { ...textResult(output), isError: true });
+
+	const collapsed = row.rows().join("\n");
+	assert.match(collapsed, /could not apply 1a2b3c4/, "the cause is the point of the preview");
+	assert.match(collapsed, /Command exited with code 1/, "and the exit status is named");
+	assert.match(collapsed, /to expand/, "the advice rows are still one expansion away");
+
+	row.component.setExpanded(true);
+	const expanded = row.rows().join("\n");
+	for (const line of output.split("\n")) assert.ok(expanded.includes(line), `expanding keeps "${line}"`);
+});
+
+test("a failed versioning card keeps its cause visible when the rows wrap", () => {
+	const bash = registeredQuietTools().get("bash");
+	// A conflict wraps: the file name and the cause are longer than a narrow card's
+	// inner width while the advice rows and the host's status row are short. Keeping
+	// the tail of the wrapped rows would spend all three on advice and the status, so
+	// the collapsed preview must lead with the cause at every width.
+	const output = [
+		"Auto-merging src/a.ts",
+		"CONFLICT (content): Merge conflict in src/a.ts",
+		"error: could not apply 1a2b3c4... feat: x",
+		"hint: After resolving the conflicts, mark them with",
+		'hint: "git add/rm <pathspec>", then run',
+		'hint: run "git cherry-pick --abort".',
+		"",
+		"Command exited with code 1",
+	].join("\n");
+	const result = { ...textResult(output), isError: true };
+	// A row that carries preview text: a wrapped continuation carries no marker of its
+	// own, so both sides of the content rows are matched by the words they hold.
+	const drawn = /error:|hint:|CONFLICT|Auto-merging|could not apply|resolving the conflicts|<pathspec>|cherry-pick --abort/;
+	// The expanded card wraps too, so a logical row is compared as the words it holds
+	// once the card's rail and padding are taken out of the way — both the float
+	// panel's left bar and a bordered style's two rails, whichever the file's earlier
+	// tests left selected.
+	const flatten = (rows: string[]) => rows.map((line) => stripAnsi(line).replace(/^\s*[\u258E\u2502]?\s?/, "").replace(/\s*\u2502\s*$/, "")).join(" ").replace(/\s+/gu, " ");
+	for (const width of [40, 44, 50, 120]) {
+		const row = hostRow(bash, { command: "git cherry-pick 1a2b3c4" }, result, { width });
+		const rows = row.rows().map((line) => stripAnsi(line));
+		const collapsed = rows.join("\n");
+		assert.match(collapsed, /could not apply 1a2b3c4/, `width ${width}: the cause stays visible`);
+		assert.match(collapsed, /to expand/, `width ${width}: the rest stays one key away`);
+		const previewRows = rows.filter((line) => drawn.test(line));
+		assert.match(previewRows[0] ?? "", /could not apply 1a2b3c4/, `width ${width}: the cause leads, never a hint`);
+		assert.ok(previewRows.length <= 3, `width ${width}: at most three preview rows, got ${JSON.stringify(previewRows)}`);
+
+		row.component.setExpanded(true);
+		const expanded = flatten(row.rows());
+		for (const line of output.split("\n")) assert.ok(expanded.includes(line), `width ${width}: expanding keeps "${line}"`);
+	}
+});
+
+test("a failed versioning card spends nothing on advice when the cause fills the rows", () => {
+	const bash = registeredQuietTools().get("bash");
+	// The cause itself wraps past the three preview rows, so no advice row may be drawn
+	// beside it: the key is what says more remains.
+	const output = [
+		"error: could not apply 1a2b3c4... feat: a subject long enough that the cause alone wraps across more than the three preview rows of a narrow card",
+		"hint: After resolving the conflicts, mark them with",
+		'hint: run "git cherry-pick --abort".',
+		"",
+		"Command exited with code 1",
+	].join("\n");
+	const row = hostRow(bash, { command: "git cherry-pick 1a2b3c4" }, { ...textResult(output), isError: true }, { width: 40 });
+	const collapsed = row.rows().map((line) => stripAnsi(line)).join("\n");
+	assert.match(collapsed, /could not apply 1a2b3c4/);
+	assert.doesNotMatch(collapsed, /hint:/, "no advice row fits beside a cause this long");
+	assert.match(collapsed, /to expand/);
+
+	row.component.setExpanded(true);
+	const expanded = row.rows().map((line) => stripAnsi(line).replace(/^\s*[\u258E\u2502]?\s?/, "").replace(/\s*\u2502\s*$/, "")).join(" ").replace(/\s+/gu, " ");
+	for (const line of output.split("\n")) assert.ok(expanded.includes(line), `expanding keeps "${line}"`);
+});
+
+test("a long versioning command keeps its complete input behind the key", () => {
+	const bash = registeredQuietTools().get("bash");
+	const command = `git add ${Array.from({ length: 12 }, (_, index) => `src/module-${index}.ts`).join(" ")}`;
+	const row = hostRow(bash, { command }, textResult(""));
+
+	const collapsed = row.rows();
+	const heading = collapsed.find((line) => /versioning/.test(line)) ?? "";
+	assert.match(heading, /⎇ versioning · git add src\/module-0\.ts/);
+	assert.match(heading, /…/, "an over-wide input ends in an ellipsis");
+	assert.match(collapsed.join("\n"), /to expand/, "the key advertises the complete command");
+
+	row.component.setExpanded(true);
+	assert.match(row.rows().join("\n"), /src\/module-11\.ts/, "expanding restores every pathspec");
+});
+
+test("a versioning card whose whole result only overflows by wrapping keeps the key", () => {
+	const bash = registeredQuietTools().get("bash");
+	// The preview reads this output whole — the summary and the diffstat are every
+	// row it printed — so nothing is left behind textually. At a narrow width those
+	// two rows wrap past the three-row preview, and only expanding draws the rest,
+	// so the card must still offer the key instead of hiding rows behind none.
+	const output = [
+		"[main 1a2b3c4] feat: a subject long enough that the summary row wraps over more than the three preview rows at a narrow width",
+		" 1 file changed, 1 insertion(+)",
+	].join("\n");
+	const row = hostRow(bash, { command: "git commit -m x" }, textResult(output), { width: 44 });
+
+	const collapsed = row.rows().join("\n");
+	assert.match(collapsed, /to expand/, "wrapping hides rows, so the card says they are there");
+	assert.doesNotMatch(collapsed, /1 file changed/, "the wrapped tail is what the key reveals");
+
+	row.component.setExpanded(true);
+	assert.match(row.rows().join("\n"), /1 file changed, 1 insertion\(\+\)/);
+});
+
+test("the minimal Card content keeps a versioning heading and withholds its preview", (t) => {
+	useCardContent(t, CARD_CONTENT.MINIMAL);
+	const bash = registeredQuietTools().get("bash");
+	const row = hostRow(bash, { command: "git commit -m x" }, textResult("[main 1a2b3c4] feat: x\n 1 file changed, 1 insertion(+)")).rows().join("\n");
+	assert.match(row, /⎇ versioning · git commit -m x/);
+	assert.doesNotMatch(row, /1 file changed/);
+	assert.match(row, /to expand/, "the key still reveals the withheld preview");
+});
+
+// A gh call is an ordinary bash call: neither a `--json` payload nor the URL a
+// create printed is styled, so the card draws the bounded preview it gives every
+// command — the payload's own rows and the rows the call printed — with no field
+// layout invented over the output.
+test("a gh --json read draws the ordinary bash preview, with no field layout", () => {
+	const bash = registeredQuietTools().get("bash");
+	const output = [
+		"{",
+		'  "number": 123,',
+		'  "state": "OPEN",',
+		'  "title": "A helpful contribution"',
+		"}",
+	].join("\n");
+	const row = hostRow(bash, { command: "gh pr view 123 --json title,state,number" }, textResult(output));
+
+	const collapsed = row.rows().join("\n");
+	assert.match(collapsed, /⌕ exploring · gh pr view 123 --json title,state,number/, "the heading still names the call it runs");
+	assert.deepEqual(
+		cardBody(collapsed).split("\n").map((line) => line.trim()).filter((line) => line.length > 0),
+		['"number": 123,', '"state": "OPEN",', '"title": "A helpful contribution"'],
+		"the preview is the payload's own rows",
+	);
+	assert.doesNotMatch(collapsed, /^\s*title: /m, "no field layout is drawn over the payload");
+
+	row.component.setExpanded(true);
+	const expanded = row.rows().join("\n");
+	for (const line of output.split("\n")) assert.ok(expanded.includes(line), `expanding keeps "${line}"`);
+	assert.doesNotMatch(expanded, /Raw output/, "the expansion is the result itself, not a decoded layout");
+});
+
+test("a gh create draws the ordinary bash preview of everything it printed", () => {
+	const bash = registeredQuietTools().get("bash");
+	const output = ["Warning: 1 uncommitted change", "https://github.com/o/r/pull/123"].join("\n");
+	const row = hostRow(bash, { command: "gh pr create --title 'feat: x' --fill" }, textResult(output));
+
+	const collapsed = row.rows().join("\n");
+	assert.match(collapsed, /↑ publishing · gh pr create --title 'feat: x' --fill/, "the heading keeps the publishing identity");
+	assert.match(collapsed, /Warning: 1 uncommitted change/, "the generic preview keeps the rows the call printed");
+	assert.match(collapsed, /https:\/\/github\.com\/o\/r\/pull\/123/);
+	assert.doesNotMatch(collapsed, /to expand/, "both rows fit, so nothing waits behind a key");
+});
+
+// A payload's own JSON escapes are text, not bytes: nothing here decodes a payload
+// into a layout of its own, so the escape stays the characters the call printed and
+// no control byte can be drawn from one.
+const TERMINAL_CONTROL_BYTES = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/;
+
+// The card sanitizes the result it is handed before it draws a row, so a control byte
+// a tool's output carried never reaches the terminal, at either expansion level, while
+// the theme's own escapes are added after.
+const ALL_CONTROL_BYTES = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/;
+
+test("a quiet card never draws a control byte its result carried", () => {
+	const bash = registeredQuietTools().get("bash");
+	const output = ["alpha\u0007beta", "gamma\u009b31mdelta", "epsilon\u009fzeta", "línea 日本語 🐛"].join("\n");
+	const context = routineRenderContext({ args: { command: "printf poisoned" }, executionStarted: true, isPartial: false });
+
+	for (const expanded of [false, true]) {
+		const rows = renderToolResult(bash, textResult(output), { expanded, isPartial: false }, context);
+		assert.doesNotMatch(rows, ALL_CONTROL_BYTES, `expanded=${expanded}: no control byte reaches a row`);
+		assert.match(rows, /alphabeta|betagamma|gammadelta/, `expanded=${expanded}: the text the byte sat in is kept`);
+		assert.match(rows, /línea 日本語 🐛/, `expanded=${expanded}: legitimate unicode is untouched`);
+	}
+	// The theme's own colour is painted after the text is sanitized, so it survives.
+	const statusPainted = renderToString(bash.renderResult(textResult(output), { expanded: true, isPartial: false }, statusTheme, context));
+	assert.match(statusPainted, /<toolOutput>/, "the theme's own role still paints the rows");
+	assert.doesNotMatch(statusPainted, /[\u007f-\u009f]/, "and the payload's C1 bytes are gone");
+});
+
+test("a payload's JSON escape never becomes a control byte in an ordinary bash call", () => {
+	const bash = registeredQuietTools().get("bash");
+	const output = JSON.stringify({ state: "OPEN", title: "fix: \u001b[31mred\u0007 title" }, null, 2);
+	const command = "cat payload.json";
+	assert.equal(TERMINAL_CONTROL_BYTES.test(output), false, "the retained output holds no control byte of its own");
+	const context = routineRenderContext({ args: { command }, executionStarted: true, isPartial: false });
+
+	for (const expanded of [false, true]) {
+		const rows = renderToolResult(bash, textResult(output), { expanded, isPartial: false }, context);
+		assert.doesNotMatch(rows, TERMINAL_CONTROL_BYTES, `expanded=${expanded}: no control byte reaches a row`);
+		assert.match(rows, /"title": "fix: \\u001b\[31mred\\u0007 title"/, `expanded=${expanded}: the escape stays the text the call printed`);
+	}
+});
+
+test("a gh call with no structured output keeps the bash preview it always had", () => {
+	const bash = registeredQuietTools().get("bash");
+	// gh's own prose is not a shape this card reads, so the generic bounded preview
+	// (the last three rows, and the key that says more exists) is untouched.
+	const output = Array.from({ length: 6 }, (_, index) => `row ${index}`).join("\n");
+	const collapsed = hostRow(bash, { command: "gh pr view 123" }, textResult(output)).rows().join("\n");
+	assert.match(collapsed, /row 3/);
+	assert.match(collapsed, /row 5/);
+	assert.doesNotMatch(collapsed, /row 0/);
+	assert.match(collapsed, /to expand/);
 });
 
 test("the bash card draws its result below the heading, collapsed or expanded", (t) => {
@@ -1586,7 +2536,7 @@ test("the bash card draws its result below the heading, collapsed or expanded", 
 	const context = routineRenderContext({ args: { command }, executionStarted: true, isPartial: false });
 
 	const rows = frameLines(bash.renderCall({ command }, passthroughTheme, context), 120);
-	assert.match(rows[0] ?? "", /^╭─ ◎ exploring · git status ─+ .*to expand.*╮$/);
+	assert.match(rows[0] ?? "", /^╭─ ⌕ exploring · git status ─+ .*to expand.*╮$/);
 	assert.match(cardHint(rows.join("\n")) ?? "", /to expand$/);
 
 	const collapsed = renderToolResult(bash, textResult("one\ntwo\nthree\nfour"), { expanded: false, isPartial: false }, context);
@@ -1596,7 +2546,7 @@ test("the bash card draws its result below the heading, collapsed or expanded", 
 
 	// Minimal keeps the same heading and only withholds the preview rows.
 	useCardContent(t, CARD_CONTENT.MINIMAL);
-	assert.match(frameLines(bash.renderCall({ command }, passthroughTheme, context), 120)[0] ?? "", /^╭─ ◎ exploring · git status ─+/);
+	assert.match(frameLines(bash.renderCall({ command }, passthroughTheme, context), 120)[0] ?? "", /^╭─ ⌕ exploring · git status ─+/);
 	assert.equal(renderToolResult(bash, textResult("one\ntwo"), { expanded: false, isPartial: false }, context), "");
 });
 
@@ -1608,7 +2558,7 @@ test("a narrow bash card keeps its heading and wraps the call detail below it", 
 	for (const width of [30, 44, 60]) {
 		const rows = frameLines(bash.renderCall({ command }, passthroughTheme, context), width);
 		assert.equal(rows.length, 1, `width ${width}: the collapsed heading is one line`);
-		assert.ok(rows[0]?.includes("◎ exploring"), `width ${width}: ${rows[0]}`);
+		assert.ok(rows[0]?.includes("⌕ exploring"), `width ${width}: ${rows[0]}`);
 		assert.match(rows[0] ?? "", /git st/, `width ${width}: the detail stays readable`);
 		assert.ok(rows.every((row) => visibleWidth(row) <= width));
 	}
@@ -1634,9 +2584,9 @@ function hostView(component: any, width: number) {
 		component,
 		rows: render,
 		expanded: () => component.expanded === true,
-		/** The drawn row that carries the call (`▎ ◎ exploring · git status ── …`). */
+		/** The drawn row that carries the call (`▎ ⌕ exploring · git status ── …`). */
 		heading: () => {
-			const marked = lineOf(/[◎⌗≡$✎☷⌕⌖+]/);
+			const marked = lineOf(/[󰆼≡$✎☷⌕⌖+]/);
 			return Math.max(1, marked > 0 ? marked : render().findIndex((row: string) => row.trim() !== ""));
 		},
 		/** The closing row of the card, owned by the result component's click region. */
@@ -1649,11 +2599,11 @@ function hostView(component: any, width: number) {
 	};
 }
 
-function hostRow(definition: any, args: Record<string, unknown>, result: any, options: { width?: number; live?: boolean } = {}) {
+function hostRow(definition: any, args: Record<string, unknown>, result: any, options: { width?: number; live?: boolean; isError?: boolean } = {}) {
 	const width = options.width ?? 120;
 	const component: any = new (ToolExecutionComponent as any)(definition.name, `call-${definition.name}`, args, {}, definition, hostUi, "/repo");
 	if (options.live !== false) component.markExecutionStarted();
-	component.updateResult(result, false);
+	component.updateResult(result, options.isError === true);
 	return hostView(component, width);
 }
 
@@ -1871,7 +2821,7 @@ test("quiet tool calls draw a rounded petal card in the lifecycle tone", () => {
 	assert.equal(header.length, 1);
 	assert.match(stripAnsi(header[0] ?? ""), /^╭─ \$ bash · printf output ─+ +to expand ╮$/);
 	const running = bash.renderCall(args, statusTheme, routineRenderContext({ args, executionStarted: true, isPartial: true })).render(width);
-	assert.match(running[0] ?? "", /^<warning>╭<\/warning><warning>─ <\/warning><bashMode>\$ bash<\/bashMode> <muted>·<\/muted> <muted>printf output<\/muted>/);
+	assert.match(running[0] ?? "", /^<warning>╭<\/warning><warning>─ <\/warning><bashMode>\$ bash<\/bashMode> <muted>·<\/muted> <muted>printf output<\/muted>/, "a running call states its state from the top corner down");
 	assert.match(bash.renderCall(args, statusTheme, routineRenderContext({ args, isPartial: false, isError: true })).render(width)[0] ?? "", /^<error>╭<\/error>/);
 
 	const expanded = bash.renderResult(textResult("alpha\nbeta"), { expanded: true, isPartial: false }, passthroughTheme, { args }).render(width);
@@ -1882,7 +2832,9 @@ test("quiet tool calls draw a rounded petal card in the lifecycle tone", () => {
 	]);
 	const failed = bash.renderResult(textResult("boom"), { expanded: true, isPartial: false, isError: true }, statusTheme, { args, isError: true }).render(width);
 	assert.match(failed.at(-1) ?? "", /^<error>╰<\/error><error>─+╯<\/error>$/);
-	assert.ok(failed.slice(0, -1).every((line) => line.startsWith("<error>│</error> ")), failed.join("\n"));
+	// A failed bash card states the failure on its whole frame, left edge included; the
+	// label keeps the identity's own color so the card still says what it was doing.
+	assert.ok(failed.slice(0, -1).every((line) => line.startsWith("<error>│</error> ") && line.endsWith("<error>│</error>")), failed.join("\n"));
 
 	const empty = tools.get("grep").renderResult(textResult("No matches found"), { expanded: false, isPartial: false }, passthroughTheme, {}).render(width);
 	assert.deepEqual(empty, [`╰${"─".repeat(28)}╯`], "an empty result still closes the card");
@@ -2166,16 +3118,16 @@ test("every CodeGraph operation heads with the one generic CodeGraph identity", 
 		frameLines(card.renderCall(args, theme, routineRenderContext({ args })), 120)[0] ?? "";
 
 	// The tool is named once, and the operation tells the three calls apart.
-	assert.match(heading({ operation: "query", query: "postEntry" }), /^╭─ ⌗ codegraph · query postEntry ─+╮$/);
-	assert.match(heading({ operation: "explore", query: "ledger total" }), /^╭─ ⌗ codegraph · explore ledger total ─+╮$/);
-	assert.match(heading({ operation: "init" }), /^╭─ ⌗ codegraph · init ─+╮$/);
+	assert.match(heading({ operation: "query", query: "postEntry" }), /^╭─ 󰆼 codegraph · query postEntry ─+╮$/);
+	assert.match(heading({ operation: "explore", query: "ledger total" }), /^╭─ 󰆼 codegraph · explore ledger total ─+╮$/);
+	assert.match(heading({ operation: "init" }), /^╭─ 󰆼 codegraph · init ─+╮$/);
 
 	for (const args of [{ operation: "query", query: "postEntry" }, { operation: "explore", query: "ledger total" }, { operation: "init" }]) {
 		const row = heading(args);
 		assert.doesNotMatch(row, /exploring/, `${args.operation} never borrows the phase label`);
 		assert.equal(row.match(/codegraph/g)?.length, 1, `${args.operation} names the tool exactly once`);
 		// One identity, one color: every operation paints the same CodeGraph role.
-		assert.match(heading(args, statusTheme), /<mdCode>⌗ codegraph<\/mdCode>/);
+		assert.match(heading(args, statusTheme), /<mdCode>󰆼 codegraph<\/mdCode>/);
 	}
 });
 
@@ -2317,6 +3269,87 @@ test("a CodeGraph init card keeps the indexed facts when the log trails into tel
 	assert.doesNotMatch(collapsed, /telemetry|newer version/, "trailing chatter never displaces the facts");
 });
 
+// The init CLI ends its run by stating what it did to the workspace index, in
+// one sentence with two possible outcomes: it built a new index, or it brought
+// the existing one up to date. Those are the only facts the card reads for the
+// collapsed row, and nothing else about the run is claimed from them.
+const CODEGRAPH_INIT_SYNCED_OUTPUT = [
+	'',
+	'┌  Initializing CodeGraph',
+	'│',
+	'Scanning files...',
+	'Parsing code...',
+	'│',
+	'◆  Indexed 1 files',
+	'│',
+	'●  7 nodes, 8 edges in 156ms',
+	'│',
+	'└  Done',
+	'CodeGraph synced the existing .codegraph index at /repo (local).',
+	'',
+].join("\n");
+const CODEGRAPH_INIT_CREATED_OUTPUT = CODEGRAPH_INIT_SYNCED_OUTPUT.replace(
+	'CodeGraph synced the existing .codegraph index at /repo (local).',
+	'CodeGraph initialized a new .codegraph index at /repo (local).',
+);
+// An outcome sentence this build does not print: nothing in the tree emits it, so
+// the card must not claim it.
+const CODEGRAPH_INIT_SYNCED_ONLY_OUTPUT = CODEGRAPH_INIT_SYNCED_OUTPUT;
+
+test("a CodeGraph init card collapses to the one action the run stated", () => {
+	const { card } = codeGraphCard();
+	const context = routineRenderContext({ args: { operation: "init" } });
+	const collapsed = (output: string, width = 120) => renderLines(
+		card.renderResult(textResult(output), { expanded: false, isPartial: false }, passthroughTheme, context),
+		width,
+	);
+
+	assert.deepEqual(collapsed(CODEGRAPH_INIT_CREATED_OUTPUT), ["→ initialized"], "a new index says so");
+	// One row is the budget, not a slice of four: at a narrow width the action
+	// still occupies the card's single body row.
+	assert.deepEqual(collapsed(CODEGRAPH_INIT_CREATED_OUTPUT, 24), ["→ initialized"], "the action stays one row at a narrow width");
+
+	// Expanding is the tool's own output, untouched: the sentence and the log above it.
+	const expanded = renderToolResult(card, textResult(CODEGRAPH_INIT_CREATED_OUTPUT), { expanded: true, isPartial: false }, context);
+	assert.match(expanded, /CodeGraph initialized a new \.codegraph index at \/repo \(local\)\./);
+	assert.match(expanded, /Indexed 1 files/);
+	assert.match(expanded, /Initializing CodeGraph/);
+});
+
+test("a CodeGraph init card names no action it did not read", () => {
+	const { card } = codeGraphCard();
+	const context = routineRenderContext({ args: { operation: "init" } });
+	const collapsed = (output: string, overrides: Record<string, unknown> = {}) => renderToolResult(
+		card,
+		textResult(output),
+		{ expanded: false, isPartial: false },
+		{ ...context, ...overrides },
+	);
+
+	// The older log states no outcome sentence, so the card keeps the facts it
+	// reported instead of claiming a sync or an init nobody printed.
+	const legacy = collapsed(CODEGRAPH_INIT_OUTPUT);
+	assert.doesNotMatch(legacy, /→/);
+	assert.match(legacy, /Indexed 1 files/);
+
+	// A sentence the card cannot read in full is not guessed at either: the row is
+	// the retained text, not an outcome the card reconstructed.
+	const unreadable = collapsed("CodeGraph initialized a new .codegraph index at /repo.");
+	assert.doesNotMatch(unreadable, /→/);
+	assert.match(unreadable, /CodeGraph initialized a new/);
+
+	// A sentence this build never prints is not an outcome at all: `init` only
+	// initializes, so a variant verb would be an outcome the card invented.
+	const foreign = collapsed(CODEGRAPH_INIT_SYNCED_ONLY_OUTPUT);
+	assert.doesNotMatch(foreign, /→/, "no outcome is claimed for a sentence this build never prints");
+	assert.match(foreign, /Indexed 1 files/, "and the facts the run did report are what is left");
+
+	// A failed call says why it failed, whatever its output also stated.
+	const failed = collapsed(CODEGRAPH_INIT_CREATED_OUTPUT, { isError: true });
+	assert.doesNotMatch(failed, /→ initialized/);
+	assert.match(failed, /CodeGraph initialized a new/);
+});
+
 test("a CodeGraph collapsed heading stays one line and expanding restores the full query", () => {
 	const { card } = codeGraphCard();
 	const query = "resolve workspace cwd and index boundaries for the codegraph tool";
@@ -2324,11 +3357,11 @@ test("a CodeGraph collapsed heading stays one line and expanding restores the fu
 	const collapsed = frameLines(card.renderCall(args, passthroughTheme, routineRenderContext({ args, executionStarted: true, isPartial: false, expanded: false })), 60);
 
 	assert.equal(collapsed.length, 1, "the collapsed CodeGraph heading is one visible line");
-	assert.match(collapsed[0] ?? "", /^╭─ ⌗ codegraph · query .*….*to expand ╮$/);
+	assert.match(collapsed[0] ?? "", /^╭─ 󰆼 codegraph · query .*….*to expand ╮$/);
 
 	const expanded = frameLines(card.renderCall(args, passthroughTheme, routineRenderContext({ args, executionStarted: true, isPartial: false, expanded: true })), 120);
 	assert.ok(expanded.length >= 1);
-	const text = expanded.map((row) => row.replace(/^╭─ ⌗ codegraph · /, "").replace(/^│ /, "")).join(" ").replace(/─+ .*╮$/, "").replace(/\s+/g, " ").trim();
+	const text = expanded.map((row) => row.replace(/^╭─ 󰆼 codegraph · /, "").replace(/^│ /, "")).join(" ").replace(/─+ .*╮$/, "").replace(/\s+/g, " ").trim();
 	assert.equal(text, `query ${query}`, "expanding keeps the complete arguments, not the ellipsis");
 });
 
@@ -2510,4 +3543,229 @@ test("an expanded card keeps the collapse key and collapses on click only when i
 	complete.click(complete.body());
 	assert.equal(complete.expanded(), true, "and the click cannot change the row either");
 	assert.deepEqual(complete.rows(), expandedComplete);
+});
+
+// The Agents preview draws the chat's own tool cards. quiet-tools owns those
+// renderers, so it hands them over when it registers them for the transcript: a
+// preview that kept its own card would drift from the chat the first time either
+// side changed, which is exactly how `write` and `edit` came to read two ways.
+test("quiet tools hand the Agents preview the renderers the transcript uses", (t) => {
+	t.after(() => clearAgentToolRenderers());
+	const tools = registeredQuietTools();
+	const registered = agentToolRendererNames().sort();
+	assert.deepEqual(registered, ["bash", "codegraph", "edit", "find", "grep", "ls", "read", "write"], "every card quiet-tools draws is offered to the preview");
+
+	// One call, drawn by the transcript's renderer and by the preview, row for row.
+	const chatRows = (toolName: string, args: Record<string, unknown>, output: string, expanded = false) => {
+		const tool = tools.get(toolName);
+		const context = routineRenderContext({ args, state: {}, isPartial: false, expanded });
+		const call = tool.renderCall(args, passthroughTheme, context);
+		const result = tool.renderResult(textResult(output), { expanded, isPartial: false }, passthroughTheme, context);
+		return [...call.render(120), ...result.render(120)].map((line) => stripAnsi(line).trimEnd());
+	};
+	const previewRows = (toolName: string, args: Record<string, unknown>, output: string, expanded = false) => {
+		const item = { kind: "tool" as const, callId: "call-1", name: toolName, args, output, running: false, isError: false };
+		const rows = renderAgentToolItem(item, passthroughTheme, 120, { expanded });
+		assert.ok(rows, `${toolName} must be drawn by the chat's renderer, not the preview's own card`);
+		return rows.map((line) => stripAnsi(line).trimEnd());
+	};
+
+	const cases: Array<[string, Record<string, unknown>, string]> = [
+		["read", { path: "lib/x.ts", offset: 1, limit: 20 }, "one\ntwo"],
+		["grep", { pattern: "TODO", path: "lib" }, "lib/a.ts:1:TODO one\nlib/a.ts:9:TODO two"],
+		["find", { pattern: "*.ts", path: "lib" }, "lib/a.ts\nlib/b.ts"],
+		["ls", { path: "lib" }, "agents-view.ts\nagents-thread-view.ts"],
+		["edit", { path: "lib/x.ts", oldText: "a", newText: "b" }, "Successfully replaced 1 occurrence"],
+		["write", { path: "lib/x.ts", content: "one\ntwo\n" }, "Successfully wrote 8 bytes"],
+		["bash", { command: "git status" }, "clean"],
+	];
+	// Every offered card is drawn here: a tool added to quiet-tools has to bring its
+	// own call through both renderers, or the offer is a claim nothing verifies.
+	assert.deepEqual(
+		[...registered].filter((name) => name !== "codegraph").sort(),
+		cases.map(([name]) => name).sort(),
+		"every offered card is covered by this check",
+	);
+	for (const [toolName, args, output] of cases) {
+		for (const expanded of [false, true]) {
+			assert.deepEqual(previewRows(toolName, args, output, expanded), chatRows(toolName, args, output, expanded), `${toolName} ${expanded ? "expanded" : "collapsed"} reads exactly as the transcript draws it`);
+		}
+	}
+
+	// The same row for row holds for the file cards, which head as the file kind
+	// instead of as the tool: a skill read and an ODD edit are drawn by the
+	// transcript's own renderer in the pane, Markdown body included.
+	const fileCases: Array<[string, Record<string, unknown>, string]> = [
+		["read", { path: "skills/gentle-ai/SKILL.md", offset: 2, limit: 3 }, "## Handoff\n\nSome **bold** text.\n"],
+		["read", { path: "odd/work/design.md" }, "## Design\none\ntwo\nthree\nfour"],
+		["edit", { path: "odd/work/design.md", oldText: "a", newText: "one\ntwo" }, "Successfully replaced 1 occurrence"],
+		["write", { path: "odd/work/design.md", content: "one\ntwo\n" }, "Successfully wrote 8 bytes"],
+	];
+	for (const [toolName, args, output] of fileCases) {
+		for (const expanded of [false, true]) {
+			assert.deepEqual(previewRows(toolName, args, output, expanded), chatRows(toolName, args, output, expanded), `${toolName} ${JSON.stringify(args.path)} ${expanded ? "expanded" : "collapsed"} reads exactly as the transcript draws it`);
+		}
+	}
+	assert.match(previewRows("read", { path: "skills/gentle-ai/SKILL.md" }, "## Handoff\n\nSome **bold** text.", true).join("\n"), /▤ skill · read skills\/gentle-ai\/SKILL\.md/);
+	// Collapsed the pane names the file too, and expanding it states the path: both
+	// levels are compared to the transcript above, so this pins the wording itself.
+	assert.match(previewRows("edit", { path: "odd/work/design.md", newText: "one\ntwo" }, "ok", false).join("\n"), /📑 odd · edit design\.md(?!:)/);
+	assert.match(previewRows("edit", { path: "odd/work/design.md", newText: "one\ntwo" }, "ok", true).join("\n"), /📑 odd · edit odd\/work\/design\.md(?!:)/);
+	assert.doesNotMatch(previewRows("edit", { path: "odd/work/design.md", newText: "one\ntwo" }, "ok", false).join("\n"), /:\d/, "an edit names no range in the pane either");
+
+	// The reported drift: the preview headed write and edit with its own separator
+	// and never named the line count the chat shows.
+	const write = previewRows("write", { path: "lib/x.ts", content: "one\ntwo\n" }, "Successfully wrote 8 bytes", false).join("\n");
+	assert.match(write, /\+ write lib\/x\.ts \(3 lines\)/);
+	assert.doesNotMatch(write, /\+ write · lib\/x\.ts/);
+	assert.match(previewRows("edit", { path: "lib/x.ts" }, "ok", false).join("\n"), /✎ edit lib\/x\.ts/);
+
+	// CodeGraph keeps its own card, drawn by the same factory the transcript uses.
+	const codegraph = previewRows("codegraph", { operation: "query", query: "postEntry" }, "Search Results for postEntry:\n  entry  lib/x.ts:12");
+	assert.match(codegraph[0]!, /╭─ 󰆼 codegraph · query postEntry/);
+	// An init call reads the same in both places too: the heading names the
+	// operation and the collapsed row is the one outcome the run stated.
+	const initOutput = [
+		'',
+		'┌  Initializing CodeGraph',
+		'│',
+		'◆  Indexed 1 files',
+		'│',
+		'CodeGraph initialized a new .codegraph index at /repo (local).',
+	].join("\n");
+	for (const expanded of [false, true]) {
+		const context = routineRenderContext({ args: { operation: "init" }, state: {}, isPartial: false, expanded });
+		const card = codeGraphCard().card;
+		// Both slots are built before either is drawn, as the host does: the result
+		// marks the shared row state the call slot reads its key hint from.
+		const call = card.renderCall({ operation: "init" }, passthroughTheme, context);
+		const result = card.renderResult(textResult(initOutput), { expanded, isPartial: false }, passthroughTheme, context);
+		const chat = [...call.render(120), ...result.render(120)].map((line) => stripAnsi(line).trimEnd());
+		assert.deepEqual(
+			previewRows("codegraph", { operation: "init" }, initOutput, expanded),
+			chat,
+			`codegraph init ${expanded ? "expanded" : "collapsed"} reads exactly as the transcript draws it`,
+		);
+	}
+	assert.match(previewRows("codegraph", { operation: "init" }, initOutput, false).join("\n"), /󰆼 codegraph · init[\s\S]*→ initialized/);
+});
+
+test("a tool quiet-tools does not draw is left to the preview's own card", (t) => {
+	t.after(() => clearAgentToolRenderers());
+	registeredQuietTools();
+	// A registration is per tool: a subagent call, which the chat renders elsewhere,
+	// never borrows the read card just because both are tool rows.
+	const item = { kind: "tool" as const, callId: "c", name: "subagent_run", args: { agent: "worker" }, output: "", running: false, isError: false };
+	assert.equal(renderAgentToolItem(item, passthroughTheme, 80, { expanded: false }), undefined);
+});
+
+// The offer lives in one process-wide registry, so a load that disables quiet tools
+// has to withdraw what an earlier load offered: otherwise the pane keeps drawing
+// quiet cards for a transcript that stopped drawing them.
+test("a disabled quiet-tools load withdraws the cards it offered", (t) => {
+	t.after(() => clearAgentToolRenderers());
+	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => productionQuietTools(createPi().pi as any));
+	assert.deepEqual(agentToolRendererNames().sort(), ["bash", "codegraph", "edit", "find", "grep", "ls", "read", "write"]);
+
+	withEnv({ GENTLE_PI_QUIET_TOOLS: "0" }, () => productionQuietTools(createPi().pi as any));
+	assert.deepEqual(agentToolRendererNames(), [], "the disabled load leaves no card behind");
+	const item = { kind: "tool" as const, callId: "c", name: "read", args: { path: "lib/x.ts" }, output: "one", running: false, isError: false };
+	assert.equal(renderAgentToolItem(item, passthroughTheme, 80, { expanded: false }), undefined, "and the preview draws its own card again");
+});
+
+// "New tools must not arrive with this problem": every tool this extension draws is
+// either offered to the preview or named as one it cannot draw there, with the
+// reason. A tool added later fails this until it is classified.
+test("every tool quiet-tools draws is classified for the Agents preview", (t) => {
+	t.after(() => clearAgentToolRenderers());
+	const { pi, tools } = createPi();
+	let registered: ((toolName: string, next: () => unknown) => unknown) | undefined;
+	(pi as any).registerToolRenderer = (resolver: (toolName: string, next: () => unknown) => unknown) => {
+		registered = resolver;
+	};
+	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => productionQuietTools(pi as any));
+
+	// The cards the resolver owns are not registered tools, so probe which names it
+	// replaces instead of passing the host's chain through.
+	const fallback = { renderShell: "self" as const, renderCall() {} };
+	assert.ok(registered, "quiet-tools registers the resolver that draws bash and codegraph");
+	const resolverOwned = ["bash", "codegraph"].filter((name) => registered!(name, () => fallback) !== fallback);
+
+	const offered = new Set(agentToolRendererNames());
+	const excluded = new Set(Object.keys(AGENTS_PREVIEW_EXCLUSIONS));
+	for (const name of [...tools.keys(), ...resolverOwned]) {
+		assert.ok(offered.has(name) || excluded.has(name), `${name} must be offered to the preview or excluded with a reason`);
+	}
+	assert.deepEqual([...offered].filter((name) => excluded.has(name)), [], "a card cannot be both offered and excluded");
+	for (const [name, reason] of Object.entries(AGENTS_PREVIEW_EXCLUSIONS)) {
+		assert.ok(reason.trim().length > 20, `${name} states why the preview cannot draw it`);
+	}
+	// The stated reason is the actual one: the codemode card reads `result.details`, which a
+	// retained call does not carry, so the exclusion cannot drift into a vague excuse.
+	assert.match(AGENTS_PREVIEW_EXCLUSIONS.codemode ?? "", /result\.details/u, "the codemode exclusion names what it reads and a retained call does not carry");
+});
+
+// A retained call carries the result's text and never its details, so a card that
+// reads `result.details` is left to the preview's own card rather than handed a
+// call it would describe wrongly: the compact codemode card would claim
+// `No observed child calls` for a script that ran children.
+test("a card that needs result details is never handed a retained call", (t) => {
+	t.after(() => clearAgentToolRenderers());
+	const { pi } = createPi();
+	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => productionQuietTools(pi as any));
+	assert.equal(agentToolRendererNames().includes("codemode"), false, "codemode is not offered");
+	assert.ok(Object.hasOwn(AGENTS_PREVIEW_EXCLUSIONS, "codemode"), "and is excluded by name, not silently forgotten");
+
+	const item = { kind: "tool" as const, callId: "c", name: "codemode", args: { code: "print(1)" }, output: "Script completed in 12ms\nOutput:\n1", running: false, isError: false };
+	assert.equal(renderAgentToolItem(item, passthroughTheme, 100, { expanded: false }), undefined, "the preview draws its own card, which shows the retained output");
+});
+
+// An ODD artifact row is read at a glance, so it names the file itself; the path it
+// sits in is what expanding it is for. The artifact mark is an emoji, two columns wide,
+// so every width below is measured the way the terminal counts it, and the read keeps
+// the range it asked for in both states while an edit and a write name none.
+test("an ODD file card names the file collapsed and the path expanded, at every width", () => {
+	const tools = registeredQuietTools();
+	const drawnAt = (name: string, args: Record<string, unknown>, expanded: boolean, width: number) =>
+		frameLines(tools.get(name).renderCall(args, passthroughTheme, routineRenderContext({ args, state: {}, expanded })), width).map(stripAnsi);
+	const cases: Array<[string, Record<string, unknown>, string]> = [
+		["read", { path: "odd/work/design.md", offset: 142, limit: 4 }, "design.md:142-145"],
+		["edit", { path: "odd/work/design.md", oldText: "a", newText: "b" }, "design.md"],
+		["write", { path: "odd/work/design.md", content: "one\n" }, "design.md"],
+	];
+	for (const [name, args, collapsedDetail] of cases) {
+		const collapsed = drawnAt(name, args, false, 120).join("\n");
+		assert.ok(collapsed.includes(`📑 odd · ${name} ${collapsedDetail}`), `${name} collapsed names the file: ${collapsed}`);
+		assert.doesNotMatch(collapsed, /odd\/work\/design\.md/, `${name} collapsed states no path`);
+		const expanded = drawnAt(name, args, true, 120).join("\n");
+		assert.ok(expanded.includes(`📑 odd · ${name} odd/work/design.md`), `${name} expanded states the path: ${expanded}`);
+	}
+	// An edit and a write state no range in either state: a count of written lines is
+	// not a position in the file, so nothing is invented for them.
+	for (const name of ["edit", "write"]) {
+		for (const expanded of [false, true]) {
+			assert.doesNotMatch(drawnAt(name, { path: "odd/work/design.md", oldText: "a", newText: "b", content: "one\n" }, expanded, 120).join("\n"), /:\d/, `${name} names no range`);
+		}
+	}
+	// A name with spaces stays whole, a Windows path names the same file, and both
+	// separators read alike.
+	assert.ok(drawnAt("read", { path: "odd/my design doc.md" }, false, 120).join("\n").includes("📑 odd · read my design doc.md"));
+	assert.ok(drawnAt("read", { path: "C:\\repo\\odd\\work\\x.md" }, false, 120).join("\n").includes("📑 odd · read x.md"));
+	assert.ok(drawnAt("read", { path: "C:\\repo\\odd\\work\\x.md" }, true, 120).join("\n").includes("📑 odd · read C:\\repo\\odd\\work\\x.md"));
+	// The mark is the user's, exactly one space after it, and it is two columns wide.
+	const heading = drawnAt("read", { path: "odd/work/design.md" }, false, 60)[0] ?? "";
+	assert.match(heading, /📑 odd/u, "the artifact mark leads the heading");
+	assert.doesNotMatch(heading, /📑 {2}odd/u, "one space between the mark and the name");
+	assert.equal(visibleWidth("📑"), 2, "an artifact mark is two columns");
+	for (const width of [40, 24, 16, 12, 10]) {
+		for (const expanded of [false, true]) {
+			const rows = drawnAt("read", { path: "odd/work/a-very-long-artifact-name-for-a-card.md", offset: 7, limit: 3 }, expanded, width);
+			assert.ok(rows.length > 0, `width ${width}: the card still draws`);
+			for (const row of rows) assert.ok(visibleWidth(row) <= width, `width ${width}: ${JSON.stringify(row)} fits`);
+			if (width >= 16) assert.ok(rows[0]!.includes("📑"), `width ${width}: the mark survives`);
+		}
+	}
+	// A skill card is not this case: it states its whole path at both levels.
+	const skill = { path: "skills/gentle-ai/SKILL.md" };
+	assert.ok(drawnAt("read", skill, false, 120).join("\n").includes("▤ skill · read skills/gentle-ai/SKILL.md"));
 });

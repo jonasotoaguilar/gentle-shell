@@ -14,14 +14,16 @@ import { isAbsolute } from "node:path";
 import { resolveGentleAiDevBinaryOverride, type GentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { CARD_CONTENT, cardContent } from "../lib/card-content-policy.ts";
 import { GentleAiElapsedTimingLedger } from "../lib/gentle-ai-elapsed-store.ts";
-import { inferOddPhase } from "../lib/odd-phase-inference.ts";
-import type { OddPhase } from "../lib/odd-phase.ts";
+import { SHELL_ACTIVITY_IDENTITY, inferShellActivity, type ShellActivity } from "../lib/odd-phase-inference.ts";
+import { versioningCardPreview } from "../lib/versioning-card-preview.ts";
+import { FileCardMarkdown, FILE_CARD_IDENTITY, fileCardIdentity, fileCardLineRange, fileCardName, markdownDocumentSource, type FileCardMark } from "../lib/skill-odd-card.ts";
+import { registerAgentToolRenderers, clearAgentToolRenderers } from "../lib/agents-tool-renderers.ts";
 import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
 import { registerCompactCodemode } from "../lib/codemode-renderer.ts";
 import { offerBuiltinCodemodeOptOut, type BuiltinCodemodeOptOutOptions } from "../lib/builtin-codemode-optout.ts";
 import { getGentleAiRenderState, renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import {
-	CARD_TONE, cardAwaitingResult, cardBottom, cardElapsed, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopLine, cardTopRows, floatRows, markCardResult,
+	CARD_TONE, cardAwaitingResult, cardBottom, cardElapsed, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopLine, cardTopRows, diffRows, floatRows, markCardResult,
 	type CardRowContext, type CardTheme,
 } from "../lib/shell-card.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
@@ -53,22 +55,37 @@ const TOOL_GLYPH = {
 	write: "+",
 } as const satisfies Record<QuietToolName, string>;
 
-// A bash command's phase inference can only return these two phases
-// (lib/odd-phase-inference.ts inferShellPhase: a checker segment checks, every
-// read-only segment explores, anything else is undefined), so a card style
-// exists for exactly those two and generic bash covers the rest. edit, write,
-// todo and the choice tools keep their own existing cards.
-export type BashCardPhase = Extract<OddPhase, "exploring" | "checking">;
+// A bash command's card identity: the activity its own command names — the two
+// ODD phases (exploring, checking) plus the identities that are presentation only:
+// preparing (installing, scaffolding, stored configuration), formatting (a
+// formatter or a lint fixer), destructive (a deletion), and versioning for a local
+// history change or publishing for a remote write. None of them is ever inferred
+// into the session's phase (see lib/odd-phase-inference.ts), and none of them is
+// ever an authorization: permission stays with the guard that owns it.
+export type BashCardActivity = ShellActivity;
 
-// Each reachable phase leads with its own mark and paints itself in its own
-// theme role, so an exploring row never looks like a checking one.
-export const PHASE_IDENTITY = {
-	exploring: { glyph: "◎", titleRole: "mdLink" },
-	checking: { glyph: "✓", titleRole: "mdHeading" },
-} as const satisfies Record<BashCardPhase, { glyph: string; titleRole: string }>;
-
-/** The identity of a command whose phase the inference cannot tell: the tool's own mark and role, never a borrowed phase. */
+/** The identity of a command whose activity the classifier cannot tell: the tool's own mark and role, never a borrowed activity. */
 export const BASH_IDENTITY = { glyph: TOOL_GLYPH.bash, titleRole: "bashMode" } as const;
+
+// The module that offers this extension's cards to the Agents preview, so a reload
+// re-describes them and a disabled load withdraws them instead of leaving a stale
+// card in the pane.
+const AGENTS_PREVIEW_OWNER = "quiet-tools";
+
+/**
+ * The tools this extension draws in the chat but deliberately does not offer to the
+ * Agents preview, each with the reason. An offer states that the card draws from
+ * the call's own arguments and its retained text; the compact `codemode` card also
+ * reads `result.details` (the observed child calls and the full-output path), and a
+ * retained call carries text alone. Handing it a retained call would make it claim
+ * `No observed child calls` for a script that ran children, so it keeps the
+ * preview's own card — which shows the retained output and never a call list it
+ * cannot know. A tool added to this extension has to be classified here or offered
+ * at the bottom of this file: the preview test fails on a tool that is neither.
+ */
+export const AGENTS_PREVIEW_EXCLUSIONS: Readonly<Record<string, string>> = {
+	codemode: "its card reads result.details (observed child calls, full-output path), which the thread protocol does not retain",
+};
 
 const COLLAPSED_COUNT_LABELS: Partial<Record<QuietToolName, string>> = {
 	grep: "matches",
@@ -80,6 +97,10 @@ const COLLAPSED_COUNT_LABELS: Partial<Record<QuietToolName, string>> = {
 // minimal: their results stay one expand key away and never add rows to the
 // transcript view.
 const COMMAND_ONLY_TOOLS: ReadonlySet<QuietToolName> = new Set(["read", "bash", "grep", "find", "ls", "edit", "write"]);
+
+// The tools whose call names one file: a skill or an ODD artifact heads as that
+// file instead of as the tool (lib/skill-odd-card.ts owns the classification).
+const FILE_CARD_TOOLS: ReadonlySet<QuietToolName> = new Set(["read", "edit", "write"]);
 
 const COLLAPSED_TAIL_LINE_LIMIT = 10;
 const PREVIEW_LINE_LIMIT = 3;
@@ -127,6 +148,17 @@ export function countNonEmptyLines(text: string): number {
 export function tailLines(text: string, limit: number): string {
 	const lines = text.split("\n");
 	return lines.slice(Math.max(0, lines.length - limit)).join("\n");
+}
+
+/**
+ * The text without the empty rows a command's own final newline leaves behind.
+ * Presentation only: a collapsed preview spends three rows on facts, so a
+ * trailing newline must not claim one of them. Every blank row inside the output,
+ * and the retained result the expanded card shows, stay exactly as the call
+ * produced them.
+ */
+function withoutTrailingEmptyRows(text: string): string {
+	return text.replace(/(?:\r?\n[ \t]*)+$/, "");
 }
 
 function outputLines(text: string): string[] {
@@ -420,11 +452,34 @@ function diffStats(diff: string): { additions: number; removals: number } {
 	return { additions, removals };
 }
 
+/**
+ * The whole edit's totals when the result says the diff it carries is only a prefix of the
+ * edit's own display diff. The Agents protocol counts them over the child's complete diff
+ * and passes them as structured numbers, so the card states an edit's real totals instead of
+ * the rows it happens to hold, and never reads a count back out of the diff text. A claim
+ * that is not three whole numbers, that cannot describe rows including itself, or that
+ * understates the rows it is drawn with is not a total: the card then counts the diff it was
+ * given, exactly as it always has.
+ */
+function truncatedTotals(result: AgentToolResult<unknown>, diff: string): { additions: number; removals: number } | undefined {
+	const claim = detailsRecord(result).truncated;
+	if (!claim || typeof claim !== "object" || Array.isArray(claim)) return undefined;
+	const record = claim as Record<string, unknown>;
+	const total = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+	const rows = total(record.rows);
+	const additions = total(record.additions);
+	const removals = total(record.removals);
+	if (rows === undefined || additions === undefined || removals === undefined || additions + removals > rows) return undefined;
+	const kept = diffStats(diff);
+	return kept.additions <= additions && kept.removals <= removals ? { additions, removals } : undefined;
+}
+
 function editSummary(result: AgentToolResult<unknown>): string {
 	const diff = detailsRecord(result).diff;
 	if (typeof diff === "string") {
-		const stats = diffStats(diff);
-		return `✓ +${stats.additions} / -${stats.removals}`;
+		const truncated = truncatedTotals(result, diff);
+		const stats = truncated ?? diffStats(diff);
+		return `✓ +${stats.additions} / -${stats.removals}${truncated === undefined ? "" : " · truncated"}`;
 	}
 	return "✓ applied";
 }
@@ -440,6 +495,19 @@ function expandedResultText(toolName: QuietToolName, result: AgentToolResult<unk
 		if (typeof diff === "string") return safeText(diff);
 	}
 	return text;
+}
+
+/**
+ * One card's rows in the role they are drawn in. An edit's diff is the one result
+ * whose rows are not all the same kind: its added rows wear the theme's added role
+ * and its removed rows its removed role, while its summary, its context rows and
+ * its hunk headers keep the role the card already paints them in. Every other
+ * result — and a failed edit, whose rows are its error rather than a diff — keeps
+ * that one role for the whole text.
+ */
+function resultRowsText(toolName: QuietToolName, text: string, theme: CardTheme, role: string, isError: boolean): string {
+	if (text === "") return "";
+	return toolName === "edit" && !isError ? diffRows(text, theme, role) : theme.fg(role, text);
 }
 
 export function formatToolResultOutput(
@@ -466,7 +534,7 @@ export function formatToolResultOutput(
 		return count > 0 ? ` → ${count} ${summaryLabel}` : "";
 	}
 	if (toolName === "bash" && isGitCommand(args)) {
-		const tail = tailLines(text, COLLAPSED_TAIL_LINE_LIMIT);
+		const tail = tailLines(withoutTrailingEmptyRows(text), COLLAPSED_TAIL_LINE_LIMIT);
 		return tail ? `\n${tail}` : "";
 	}
 	if (toolName === "read") {
@@ -483,6 +551,67 @@ export function formatToolResultOutput(
 	return "";
 }
 
+/** One expansion level's rows, as the card draws them. */
+interface QuietResultRows {
+	/** The rows the card draws. */
+	text: string;
+	/** Whether the preview keeps the tail of its text (a log's last rows) rather than its head (a summary). */
+	tail: boolean;
+	/** Set when the preview knows its own shape; otherwise the card compares its two levels itself. */
+	reveals?: boolean;
+}
+
+/** What one shared command preview draws: the rows, which end they lead from, and whether expanding shows more. */
+type CommandPreview = { text: string; tail: boolean; reveals: boolean };
+
+interface CommandPreviewInput {
+	command: string;
+	output: string;
+	failed: boolean;
+	limit?: number;
+}
+
+// The shared previews, in the order a card tries them: local history
+// (lib/versioning-card-preview.ts). A shared preview owns one command family and
+// answers nothing for another, so the card wires it once and the chat and the
+// Agents pane cannot drift apart. Every other command — a gh read or a gh create
+// included — keeps the card's own bounded result preview.
+const COMMAND_PREVIEWS: ReadonlyArray<(input: CommandPreviewInput) => CommandPreview | undefined> = [
+	versioningCardPreview,
+];
+
+// pi re-renders every visible card each frame, so a shared preview is parsed once
+// per retained result: the command and the output of one call never change, and
+// only the drawn rows are kept, never a copy of the output.
+const commandPreviewCache = new WeakMap<object, { key: string; preview: CommandPreview | undefined }>();
+
+/**
+ * The preview a shared helper draws for this result, or undefined when the call is
+ * none of theirs (inspection, a check and every other write keep the card's own
+ * bounded preview). The helpers own every shape decision, so the chat and the
+ * Agents pane draw one call the same way.
+ */
+function commandPreviewRows(
+	result: AgentToolResult<unknown>,
+	text: string,
+	args: Record<string, unknown> | undefined,
+	failed: boolean,
+): QuietResultRows | undefined {
+	const command = typeof args?.command === "string" ? args.command : "";
+	if (command.length === 0) return undefined;
+	const cacheKey = typeof result === "object" && result !== null ? result : undefined;
+	const key = `${failed ? 1 : 0}\u0000${PREVIEW_LINE_LIMIT}\u0000${command}`;
+	const cached = cacheKey === undefined ? undefined : commandPreviewCache.get(cacheKey);
+	let preview: CommandPreview | undefined;
+	if (cached !== undefined && cached.key === key) {
+		preview = cached.preview;
+	} else {
+		preview = COMMAND_PREVIEWS.reduce<CommandPreview | undefined>((found, helper) => found ?? helper({ command, output: text, failed, limit: PREVIEW_LINE_LIMIT }), undefined);
+		if (cacheKey !== undefined) commandPreviewCache.set(cacheKey, { key, preview });
+	}
+	return preview === undefined ? undefined : { text: preview.text, tail: preview.tail, reveals: preview.reveals };
+}
+
 /**
  * The visible rows of one quiet result at one expansion level, before the card
  * paints them. Both levels are computed for every result, so a card can tell
@@ -493,9 +622,16 @@ function quietResultRows(
 	result: AgentToolResult<unknown>,
 	text: string,
 	options: { expanded: boolean; isError: boolean; args?: Record<string, unknown>; withheld: boolean },
-): string {
+): QuietResultRows {
 	const { expanded, isError, args, withheld } = options;
-	if (!expanded && withheld) return "";
+	if (!expanded && withheld) return { text: "", tail: false };
+	// A versioning call previews the shape its own command named instead of the tail
+	// of whatever it printed: a commit's summary and diffstat, nothing for a silent
+	// add, and the raw rows for a shape the shared helper refuses to read.
+	if (!expanded) {
+		const preview = commandPreviewRows(result, text, args, isError);
+		if (preview !== undefined) return preview;
+	}
 	let output = formatToolResultOutput(toolName, result, { expanded, isError, args });
 	// Counts alone hide the result: retain their useful totals alongside actual rows.
 	if (!expanded && !isError && output && COLLAPSED_COUNT_LABELS[toolName]) {
@@ -505,81 +641,54 @@ function quietResultRows(
 		const diff = detailsRecord(result).diff;
 		if (typeof diff === "string") output += `\n${firstLines(safeText(diff).split("\n").filter((line) => /^[+-]/.test(line)).join("\n"), PREVIEW_LINE_LIMIT - 1)}`;
 	}
-	return output.replace(/^\n/, "");
+	return { text: output.replace(/^\n/, ""), tail: !expanded && shouldRenderPreviewTail(toolName, text, isError, args) };
 }
 
+/**
+ * The line range a read card names after the path, in the warm role of the card's
+ * own theme. The range itself comes from the shared file-card helper, so the chat's
+ * row and the Agents preview name the same lines and refuse the same unreadable
+ * shapes; only the color is the chat's.
+ */
 function lineRangeSuffix(args: Record<string, unknown>, theme: ThemeLike): string {
-	if (args.offset === undefined && args.limit === undefined) return "";
-	const startLine = typeof args.offset === "number" ? args.offset : 1;
-	const endLine = typeof args.limit === "number" ? startLine + args.limit - 1 : undefined;
-	return theme.fg("warning", `:${startLine}${endLine === undefined ? "" : `-${endLine}`}`);
+	const range = fileCardLineRange("read", args);
+	return range === undefined ? "" : theme.fg("warning", range);
 }
 
 /**
- * Splits a shell composition into its segments, or undefined when the command
- * carries quoting, substitution, escapes, or a pipe the card cannot read
- * safely. It never guesses: an unreadable composition keeps the whole command
- * visible. A pipeline routes output into another program (`| tee log.txt`,
- * `| xargs rm`, `|| fallback`), so no single segment is the whole story.
- */
-function splitShellSegments(command: string): string[] | undefined {
-	if (/['"`]|\$\(|\\|\|/.test(command)) return undefined;
-	return command.split(/&&|\|\||;|\n/).map((segment) => segment.trim()).filter((segment) => segment.length > 0);
-}
-
-// A composition may skip a segment only when it is a harmless no-op whose output
-// nobody reads. Deliberately tiny: anything unlisted makes the card name the
-// whole command, so a consequential action is never hidden behind a test run.
-const BASH_IGNORABLE_SEGMENT = /^(cd|pushd|popd|echo|printf|sleep|true|false|export|set|\[\[?|test)\b/;
-// A no-op stops being harmless the moment it redirects output to a file. Stream
-// merges and discarded output are not writes; anything else is. Quotes and
-// escapes never reach this check (the splitter refuses those commands).
-const BASH_HARMLESS_REDIRECT = /\s*(\d?>&\d|&?\d?>\s*\/dev\/null)/g;
-
-function writesFileSegment(segment: string): boolean {
-	return segment.replace(BASH_HARMLESS_REDIRECT, "").includes(">");
-}
-
-/**
- * The segment of a shell composition that names the work the phase came from:
- * the last segment the same classifier also labels with that phase. A single
- * segment has nothing to abbreviate, an unreadable composition returns
- * undefined, and so does a composition holding any segment that is neither a
- * read/verify step nor a harmless no-op — the heading then keeps the whole
- * command instead of hiding what else runs.
- */
-function bashPrincipalAction(command: string, phase: BashCardPhase): string | undefined {
-	const segments = splitShellSegments(command);
-	if (!segments || segments.length < 2) return undefined;
-	const safe = segments.every((segment) => {
-		const segmentPhase = inferOddPhase("bash", { command: segment });
-		if (segmentPhase === "exploring" || segmentPhase === "checking") return true;
-		return BASH_IGNORABLE_SEGMENT.test(segment) && !writesFileSegment(segment);
-	});
-	if (!safe) return undefined;
-	return segments.filter((segment) => inferOddPhase("bash", { command: segment }) === phase).at(-1);
-}
-
-/**
- * The bash heading: the phase its own command implies (with that phase's mark
- * and color) over the composition's principal action, or the unconditional
- * generic `bash` fallback with the command itself for anything the inference
- * does not label. Collapsed it stays one row; expanded it carries the complete
- * command.
+ * The bash heading: the activity its own command names (with that activity's mark
+ * and color), or the unconditional generic `bash` fallback, over the command the
+ * call actually runs. The detail is always that complete command — never a
+ * shortened substitute — so nothing the call does is hidden: collapsed the
+ * heading stays one row and an over-wide command ends in an ellipsis, and
+ * expanded the whole command continues on the rows below. The rail that leads
+ * the card is painted in the same role as the label, so the card's left edge
+ * belongs to its heading.
  */
 function bashHeading(args: Record<string, unknown>, theme: ThemeLike, expanded: boolean): ToolCardHeading {
 	const command = safeText(asString(args.command, "..."));
 	const timeout = typeof args.timeout === "number" ? ` (timeout ${args.timeout}s)` : "";
-	const phase = inferOddPhase("bash", args);
-	const identity = phase === undefined ? BASH_IDENTITY : PHASE_IDENTITY[phase as BashCardPhase];
-	const detail = phase === undefined ? command : bashPrincipalAction(command, phase as BashCardPhase) ?? command;
+	const identity = bashIdentity(args);
 	return {
-		title: theme.bold(phase ?? "bash"),
-		subtitle: `${detail}${timeout}`,
+		title: theme.bold(identity.activity ?? "bash"),
+		subtitle: `${command}${timeout}`,
 		glyph: identity.glyph,
 		titleRole: identity.titleRole,
+		railRole: identity.titleRole,
 		singleLine: !expanded,
 	};
+}
+
+/**
+ * The identity a bash call wears: the activity its own command names, or the
+ * generic `$ bash` fallback's. The heading and the rail its result continues are
+ * two halves of one card, so both derive it from the retained call the same way.
+ */
+function bashIdentity(args: Record<string, unknown>): { activity: BashCardActivity | undefined; glyph: string; titleRole: string } {
+	const command = asString(args.command);
+	const activity = command.length > 0 ? inferShellActivity(command) : undefined;
+	const identity = activity === undefined ? BASH_IDENTITY : SHELL_ACTIVITY_IDENTITY[activity];
+	return { activity, glyph: identity.glyph, titleRole: identity.titleRole };
 }
 
 /** The parts of a tool card heading: what it says, the mark that leads it, the theme role that paints it, and whether it must fit one row. */
@@ -588,7 +697,42 @@ interface ToolCardHeading {
 	subtitle?: string;
 	glyph: string;
 	titleRole?: string;
+	/** Theme role for the card's left rail; the bash card names its activity there, so the rail matches the label. */
+	railRole?: string;
 	singleLine?: boolean;
+}
+
+/** The file card a call wears, or undefined when the call names no skill or ODD file. */
+function fileCard(toolName: QuietToolName, args: Record<string, unknown> | undefined): FileCardMark | undefined {
+	return FILE_CARD_TOOLS.has(toolName) ? fileCardIdentity(args?.path) : undefined;
+}
+
+/**
+ * A file card's heading: the file kind's own name and mark, with the tool and the
+ * path as its detail and the range the call reads or writes after it in the warm
+ * role. A skill keeps the read card's colors and an ODD artifact wears the theme's
+ * purple one on its label and on the rail that leads its rows, while the frame keeps
+ * the call's own status. Collapsed the heading stays one row and ends an over-wide
+ * detail in an ellipsis; expanded it continues the whole detail on the rows below, so
+ * the path and its range are never lost.
+ */
+function fileCardHeading(toolName: QuietToolName, args: Record<string, unknown>, theme: ThemeLike, expanded: boolean): ToolCardHeading | undefined {
+	const card = fileCard(toolName, args);
+	if (card === undefined) return undefined;
+	// Collapsed, an ODD card names the file itself — its own name — because that row is
+	// read at a glance and the path it sits in is what expanding it is for; expanded it
+	// states the whole path the call touched, as the skill card does at both levels.
+	const full = shortenPath(args.path);
+	const path = safeText((card.identity === FILE_CARD_IDENTITY.ODD && !expanded ? fileCardName(args.path) : "") || full || "...");
+	const range = fileCardLineRange(toolName, args);
+	return {
+		title: theme.bold(card.title),
+		subtitle: `${toolName} ${theme.fg("accent", path)}${range === undefined ? "" : theme.fg("warning", range)}`,
+		glyph: card.glyph,
+		titleRole: card.titleRole,
+		railRole: card.railRole,
+		singleLine: !expanded,
+	};
 }
 
 /** One heading at one expansion level, drawn with whatever card chrome is active right now. */
@@ -832,7 +976,7 @@ class ToolCardTop implements Component {
 				body: running ? [cardRunningLine(this.tone, this.theme, inner)] : undefined,
 				bottom: running ? cardBottom(this.tone, this.theme, inner) : undefined,
 			};
-		}));
+		}, this.heading.railRole));
 	}
 
 	invalidate(): void { this.rows.invalidate(); }
@@ -848,10 +992,11 @@ class ToolCardBody implements Component {
 	private readonly elapsed: string | undefined;
 	private readonly row: CardRowContext | undefined;
 	private readonly reveal: CardReveal | undefined;
+	private readonly railRole: string | undefined;
 	/** What the last drawn frame showed; a card with nothing left keeps the click with the host. */
 	private showsMore = true;
 
-	constructor(inner: () => Component, tone: ToolTone, theme: CardTheme, cacheable = true, elapsed?: string, row?: CardRowContext, reveal?: CardReveal) {
+	constructor(inner: () => Component, tone: ToolTone, theme: CardTheme, cacheable = true, elapsed?: string, row?: CardRowContext, reveal?: CardReveal, railRole?: string) {
 		this.inner = inner;
 		this.tone = tone;
 		this.theme = theme;
@@ -859,6 +1004,7 @@ class ToolCardBody implements Component {
 		this.elapsed = elapsed;
 		this.row = row;
 		this.reveal = reveal;
+		this.railRole = railRole;
 	}
 
 	/** A left click on the result rows toggles the card through the same state as its heading. */
@@ -878,7 +1024,7 @@ class ToolCardBody implements Component {
 				bottom: cardBottom(this.tone, this.theme, inner, this.elapsed),
 				afterHeading: true,
 			};
-		});
+		}, this.railRole);
 		return this.cacheable ? this.rows.render(target, false, build) : build();
 	}
 
@@ -982,7 +1128,7 @@ export function createQuietToolRenderer(
 			const hint = finished ? stripAnsi(keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")) : undefined;
 			const heading = toolName === "bash"
 				? bashHeading(callArgs, theme, expanded)
-				: { title: formatToolCall(toolName, callArgs, theme), glyph: TOOL_GLYPH[toolName] };
+				: fileCardHeading(toolName, callArgs, theme, expanded) ?? { title: formatToolCall(toolName, callArgs, theme), glyph: TOOL_GLYPH[toolName] };
 			// Only the bash card withholds a no-op expansion; every other quiet card
 			// keeps the key and the click it has always had.
 			const reveal = toolName === "bash" ? cardReveal(renderContext.state) : undefined;
@@ -1013,7 +1159,14 @@ export function createQuietToolRenderer(
 			const elapsed = toolName === "bash" ? cardElapsed(renderContext?.durationMs) : undefined;
 			const expanded = options.expanded;
 			const reveal = toolName === "bash" ? cardReveal(renderContext?.state) : undefined;
-			const carded = (component: () => Component, cacheable = options.isPartial !== true): Component => new ToolCardBody(component, resultTone, theme, cacheable, elapsed, renderContext, reveal);
+			// The result continues the heading's card, so a card whose heading names a rail
+			// keeps that rail — a bash activity's own role, or the purple an ODD artifact
+			// wears — derived from the same retained call and arguments.
+			const fileMark = toolName === "bash" ? undefined : fileCard(toolName, renderContext?.args);
+			const railRole = fileMark === undefined
+				? toolName === "bash" ? bashIdentity(renderContext?.args ?? {}).titleRole : undefined
+				: fileMark.railRole;
+			const carded = (component: () => Component, cacheable = options.isPartial !== true): Component => new ToolCardBody(component, resultTone, theme, cacheable, elapsed, renderContext, reveal, railRole);
 			// Under the minimal Card content preference, every quiet tool draws
 			// the command alone while collapsed; the expand key still reveals
 			// the full result. Failures keep their bounded error tail so a red
@@ -1024,7 +1177,16 @@ export function createQuietToolRenderer(
 			// the rows are drawn (wrapping at a narrow width hides rows too).
 			const collapsedRows = quietResultRows(toolName, safeResult, text, { expanded: false, isError, args: renderContext?.args, withheld });
 			const expandedRows = quietResultRows(toolName, safeResult, text, { expanded: true, isError, args: renderContext?.args, withheld });
-			if (reveal) reveal.body = (rowWidth) => collapsedRows !== expandedRows || contentRows(collapsedRows, cardInnerWidth(rowWidth)) > PREVIEW_LINE_LIMIT;
+			// A versioning preview judges its own text, so its `reveals` is authoritative
+			// there; every other preview is compared level against level. Either way the
+			// rows are measured where they are drawn, because wrapping at a narrow width
+			// hides rows too: a preview whose text is the whole output still leaves rows
+			// behind the key once those rows no longer fit, and expanding draws them.
+			if (reveal) reveal.body = (rowWidth) => {
+				const overflows = contentRows(collapsedRows.text, cardInnerWidth(rowWidth)) > PREVIEW_LINE_LIMIT;
+				if (collapsedRows.reveals !== undefined) return collapsedRows.reveals || overflows;
+				return collapsedRows.text !== expandedRows.text || overflows;
+			};
 			if (!expanded && withheld) return carded(() => new Text("", 0, 0));
 			if (options.isPartial) {
 				const label = partialLabel(toolName, text);
@@ -1045,11 +1207,18 @@ export function createQuietToolRenderer(
 				), false);
 			}
 			const color = isError ? "error" : expanded ? "toolOutput" : "muted";
-			if (expanded) return carded(() => new Text(expandedRows ? theme.fg(color, expandedRows) : "", 0, 0));
-			if (collapsedRows) {
-				const tail = shouldRenderPreviewTail(toolName, text, isError, renderContext?.args);
+			// A Markdown document renders through Pi's own Markdown renderer once the call is
+			// expanded: any `.md` file a read opens, and the `.md` a write just wrote, drawn
+			// over the content the call wrote. The rule itself lives in the shared file-card
+			// module, so the chat and the Agents pane draw one call the same way; an edit
+			// keeps its diff, the collapsed preview stays the file's first rows, and every
+			// other file keeps the plain result it had.
+			const markdownSource = markdownDocumentSource(toolName, renderContext?.args, text, { expanded, isError });
+			if (markdownSource !== undefined) return carded(() => new FileCardMarkdown(markdownSource, theme));
+			if (expanded) return carded(() => new Text(resultRowsText(toolName, expandedRows.text, theme, color, isError), 0, 0));
+			if (collapsedRows.text) {
 				return carded(() => new BoundedRows([
-					{ text: theme.fg(color, collapsedRows), rows: PREVIEW_LINE_LIMIT, tail },
+					{ text: resultRowsText(toolName, collapsedRows.text, theme, color, isError), rows: PREVIEW_LINE_LIMIT, tail: collapsedRows.tail },
 				], cacheKey));
 			}
 			// The card top rule carries the expand key, so an empty result only closes the frame.
@@ -1063,12 +1232,36 @@ export function createQuietToolRenderer(
 // bash. The tool keeps its own execution, arguments, timeouts, and results;
 // only the row's drawing is Gentle's.
 const CODEGRAPH_TOOL = "codegraph";
-const CODEGRAPH_IDENTITY = { glyph: "⌗", titleRole: "mdCode" } as const;
+// U+F01BC is the tool's own mark, so the card wears the icon CodeGraph ships.
+const CODEGRAPH_IDENTITY = { glyph: "󰆼", titleRole: "mdCode" } as const;
 // The init CLI paints a progress box; its separator rows carry no facts.
 const CODEGRAPH_CHROME = /^[\s│┌└─]*$/;
 // The init log trails into telemetry and upgrade notices after its summary, so
 // the collapsed rows name the index it built rather than the last lines it wrote.
 const CODEGRAPH_INIT_FACT = /\b(Indexed \d+ files?|\d+ nodes?, \d+ edges?|Initialized in)\b/;
+// The init CLI ends by stating what it did to the workspace index, in one
+// sentence: it either built a new `.codegraph` index or brought the existing one
+// up to date. Those two sentences are the only evidence the card reads for that
+// fact — the outcome is never inferred from a stored action, from the arguments,
+// or from the progress box above them — and the parenthesised location is part of
+// the sentence the tool printed, so a line missing it is not read at all.
+// The one sentence this build's `init` ends with. Nothing else is read: an outcome
+// the tool does not print here is not an outcome the card may claim.
+const CODEGRAPH_INIT_OUTCOME = /^CodeGraph initialized a new \.codegraph index at .+ \([^()]+\)\.$/;
+const CODEGRAPH_INIT_OUTCOME_ACTION = "initialized";
+
+/**
+ * What an init call stated it did to the workspace index, as the verb the card
+ * uses, or undefined when the output states no outcome the card can read. Only
+ * that sentence is read: an older log, an unknown shape, or a run that failed and
+ * printed no conclusion leaves the card with the output it has.
+ */
+function codeGraphInitOutcome(text: string): string | undefined {
+	for (const line of outputLines(text)) {
+		if (CODEGRAPH_INIT_OUTCOME.test(line.trim())) return CODEGRAPH_INIT_OUTCOME_ACTION;
+	}
+	return undefined;
+}
 
 /**
  * The result count CodeGraph's own output states, or undefined when the shape
@@ -1127,6 +1320,11 @@ function codeGraphCollapsedRows(
 	}
 	const summary = codeGraphResultSummary(operation, text);
 	if (summary) return { text: `→ ${summary}`, rows: 1, tail: false };
+	// An init the tool concluded says which of its two outcomes it reached, and that
+	// one fact is the whole collapsed row: an index built is not an index brought up
+	// to date, and neither is worth spending preview rows on the progress box.
+	const outcome = operation === "init" ? codeGraphInitOutcome(text) : undefined;
+	if (outcome) return { text: `→ ${outcome}`, rows: 1, tail: false };
 	const preview = operation === "init" ? codeGraphInitPreview(text) : codeGraphPreview(text);
 	return preview ? { text: preview, rows: PREVIEW_LINE_LIMIT, tail: true } : undefined;
 }
@@ -1229,7 +1427,13 @@ export default function quietTools(
 	resolveOverride: GentleAiDevBinaryOverrideResolver = () => resolveGentleAiDevBinaryOverride(),
 	codemodeOptOut: Omit<BuiltinCodemodeOptOutOptions, "effectiveExtensions"> = {},
 ): ReturnType<ExtensionFactory> {
-	if (!quietToolsEnabled()) return;
+	if (!quietToolsEnabled()) {
+		// This process may have offered these cards on an earlier load. The preview
+		// reads one process-wide registry, so an offer has to be withdrawn here: a
+		// transcript that stopped drawing quiet cards must not keep them in the pane.
+		clearAgentToolRenderers(AGENTS_PREVIEW_OWNER);
+		return;
+	}
 	let elapsedTiming: GentleAiElapsedTimingLedger | undefined;
 	let codemodeOptOutOffered = false;
 	pi.on("session_start", (_event, ctx) => {
@@ -1273,5 +1477,27 @@ export default function quietTools(
 			return next();
 		});
 	}
+	// The Agents preview draws a tool call with the chat's own card, so the renderers
+	// registered here are handed over as they are: same factory, same arguments, one
+	// implementation. A card the preview kept of its own drifted from the transcript
+	// (`write` and `edit` headed a call two different ways), and nothing on either
+	// side would have caught the next drift — a test now draws each offered call
+	// through both renderers and requires the same rows.
+	//
+	// The offer belongs to this module, so a reload re-describes it and a disabled
+	// load withdraws it. A card this module draws but cannot draw from a retained
+	// call is named in AGENTS_PREVIEW_EXCLUSIONS instead of being offered.
+	//
+	// Two chat-only paths stay out of the pane because the protocol retains neither:
+	// the elapsed-time ledger is keyed by the chat session's own tool calls, and the
+	// read card's official image fallback needs image content (a retained result is
+	// text). Neither is approximated in the preview.
+	registerAgentToolRenderers({
+		...Object.fromEntries((Object.keys(TOOL_CREATORS) as RegisteredToolName[]).map(
+			(name) => [name, createQuietToolRenderer(name, resolveOverride)],
+		)),
+		bash: createQuietToolRenderer("bash", resolveOverride),
+		[CODEGRAPH_TOOL]: createCodeGraphCardRenderer(),
+	}, { owner: AGENTS_PREVIEW_OWNER });
 	return registerCompactCodemode(pi);
 }

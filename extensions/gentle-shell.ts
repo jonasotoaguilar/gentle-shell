@@ -19,6 +19,7 @@ import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-inte
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
 import { CARD_STYLE, CARD_TONE, cardStyle, panelHeaderRow, renderCard, setCardStyle, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { resolveCardStyle, writeCardStyle } from "../lib/card-style-policy.ts";
+import { AGENTS_VIEW_STYLE, resolveAgentsViewStyle, writeAgentsViewStyle } from "../lib/agents-view-style-policy.ts";
 import { CARD_CONTENT, resolveCardContent, setCardContent, writeCardContent } from "../lib/card-content-policy.ts";
 import { CommandPalette, commandsKey, type CommandPaletteResult } from "../lib/command-palette.ts";
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
@@ -2682,6 +2683,30 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					requestCustomizeRender?.();
 				},
 				() => ({ title: `Cards · ${style}`, sample: `${cardStylePreview[style]}${resolveCardStyle(home).malformed ? " · malformed or unreadable file" : ""}` }),
+			);
+			// Which renderer the /gentle:agents overlay draws its selected thread
+			// with: the log view it has always had (the default) or the cards view
+			// added alongside it. The overlay reads the preference when it opens, so a
+			// choice made here applies there and leaves the conversation untouched.
+			// Each row previews what that renderer really draws: the log view prints
+			// one labelled run per item and has no cards, while the cards view is the
+			// chat's own rendering, with Markdown prose, a card per call that expands
+			// on its own, and the child's real edit diff.
+			const agentsStylePreview = {
+				[AGENTS_VIEW_STYLE.LOG]: "= Text · Thinking · Note · Tool rows · no cards",
+				[AGENTS_VIEW_STYLE.CARDS]: "= cards + markdown · expand per card · real diff",
+			};
+			for (const style of Object.values(AGENTS_VIEW_STYLE)) add(
+				() => {
+					const current = resolveAgentsViewStyle(home);
+					return `Card agents: ${style}${current.style === style && !current.malformed ? " (current)" : ""}`;
+				},
+				`Card agents: ${style}. Applies the next time /gentle:agents opens.`,
+				() => {
+					writeAgentsViewStyle(style, home);
+					requestCustomizeRender?.();
+				},
+				() => ({ title: `Cards · agents ${style}`, sample: `${agentsStylePreview[style]}${resolveAgentsViewStyle(home).malformed ? " · malformed or unreadable file" : ""}` }),
 			);
 			// The content level picks between the quiet tools' result previews
 			// (default) and command-only cards (minimal).
