@@ -77,6 +77,113 @@ test("known shell inspections reuse phase inference without counting checks, wri
 	}
 });
 
+test("newly inferred metadata probes count as discovery while checks and rewrites never do", () => {
+	// Widening phase inference widens this budget: every command the detector
+	// newly reads as exploring becomes a tracked lookup, so the checks and the
+	// mutations that stay out of `exploring` must stay out of the count too.
+	const budget = createExplorationBudget();
+	budget.start("s");
+	for (const command of [
+		"make install", "make -j install", "cargo fmt", "ruff check --fix .", "deno lint --fix", "pnpm install",
+		"go env -w GOPATH=/tmp/go", "go env -u GOPATH",
+		"pnpm -C pkg test", "pnpm run test:unit", "cargo fmt --check", "python -m unittest",
+		"git log --oneline `git rev-parse HEAD`", "cat <(touch marker)",
+	]) {
+		budget.call("s", command, "bash");
+		assert.equal(budget.result("s", event(command, "bash", "x".repeat(50000), false, { command })), undefined, command);
+	}
+	for (const [i, command] of ["locale", "cargo tree", "go env", "gh api repos/o/n"].entries()) {
+		budget.call("s", String(i), "bash");
+		const notice = budget.result("s", event(String(i), "bash", "x", false, { command }));
+		if (i < 3) assert.equal(notice, undefined, command);
+		else assert.match(notice ?? "", /Exploration budget:.*4 tracked lookups/, command);
+	}
+});
+
+test("versioning and publishing never count as discovery while a help page does", () => {
+	// The budget counts exactly what the classifier names as exploring. Versioning
+	// and publishing are card identities, not phases, so a commit, a push or a PR
+	// edit is never a tracked lookup — while a help page is a read like any other.
+	const budget = createExplorationBudget();
+	budget.start("s");
+	for (const command of [
+		"git add -A",
+		"git commit -m x",
+		"git rebase main",
+		"git cherry-pick abc1234",
+		"git push",
+		`git commit -m "--help"`,
+		"gh pr create --title x",
+		"gh issue edit 7 --add-label bug",
+		"gh label create bug",
+		"gh stack init",
+		"gh stack submit",
+		"git push && rm -rf dist",
+		// A help flag an option consumed is not a query, a quoted `>` is not a write,
+		// and an escaped space keeps the help flag inside the value.
+		"git commit -m --help",
+		"gh issue comment 7 --body --help",
+		"git commit -m foo\\ --help",
+		"gh issue comment 7 --body foo\\ --help",
+		"git commit -m $OPTS --help",
+		`git commit -m "fix: a > b"`,
+		`gh issue comment 7 --body "before > after"`,
+	]) {
+		budget.call("s", command, "bash");
+		assert.equal(budget.result("s", event(command, "bash", "x".repeat(50000), false, { command })), undefined, command);
+	}
+	// A usage page is a lookup, including one a command reaches after a value that
+	// holds escaped whitespace.
+	for (const [i, command] of [
+		"git commit --help",
+		"gh pr create --help",
+		"gh stack submit --help",
+		"git commit -m foo\\ bar --help",
+	].entries()) {
+		budget.call("s", String(i), "bash");
+		const notice = budget.result("s", event(String(i), "bash", "x", false, { command }));
+		if (i < 3) assert.equal(notice, undefined, command);
+		else assert.match(notice ?? "", /Exploration budget:.*4 tracked lookups/, command);
+	}
+});
+
+test("preparing, formatting and destructive never count as discovery", () => {
+	// The budget counts exactly what the classifier names as exploring. Installing,
+	// reformatting and deleting are card identities, not phases, so none of them is
+	// a tracked lookup — and a check that reads the same files still is not either.
+	const budget = createExplorationBudget();
+	budget.start("s");
+	for (const command of [
+		"pnpm install",
+		"npm ci",
+		"pip install -r requirements.txt",
+		"mkdir -p tmp/scratch",
+		"git config user.name x",
+		"prettier --write .",
+		"eslint . --fix",
+		"cargo fmt",
+		"ruff check --fix .",
+		"rm -rf dist",
+		"env FOO=bar rm -rf dist",
+		"git checkout .",
+		"rm -f logo.png",
+		"git reset --hard HEAD~1",
+		"git push --delete origin feat/x",
+		`psql -c 'DROP TABLE t'`,
+		`echo 'DROP TABLE t' | psql`,
+		"docker system prune -af",
+		"kubectl delete pod web",
+		"pnpm test && rm -rf dist",
+		"pnpm test && node scripts/release.mjs",
+		"timeout 900 pnpm typecheck 2>&1 | tail -20",
+		"prettier --check .",
+		"git clean -n",
+	]) {
+		budget.call("s", command, "bash");
+		assert.equal(budget.result("s", event(command, "bash", "x".repeat(50000), false, { command })), undefined, command);
+	}
+});
+
 test("read-only memory recall counts and memory mutation or diagnostics never count", () => {
 	const budget = createExplorationBudget();
 	budget.start("s");

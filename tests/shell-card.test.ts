@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
-	CARD_STYLE, CARD_TONE, cardAwaitingResult, cardElapsed, cardRunningLine, cardStyle, cardTopLine, cardTopRows, headingFits, markCardResult, panelExtraRows, panelHeaderRow, renderCard, setCardStyle,
+	CARD_STYLE, CARD_TONE, cardAwaitingResult, cardElapsed, cardRunningLine, cardStyle, cardTopLine, cardTopRows, diffRows, headingFits, markCardResult, panelExtraRows, panelHeaderRow, renderCard, setCardStyle,
 	type Card, type CardStyle, type CardTone,
 } from "../lib/shell-card.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -37,6 +37,22 @@ function card(overrides: Partial<Card> = {}): Card {
 		tone: CARD_TONE.INFO,
 		...overrides,
 	};
+}
+
+// U+2692 is drawn two cells wide by an emoji-fallback font while pi-tui counts it
+// as one, so the glyph's ink covers the cell after it: a one-space gap is painted
+// inside the mark and the heading reads `⚒preparing`. A mark like that carries its
+// own gap, so the eye always sees one column.
+const WIDE_INK_MARKS = new Set(["⚒"]);
+
+/** Blank columns that survive the mark's one-cell overhang, i.e. what the eye sees. */
+function visibleGapAfter(row: string, mark: string): number {
+	const cells = [...row];
+	const at = cells.indexOf(mark);
+	if (at < 0) return 0;
+	let spaces = 0;
+	for (let index = at + 1; index < cells.length && cells[index] === " "; index += 1) spaces += 1;
+	return Math.max(0, spaces - (WIDE_INK_MARKS.has(mark) ? 1 : 0));
 }
 
 test("renderCard draws the rounded frame with the title in the top rule and wraps the body inside", () => {
@@ -117,6 +133,30 @@ test("renderCard accepts a custom glyph and an empty body", () => {
 test("renderCard keeps the top rule at width with a two-cell glyph", () => {
 	const lines = renderCard(card({ glyph: "\u{1F339}\uFE0E" }), plainTheme, 60, { expanded: false, hint: "ctrl+o expand" });
 	for (const line of lines) assert.equal(visibleWidth(line), 60, `"${stripAnsi(line)}" is not 60 wide`);
+});
+
+test("renderCard keeps a mark's own gap and counts it in the heading width", () => {
+	// A mark a font paints two cells wide carries its own gap, so the card draws two
+	// columns before the word and the heading width counts both: the key hint is kept
+	// or dropped by what the terminal really has, never by a column the font paints over.
+	const gapped = card({ title: "preparing", subtitle: "pnpm install", glyph: "⚒ ", tone: CARD_TONE.SUCCESS, body: [] });
+	const outlined = withCardStyle(CARD_STYLE.NEON, () => renderCard(gapped, plainTheme, 40, { expanded: false })).map(stripAnsi);
+	assert.match(outlined[0]!, /^╭─ ⚒ {2}preparing · pnpm install ─+╮$/);
+	assert.equal(visibleGapAfter(outlined[0]!, "⚒"), 1, "one column of gap, not two");
+	assert.doesNotMatch(outlined[0]!, /⚒\S/u, "the mark never joins its word");
+	for (const row of outlined) assert.equal(visibleWidth(row), 40, `"${row}" keeps the card width`);
+
+	// The counted heading is the mark, its gap, the separator and the word.
+	const bare = card({ title: "preparing", subtitle: undefined, glyph: "⚒ ", body: [] });
+	assert.equal(visibleWidth("⚒  preparing"), 12);
+	assert.equal(headingFits(bare, undefined, 17), true, "17 columns hold the 12-column heading and the frame");
+	assert.equal(headingFits(bare, undefined, 16), false, "one column short is short: the gap is counted, not guessed");
+
+	// The float style draws the same heading, one column inside its accent bar.
+	const floated = withCardStyle(CARD_STYLE.FLOAT, () => renderCard(gapped, floatTheme, 40, { expanded: false, previewRows: 1 })).map(stripAnsi);
+	assert.match(floated[1]!, /^ ▎ ⚒ {2}preparing · pnpm install/);
+	assert.equal(visibleGapAfter(floated[1]!, "⚒"), 1, "the float heading carries the same single column");
+	for (const row of floated) assert.equal(visibleWidth(row), 40, `"${row}" keeps the panel width`);
 });
 
 test("renderCard drops the hint before truncating title content", () => {
@@ -204,7 +244,7 @@ test("renderCard never exceeds extremely narrow supplied widths", () => {
 // Float style: the same rows become a borderless panel. Content cells keep a
 // tone-matched background, the frame turns into a tone accent bar and spaces,
 // and a one-column margin stays outside the panel on both sides.
-const FG_CODE: Record<string, number> = { border: 240, accent: 211, success: 114, warning: 221, error: 203, dim: 245, muted: 244, text: 252 };
+const FG_CODE: Record<string, number> = { border: 240, accent: 211, success: 114, warning: 221, error: 203, dim: 245, muted: 244, text: 252, mdLink: 111 };
 const BG_CODE: Record<string, number> = { toolSuccessBg: 22, toolPendingBg: 58, toolErrorBg: 52 };
 const floatTheme = {
 	fg(color: string, text: string) {
@@ -519,6 +559,65 @@ test("a title role paints the glyph and title while the frame keeps the call's t
 	assert.match(plain[0], /<success>✿ Gentle AI<\/success>/);
 });
 
+test("a rail role paints the whole left edge in the heading's own color, unless the call is still reporting a state", () => {
+	// A quiet bash card names its ODD phase in that phase's color, and the card's left
+	// edge is one rail from its top corner to its bottom corner, so it wears that color
+	// while the call has nothing left to report. A running call (the warning tone) and a
+	// failed one (the error tone) keep the status tone on that edge instead: the edge is
+	// where the card states its state, so a label never repaints a call the reader still
+	// has to read as pending or broken. The rest of the frame keeps the status tone either
+	// way. Odd artifacts and customized skills are read/write/edit cards like any other, so
+	// the same rule governs the rail they name.
+	const value = card({ glyph: "⌕", title: "exploring", subtitle: "git status", tone: CARD_TONE.SUCCESS, titleRole: "mdLink", railRole: "mdLink", body: ["clean"] });
+	const frameRole: Record<CardTone, string> = { [CARD_TONE.INFO]: "border", [CARD_TONE.SUCCESS]: "success", [CARD_TONE.WARNING]: "warning", [CARD_TONE.ERROR]: "error" };
+	for (const tone of Object.values(CARD_TONE)) {
+		const status = frameRole[tone];
+		// A status that is still active owns the edge; an idle card wears its own role.
+		const edge = tone === CARD_TONE.WARNING || tone === CARD_TONE.ERROR ? status : "mdLink";
+		const neon = renderCard({ ...value, tone }, taggedTheme, 40, { expanded: true });
+		assert.match(neon[0]!, new RegExp(`^<${edge}>╭</${edge}><${status}>─ `), `${tone}: the top corner wears ${edge}, the rule keeps the status`);
+		assert.match(neon[0]!, /<mdLink>⌕ exploring<\/mdLink>/);
+		assert.match(neon[1]!, new RegExp(`^<${edge}>│</${edge}> .* <${status}>│</${status}>$`), `${tone}: the left rail wears ${edge}, the right rail the status`);
+		assert.match(neon.at(-1)!, new RegExp(`^<${edge}>╰</${edge}><${status}>─+╯</${status}>$`), `${tone}: the bottom corner wears ${edge}`);
+	}
+
+	// A card that names no rail role keeps the tone edge it always had, exactly
+	// like the title override above.
+	const plainRails = renderCard({ ...value, tone: CARD_TONE.WARNING, railRole: undefined }, taggedTheme, 40, { expanded: true });
+	assert.match(plainRails[0]!, /^<warning>╭<\/warning>/, "without a rail role the top corner stays the status tone");
+	assert.match(plainRails[1]!, /^<warning>│<\/warning> /);
+
+	// The float style draws one continuous bar, and the same rule holds there: a running
+	// call keeps the pending colour on the bar while the label keeps the identity's own,
+	// and a call that finished paints the bar in the identity.
+	const runningFloat = withCardStyle(CARD_STYLE.FLOAT, () => renderCard({ ...value, tone: CARD_TONE.WARNING, body: ["alpha", "beta"] }, floatTheme, 40, { expanded: true, previewRows: 3 }));
+	assert.ok(runningFloat.length > 3, "the panel has padding, heading and body rows");
+	for (const row of runningFloat) {
+		assert.ok(row.includes(`\x1b[38;5;${FG_CODE.warning}m▎`), `a running call keeps the pending bar: ${JSON.stringify(row)}`);
+		assert.deepEqual(cellBackgrounds(row).slice(1, -1), Array(38).fill(BG_CODE.toolPendingBg), "the status tint stays behind the rail");
+	}
+	const runningHeading = runningFloat.find((row) => row.includes("⌕"))!;
+	assert.ok(runningHeading.includes(`\x1b[38;5;${FG_CODE.mdLink}m⌕`), `the label keeps the identity's colour: ${JSON.stringify(runningHeading)}`);
+	const finishedFloat = withCardStyle(CARD_STYLE.FLOAT, () => renderCard({ ...value, body: ["alpha", "beta"] }, floatTheme, 40, { expanded: true, previewRows: 3 }));
+	for (const row of finishedFloat) {
+		assert.ok(row.includes(`\x1b[38;5;${FG_CODE.mdLink}m▎`), `a finished call paints the bar in the identity: ${JSON.stringify(row)}`);
+		assert.deepEqual(cellBackgrounds(row).slice(1, -1), Array(38).fill(BG_CODE.toolSuccessBg), "the status tint stays behind the rail");
+	}
+	const failedFloat = withCardStyle(CARD_STYLE.FLOAT, () => renderCard({ ...value, tone: CARD_TONE.ERROR, body: ["alpha"] }, floatTheme, 40, { expanded: true, previewRows: 3 }));
+	for (const row of failedFloat) {
+		assert.ok(row.includes(`\x1b[38;5;${FG_CODE.error}m▎`), `a failed call paints the bar in the error tone: ${JSON.stringify(row)}`);
+	}
+
+	// Narrow panels keep the same rail rather than falling back to the tone.
+	for (const width of [10, 12, 20, 40]) {
+		const rows = withCardStyle(CARD_STYLE.FLOAT, () => renderCard({ ...value, body: ["clean"] }, floatTheme, width, { expanded: true, previewRows: 3 }));
+		for (const row of rows) {
+			assert.equal(visibleWidth(row), width);
+			assert.ok(row.includes(`\x1b[38;5;${FG_CODE.mdLink}m▎`), `width ${width}: ${JSON.stringify(row)}`);
+		}
+	}
+});
+
 test("a heading detail that cannot share the top rule continues below it", () => {
 	const detail = "printf alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa";
 	const value: Card = { title: "bash", subtitle: detail, body: [], tone: CARD_TONE.WARNING };
@@ -566,6 +665,26 @@ test("elapsed time reads in milliseconds and seconds, and is omitted when unknow
 	for (const value of [undefined, Number.NaN, Number.POSITIVE_INFINITY, -5]) assert.equal(cardElapsed(value), undefined, String(value));
 });
 
+test("a diff paints its added rows green and its removed rows red, and leaves every other row alone", () => {
+	// An edit's diff carries three marks: `+` is a row the edit added, `-` is one it
+	// removed, and everything else — context, the patch's own file headers and a
+	// hunk header — is not a change and keeps the role the card already paints it in.
+	const diff = ["@@ -1,2 +1,2 @@", "-1 const b = 2;", "+1 const b = 3;", " 1 const a = 1;", "--- a/lib/x.ts", "+++ b/lib/x.ts"].join("\n");
+	assert.deepEqual(diffRows(diff, taggedTheme, "muted").split("\n"), [
+		"<muted>@@ -1,2 +1,2 @@</muted>",
+		"<toolDiffRemoved>-1 const b = 2;</toolDiffRemoved>",
+		"<toolDiffAdded>+1 const b = 3;</toolDiffAdded>",
+		"<muted> 1 const a = 1;</muted>",
+		"<muted>--- a/lib/x.ts</muted>",
+		"<muted>+++ b/lib/x.ts</muted>",
+	]);
+	// A caller with no base role keeps the non-diff rows exactly as they arrived,
+	// so a card that painted its own rows does not gain a second opinion.
+	assert.deepEqual(diffRows("context\n+added", taggedTheme).split("\n"), ["context", "<toolDiffAdded>+added</toolDiffAdded>"]);
+	// Nothing to paint is nothing, never a role left open around an empty row.
+	assert.equal(diffRows("", taggedTheme, "muted"), "");
+});
+
 test("headingFits says whether a composed subtitle still leaves room for the key hint", () => {
 	const card: Card = { title: "Agent status", subtitle: "explore", body: [], tone: CARD_TONE.INFO, glyph: "◎" };
 	const hint = "expand";
@@ -576,4 +695,31 @@ test("headingFits says whether a composed subtitle still leaves room for the key
 	assert.equal(headingFits(card, undefined, needed - (visibleWidth(hint) + 2)), true, "without a hint exactly the head columns are enough");
 	assert.equal(headingFits(card, undefined, needed - (visibleWidth(hint) + 3)), false, "and one column less is still a no");
 	assert.equal(headingFits({ ...card, subtitle: undefined }, hint, needed - 9), true, "no subtitle frees its separator and columns");
+});
+
+function ownedCard(overrides: Partial<Card> = {}): Card {
+	return card({
+		glyph: "◈",
+		title: "odd",
+		subtitle: "read odd/work/design.md",
+		tone: CARD_TONE.SUCCESS,
+		titleRole: "warning",
+		railRole: "warning",
+		body: ["one"],
+		...overrides,
+	});
+}
+
+test("a card's heading and the rail that leads its rows wear the role the card names", () => {
+	// The identity a file card names is a theme role, so the theme decides its color: the
+	// heading and the rail share it, and the frame keeps the call's status tone, so the
+	// label never hides the state.
+	const rows = renderCard(ownedCard({ titleRole: "mdHeading", railRole: "mdHeading" }), taggedTheme, 44, { expanded: true, previewRows: 3 });
+	assert.match(rows[0]!, /<mdHeading>◈ odd<\/mdHeading>/, "the heading wears the role the card names");
+	assert.match(rows[0]!, /<success>/, "the frame keeps the call's tone");
+	assert.match(rows[1]!, /^<mdHeading>/, `the left rail carries the same role: ${rows[1]!}`);
+	assert.match(rows[1]!, /<success>[^<]*<\/success>$/, "the right rail keeps the tone");
+	// A card that names no rail role keeps the tone's rail, as before.
+	const toneRail = renderCard(ownedCard({ titleRole: "mdHeading", railRole: undefined }), taggedTheme, 44, { expanded: true, previewRows: 3 });
+	assert.match(toneRail[1]!, /^<success>/, "no rail role keeps the tone rail");
 });
