@@ -148,13 +148,13 @@ test("the log draws thinking and every retained output line whole, whatever deta
 });
 
 test("cards bound a collapsed result and hide thinking while expansion keeps every retained line", () => {
-	const resolved: ToolItem = { kind: "tool", callId: "call", name: "bash", args: {}, output: Array.from({ length: 8 }, (_, index) => `output line ${index}`).join("\n"), running: false, isError: false };
+	const resolved: ToolItem = { kind: "tool", callId: "call", name: "webfetch", args: {}, output: Array.from({ length: 8 }, (_, index) => `output line ${index}`).join("\n"), running: false, isError: false };
 	const reasoning = { kind: "thinking" as const, text: Array.from({ length: 6 }, (_, index) => `thought ${index}`).join("\n") };
 	const toolLines = (indent: string, count: number): string[] => Array.from({ length: count }, (_, index) => `${indent}output line ${index}`);
 
-	assert.deepEqual(renderThreadItem(resolved, plainTheme, 40, { presentation: "cards", expanded: false }), ["Tool · bash · Complete", "  Output", ...toolLines("    ", 3), "    … 5 more lines"], "a collapsed card result keeps its bounded preview and the count it withholds");
-	assert.deepEqual(renderThreadItem(resolved, plainTheme, 40, { presentation: "cards", expanded: false, expandHint: "ctrl+o to expand" }), ["Tool · bash · Complete", "  Output", ...toolLines("    ", 3), "    … 5 more lines · ctrl+o to expand"], "the preview names the key that draws the rest");
-	assert.deepEqual(renderThreadItem(resolved, plainTheme, 40, { presentation: "cards", expanded: true }), ["Tool · bash · Complete", "  Output", ...toolLines("    ", 8)], "expanding draws every retained line");
+	assert.deepEqual(renderThreadItem(resolved, plainTheme, 40, { presentation: "cards", expanded: false }), ["Tool · webfetch · Complete", "  Output", ...toolLines("    ", 3), "    … 5 more lines"], "a collapsed card result keeps its bounded preview and the count it withholds");
+	assert.deepEqual(renderThreadItem(resolved, plainTheme, 40, { presentation: "cards", expanded: false, expandHint: "ctrl+o to expand" }), ["Tool · webfetch · Complete", "  Output", ...toolLines("    ", 3), "    … 5 more lines · ctrl+o to expand"], "the preview names the key that draws the rest");
+	assert.deepEqual(renderThreadItem(resolved, plainTheme, 40, { presentation: "cards", expanded: true }), ["Tool · webfetch · Complete", "  Output", ...toolLines("    ", 8)], "expanding draws every retained line");
 
 	assert.deepEqual(renderThreadItem(reasoning, plainTheme, 40, { presentation: "cards", thinkingExpanded: false }), ["Thinking..."], "hidden thinking is exactly the chat's own row, never a preview of the reasoning");
 	assert.deepEqual(renderThreadItem(reasoning, plainTheme, 40, { presentation: "cards", thinkingExpanded: true }), ["Thinking", ...Array.from({ length: 6 }, (_, index) => `  thought ${index}`)], "cards show every thinking line when shown");
@@ -167,9 +167,9 @@ test("cards bound a collapsed result and hide thinking while expansion keeps eve
 	assert.deepEqual(renderThreadItem(reasoning, plainTheme, 40, { presentation: "cards", thinkingExpanded: false, expandHint: "ctrl+o to expand" }), ["Thinking..."], "a collapsed tool hint never leaks onto hidden thinking");
 
 	const short: ToolItem = { ...resolved, output: "one\ntwo" };
-	assert.deepEqual(renderThreadItem(short, plainTheme, 40, { presentation: "cards", expanded: false }), ["Tool · bash · Complete", "  Output", "    one", "    two"], "a short result is never cut, so no remainder is invented");
+	assert.deepEqual(renderThreadItem(short, plainTheme, 40, { presentation: "cards", expanded: false }), ["Tool · webfetch · Complete", "  Output", "    one", "    two"], "a short result is never cut, so no remainder is invented");
 	const empty: ToolItem = { ...resolved, output: "" };
-	assert.deepEqual(renderThreadItem(empty, plainTheme, 40, { presentation: "cards", expanded: false }), ["Tool · bash · Complete"], "a call with nothing retained still claims no output");
+	assert.deepEqual(renderThreadItem(empty, plainTheme, 40, { presentation: "cards", expanded: false }), ["Tool · webfetch · Complete"], "a call with nothing retained still claims no output");
 	for (const width of [4, 8, 10, 20, 40, 80]) {
 		for (const lines of [
 			renderThreadItem(resolved, plainTheme, width, { presentation: "cards", expanded: false }),

@@ -1027,14 +1027,15 @@ test("cards follow the renderer the chat offers live", (t) => {
 	registerQuietTools();
 	assert.equal(readsCard(), true, "a re-offered renderer redraws the card without a resize or a new item");
 
-	// bash is offered only while the chat draws it as a card (minimal content).
+	// bash is a Gentle card at both Card content levels, so the pane draws it under the
+	// default preference too; the level changes what the card shows, not whether it exists.
 	applyTool(store, "bash", { command: "printf hi" }, "hi", false, "bash-call");
-	const bashCard = (): boolean => /\$ printf hi/.test(stripAnsi(view.render(60).join("\n")));
-	assert.equal(bashCard(), false, "the default content preference leaves bash to the generic block");
+	const bashCard = (): boolean => /bash/.test(stripAnsi(view.render(60).join("\n"))) && !/Tool · bash ·/.test(stripAnsi(view.render(60).join("\n")));
+	assert.equal(bashCard(), true, "the default content preference still draws the bash card");
 	setCardContent(CARD_CONTENT.MINIMAL);
-	assert.equal(bashCard(), true, "the card appears as soon as the chat offers it");
+	assert.equal(bashCard(), true, "the card survives the level change");
 	setCardContent(CARD_CONTENT.DEFAULT);
-	assert.equal(bashCard(), false, "and withdraws when the chat stops offering it");
+	assert.equal(bashCard(), true, "and draws again under the default level");
 	view.dispose();
 });
 
