@@ -302,6 +302,17 @@ Pick how much a collapsed quiet-tool card shows in `/gentle:customize` → **Car
 
 Quiet tool cards redraw immediately after a change; bash rows follow on new calls. Gentle AI cards keep their full card and elapsed time at both levels.
 
+### Card bash
+
+Pick the bash card's heading identity in `/gentle:customize` → **Cards** → **Card bash**. The choice is saved in `card-bash.json` in the Gentle Pi config home; a missing, malformed, or unreadable file reads as `activity` (the default), and a malformed file is never overwritten.
+
+| Mode | Bash card heading |
+|------|-------------------|
+| `activity` | The activity the command implies (`⌕ exploring`, `✓ checking`, …) with that activity's mark, color and card box. |
+| `output` | The plain `bash` identity: the `$ bash` title and mark, and a box that follows the call's tone instead of an activity role. |
+
+The switch changes the heading identity only. The command the card shows, its detail rows and the result preview stay the same at both modes, so `output` never brings back uncondensed output.
+
 ### Compact Code card
 
 With quiet tools enabled, `codemode` uses the same rounded **Code** card. The collapsed view shows up to eight observed child calls in their original order, including repeats, with Pi's actual status and available nonnegative duration. Additional calls and failures are counted. Error payloads have a separate two-row preview even when their child falls outside the first eight; final output has a three-row physical budget, and a full-output locator remains visible when available.
@@ -455,7 +466,7 @@ You do not need the command: ask in plain language for a screen, mockup, landing
 The canvas opens in navigation mode: the mouse wheel, trackpad, and drag always pan or zoom the canvas, even over an artboard, and Ctrl/Cmd + wheel zooms. Hovering an artboard shows "Click to use this design"; clicking it enters focus mode, which shows that artboard at its designed width at 100% and lets it own the pointer and keyboard, so its own scrolling, hovers, buttons, and inputs behave like the real page. While an artboard is in focus, the comments panel hides to make room, the rest of the canvas is dimmed and does not pan or zoom, and an artboard taller than the window scrolls inside its frame. To return to navigation mode, press the floating "Back to canvas" button or `Shift+Esc`, which works even while typing inside the artboard; plain `Esc` stays with the design, and the previous zoom, position, and comments panel are restored. Comment mode keeps working in both modes: a click picks an element instead of entering focus mode.
 
 - While the agent is busy, the run is queued as a follow-up.
-- `/gentle:design open [slug]` shows a design on a local canvas in the default browser: every artboard side by side at its manifest size, with its title and tradeoff; zoom with the buttons or Ctrl/Cmd + wheel, pan by dragging or scrolling, and Fit to the window. The canvas reloads an artboard when its file changes and the whole design when `design.json` changes. Without a slug it opens the most recent design. The URL is always printed; when the browser cannot be opened, open it manually.
+- `/gentle:design open [slug]` shows a design on a local canvas in the default browser: every artboard side by side at its manifest size, with its title and tradeoff; zoom with the buttons or Ctrl/Cmd + wheel, pan by dragging or scrolling, and Fit to the window. The view starts fitted and fits again when the window or the panel changes size, until you zoom or pan yourself; while you write a comment it waits, and the next size change fits it. The canvas reloads an artboard when its file changes and the whole design when `design.json` changes. Without a slug it opens the most recent design. The URL is always printed; when the browser cannot be opened, open it manually.
 - `/gentle:design` with no arguments opens the most recent design (by `design.json` modification time) the same way. When the project has no design yet but has `design/system.html`, it and `open` show the canvas with only the system board; with neither, they print usage.
 - Comments: turn on Comment mode, click an element in an artboard, and type a comment. Every comment is saved in `design/<slug>/comments.json` with its artboard, CSS selector, text excerpt, date, and status (`open` or `resolved`), so any agent or later session can read it.
   - **Send now** (the default) also sends the session one message with the design, the comment id, the artboard file, the selector, the excerpt, and the comment; while the agent is busy, it is queued as a follow-up.
