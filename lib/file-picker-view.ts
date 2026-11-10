@@ -45,7 +45,7 @@ const LOADING_FILES = "Loading files …";
 const LOADING_PREVIEW = "Loading preview …";
 const NO_FILES = "No files in this repository.";
 const TRUNCATED_NOTICE = "… preview truncated.";
-const FOOTER = "type to search • tab select • ctrl+u clear • ctrl+j/k move • ctrl+shift+j/k scroll • enter insert • ctrl+e editor • esc close";
+const FOOTER = "type to search • tab select • ctrl+u clear • ctrl+j/k move • ctrl+shift+j/k scroll • enter insert • ctrl+e editor • esc/ctrl+c close";
 const NEW_BADGE = "new";
 const UPDATED_BADGE = "upt";
 
@@ -446,15 +446,23 @@ export class FilePickerView {
 			const paths = this.insertionPaths();
 			if (paths.length === 0) return;
 			this.complete();
-			this.deps.onInsert(paths);
-			this.deps.onClose();
+			// The overlay closes even when the paste throws: a completed panel
+			// with dead input would otherwise strand the session in the picker.
+			try {
+				this.deps.onInsert(paths);
+			} finally {
+				this.deps.onClose();
+			}
 			return;
 		}
 		const path = action === "open" ? this.selectedPath() : undefined;
 		if (action === "open" && path === undefined) return;
 		this.complete();
-		if (path !== undefined) this.deps.onOpen(path);
-		this.deps.onClose();
+		try {
+			if (path !== undefined) this.deps.onOpen(path);
+		} finally {
+			this.deps.onClose();
+		}
 	}
 
 	private complete(): void {

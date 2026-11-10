@@ -130,7 +130,7 @@ test("the card frame is exact at two widths, with the title, esc hint, step subt
 	assert.match(wide[1]!, /^│ File picker +esc +│$/, "the header carries the title on the left and esc on the right");
 	assert.match(wide[2]!, /Choose a scope/, "a muted subtitle line names the step");
 	const footer = wide[wide.length - 2]!;
-	for (const key of ["↑/↓", "ctrl+j/k", "enter", "esc close"]) {
+	for (const key of ["↑/↓", "ctrl+j/k", "enter", "esc/ctrl+c close"]) {
 		assert.ok(footer.includes(key), `footer must list ${JSON.stringify(key)}: ${footer}`);
 	}
 });
@@ -193,6 +193,14 @@ test("esc and ctrl+c close exactly once", () => {
 	assert.equal(ctrlC.calls.close, 1);
 	ctrlC.view.handleInput("\x03");
 	assert.equal(ctrlC.calls.close, 1);
+});
+
+test("a throwing scope callback still closes the step exactly once", () => {
+	const { view, calls } = createView({ onSelect() { throw new Error("picker failed"); } });
+	assert.throws(() => view.handleInput("\r"), /picker failed/);
+	assert.equal(calls.close, 1, "onClose runs even when choosing a scope throws");
+	view.handleInput("\r");
+	assert.equal(calls.close, 1, "a completed step never closes twice");
 });
 
 test("the wheel moves the selection and clamps at both ends", () => {
@@ -265,7 +273,7 @@ test("an empty scope list renders its message instead of a blank card and never 
 	const body = bodyText(lines);
 	assert.match(body, /No worktrees/);
 	assert.match(body, /File picker/);
-	assert.match(body, /esc close/);
+	assert.match(body, /esc\/ctrl\+c close/);
 	assert.equal(visibleWidth(lines[0]!), 100);
 	view.handleInput("\r");
 	view.handleInput("\x1b[B");

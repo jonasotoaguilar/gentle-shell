@@ -44,7 +44,7 @@ export interface FileScopeDeps {
 const TITLE = "File picker";
 const SUBTITLE = "Choose a scope";
 const NO_SCOPES = "No worktrees registered.";
-const FOOTER = "↑/↓ or ctrl+j/k move • enter choose scope • esc close";
+const FOOTER = "↑/↓ or ctrl+j/k move • enter choose scope • esc/ctrl+c close";
 const MAX_CARD_HEIGHT = 24;
 // Header, step subtitle and footer, plus the two card borders.
 const CHROME_ROWS = 5;
@@ -215,8 +215,18 @@ export class FileScopeView {
 		this.completed = true;
 		this.pointerFrame = undefined;
 		this.hovered = undefined;
-		if (scope) this.deps.onSelect(scope);
-		else this.deps.onClose();
+		if (!scope) {
+			this.deps.onClose();
+			return;
+		}
+		// Choosing hands the scope to the picker, which closes this step. A
+		// throwing handoff must not leave a completed step with dead input.
+		try {
+			this.deps.onSelect(scope);
+		} catch (error) {
+			this.deps.onClose();
+			throw error;
+		}
 	}
 
 	private scopeRows(width: number, bodyRows: number, hits: PointerHit[]): string[] {

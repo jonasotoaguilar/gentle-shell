@@ -94,6 +94,10 @@ interface FakeUi {
 	overlayView: { render(width: number): string[]; handleInput(data: string): void } | undefined;
 	closeOverlay: (() => void) | undefined;
 	customOptions?: unknown[];
+	/** Text handed to the prompt editor, in call order. */
+	pastes: string[];
+	/** How many overlays have called their `done` callback, so a test can see close ordering. */
+	overlayCompletions: number;
 }
 
 interface GitScript {
@@ -184,7 +188,7 @@ async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionC
 }
 
 function fakeContext(options: { theme?: typeof plainTheme & { getBgAnsi?(): string }; hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; idle?: boolean; editorFactory?: unknown; token?: string; select?: (title: string, options: string[]) => Promise<string | undefined> } = {}): { ctx: ExtensionContext; ui: FakeUi; overlayReady: Promise<void> } {
-	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), widgetSets: 0, workingVisible: undefined, notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined, customOptions: [] };
+	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), widgetSets: 0, workingVisible: undefined, notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined, customOptions: [], pastes: [], overlayCompletions: 0 };
 	let resolveOverlay: () => void;
 	const overlayReady = new Promise<void>((resolve) => { resolveOverlay = resolve; });
 	const entries = options.entries ?? [];
@@ -228,6 +232,9 @@ function fakeContext(options: { theme?: typeof plainTheme & { getBgAnsi?(): stri
 			notify(message: string) {
 				ui.notices.push(message);
 			},
+			pasteToEditor(text: string) {
+				ui.pastes.push(text);
+			},
 			setWorkingVisible(visible: boolean) {
 				ui.workingVisible = visible;
 			},
@@ -242,7 +249,7 @@ function fakeContext(options: { theme?: typeof plainTheme & { getBgAnsi?(): stri
 					ui.closeOverlay = () => resolve(null);
 					// An identity bg mock hides focused rows; omit it so overlay navigation
 					// remains inspectable through Commands' ▸ fallback.
-					ui.overlayView = factory(fakeTui, { ...plainTheme, bg: undefined }, fakeKeybindings, (value: T) => resolve(value));
+					ui.overlayView = factory(fakeTui, { ...plainTheme, bg: undefined }, fakeKeybindings, (value: T) => { ui.overlayCompletions += 1; resolve(value); });
 					resolveOverlay();
 				});
 			},
@@ -5272,6 +5279,28 @@ const gitStateOnly = (git: readonly string[][]) => git.length > 0 && git.every((
   || (command[0] === "diff" && command.includes("HEAD")) || command[0] === "symbolic-ref" || (command[0] === "rev-parse" && command.includes("--verify"));
 });
 
+// The file picker's Git reads: one `ls-files` per browsed root, a clean
+// status, and the same branch asks /changes makes. Anything else is quiet.
+function filePickerGit(pi: ExtensionAPI, files: Record<string, string[]> = { "/repo": ["AGENTS.md", "src/index.ts"] }, rejectBranchFor: readonly string[] = []) {
+ const calls: string[][] = [];
+ (pi as unknown as { exec(command: string, args: string[]): Promise<unknown> }).exec = async (_command, args) => {
+  calls.push(args);
+  const root = args[1];
+  if (args.includes("ls-files")) return { stdout: (files[root] ?? []).map((path) => `${path}\0`).join(""), stderr: "", code: 0, killed: false };
+  if (args.includes("worktree")) return { stdout: "worktree /repo\0branch refs/heads/main\0\0", stderr: "", code: 0, killed: false };
+  if (args.includes("symbolic-ref")) {
+   if (root !== undefined && rejectBranchFor.includes(root)) throw new Error("git unavailable");
+   return { stdout: "", stderr: "", code: 1, killed: false };
+  }
+  return { stdout: args.includes("rev-parse") ? root ?? "" : "", stderr: "", code: 0, killed: false };
+ };
+ return calls;
+}
+
+async function until(check: () => boolean): Promise<void> {
+ for (let attempt = 0; attempt < 200 && !check(); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+}
+
 test("Changes lists the session root's Git state at turn end, never at startup", async () => {
  const { pi, handlers, git } = fakePi([{numstat:"2\t0\tlib/b.ts\n",porcelain:" M lib/b.ts\0?? other.ts\0"},{numstat:"3\t0\tlib/b.ts\n",porcelain:" M lib/b.ts\0?? other.ts\0"}]);
  gentleShell(pi,{});
@@ -5360,6 +5389,118 @@ test("a registered worktree opens Changes as its own group", async () => {
   assert.match(rendered,/detached · linked/, "a root outside the worktree list asks for its own HEAD");
   assert.ok(gitStateOnly(git), JSON.stringify(git));
  } finally { ui.closeOverlay?.(); await opened; await fire(handlers,"session_shutdown",ctx); }
+});
+
+// /gentle:files wires the command, the shortcut and the picker together: the
+// overlay the user sees, the text Enter pastes and the order of both.
+test("/gentle:files and alt+p register, and Enter pastes before the picker closes", async () => {
+	const h = fakePi();
+	filePickerGit(h.pi);
+	gentleShell(h.pi, {});
+	const { ctx, ui, overlayReady } = fakeContext();
+	const api = ctx.ui as unknown as { pasteToEditor(text: string): void };
+	const trace: string[] = [];
+	const basePaste = api.pasteToEditor;
+	api.pasteToEditor = (text) => { trace.push(`paste:${text}:${ui.overlayCompletions === 0 ? "open" : "closed"}`); basePaste.call(api, text); };
+	await fire(h.handlers, "session_start", ctx);
+	assert.ok(h.commands.has("gentle:files"), "/gentle:files is registered");
+	assert.ok(h.shortcuts.has("alt+p"), "alt+p is the registered default shortcut");
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await overlayReady;
+	const frame = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
+	await until(() => frame().includes("AGENTS.md"));
+	assert.match(frame(), /File picker/);
+	assert.match(frame(), /AGENTS\.md/, "the picker lists the session repository's files");
+	assert.match(frame(), /tab select/, "the picker itself opened, not a scope step");
+	ui.overlayView!.handleInput("\r");
+	await opened;
+	assert.deepEqual(ui.pastes, ["@AGENTS.md"], "Enter pastes the @-relative path of the session cwd");
+	assert.deepEqual(trace, ["paste:@AGENTS.md:open"], "the paste lands while the overlay is still open, and closing follows it");
+	assert.equal(ui.overlayCompletions, 1, "Enter closes the picker exactly once");
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
+test("the scope step appears only with a listed worktree, closes first, and browses the chosen root", async () => {
+	const h = fakePi();
+	const calls = filePickerGit(h.pi, { "/repo": ["AGENTS.md"], "/linked": ["linked-only.ts"] }, ["/linked"]);
+	gentleShell(h.pi, {});
+	const { ctx, ui, overlayReady } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	const direct = h.commands.get("gentle:files")!.handler("", ctx);
+	await overlayReady;
+	assert.equal(ui.customOptions?.length, 1, "an unregistered session opens the picker directly");
+	assert.doesNotMatch(stripAnsi(ui.overlayView!.render(120).join("\n")), /Choose a scope/);
+	ui.overlayView!.handleInput("\x1b");
+	await direct;
+
+	await h.tools.get("session_worktree_register")!.execute("r", { path: "/linked" }, undefined, undefined, ctx);
+	const previous = ui.overlayView;
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await until(() => ui.overlayView !== previous);
+	const scopeView = ui.overlayView!;
+	const options = ui.customOptions?.length ?? 0;
+	const scopeFrame = stripAnsi(scopeView.render(120).join("\n"));
+	assert.match(scopeFrame, /Choose a scope/, "a listed worktree adds the scope step");
+	assert.match(scopeFrame, /▸ main/, "the session repository stays the first scope");
+	assert.match(scopeFrame, /unknown · linked/, "a rejected branch lookup is unknown, as /changes labels it");
+
+	scopeView.handleInput("\x1b[B");
+	scopeView.handleInput("\r");
+	await until(() => ui.overlayView !== scopeView);
+	assert.ok(ui.overlayView !== scopeView, "the scope step is gone before the picker is created");
+	assert.equal(ui.customOptions?.length, options + 1, "the picker opens after the scope step resolved");
+	const pickerFrame = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
+	await until(() => pickerFrame().includes("linked-only.ts"));
+	assert.match(pickerFrame(), /linked-only\.ts/, "the picker lists the chosen worktree's files");
+	assert.ok(calls.some((args) => args.includes("ls-files") && args[1] === "/linked"), "the listing reads the chosen root, not the session cwd");
+	ui.overlayView!.handleInput("\x1b");
+	await opened;
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
+test("a root /changes no longer lists adds no scope step", async () => {
+	const h = fakePi();
+	filePickerGit(h.pi, { "/repo": ["AGENTS.md"], "/gone": ["stale.ts"] });
+	gentleShell(h.pi, {}, { rootExists: (root) => root !== "/gone" });
+	const { ctx, ui, overlayReady } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	await h.tools.get("session_worktree_register")!.execute("r", { path: "/gone" }, undefined, undefined, ctx);
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await overlayReady;
+	const frame = stripAnsi(ui.overlayView!.render(120).join("\n"));
+	assert.equal(ui.customOptions?.length, 1, "a filtered root never adds the scope step");
+	assert.doesNotMatch(frame, /Choose a scope/);
+	assert.doesNotMatch(frame, /gone/, "a root that no longer exists is not offered");
+	ui.overlayView!.handleInput("\x1b");
+	await opened;
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
+test("ctrl+e closes the picker before the editor handoff and reports the missing editor", async (t) => {
+	const saved = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR };
+	delete process.env.VISUAL;
+	delete process.env.EDITOR;
+	t.after(() => {
+		if (saved.VISUAL !== undefined) process.env.VISUAL = saved.VISUAL;
+		if (saved.EDITOR !== undefined) process.env.EDITOR = saved.EDITOR;
+	});
+	const h = fakePi();
+	filePickerGit(h.pi);
+	gentleShell(h.pi, {});
+	const { ctx, ui, overlayReady } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	const api = ctx.ui as unknown as { notify(message: string): void };
+	const handoffs: string[] = [];
+	const baseNotify = api.notify;
+	api.notify = (message) => { handoffs.push(`${message}:${ui.overlayCompletions === 0 ? "open" : "closed"}`); baseNotify.call(api, message); };
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await overlayReady;
+	const frame = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
+	await until(() => frame().includes("AGENTS.md"));
+	ui.overlayView!.handleInput("\x05");
+	await opened;
+	assert.deepEqual(handoffs, ["No editor configured. Set $VISUAL or $EDITOR.:closed"], "the overlay closes before the editor handoff reports");
+	await fire(h.handlers, "session_shutdown", ctx);
 });
 
 // /gentle:changes opens like Gentle Agents: a full-terminal overlay whose

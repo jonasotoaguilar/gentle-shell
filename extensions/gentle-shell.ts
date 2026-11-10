@@ -16,7 +16,7 @@ import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles
 import * as os from "node:os";
 import { dirname, basename, join, resolve } from "node:path";
 import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellSidebarBar, renderShellStatusBar, renderShellStatusSections, renderShellChromeBar, renderShellChromePad, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, foreignRootBranch, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
+import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, UNKNOWN_BRANCH, WorktreeChangesTracker, changesDigest, foreignRootBranch, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { FilePickerView } from "../lib/file-picker-view.ts";
 import { FileScopeView, type FileScope } from "../lib/file-scope-view.ts";
@@ -3068,22 +3068,25 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		try { return deps.resolveWorktree(ctx.cwd, ctx.cwd)?.root ?? ctx.cwd; }
 		catch { return ctx.cwd; }
 	};
-	// `main` is always the session repository; every other scope is a worktree
-	// this session registered, labelled exactly as /changes labels it. With no
+	// `main` is always the session repository; every other scope is a root
+	// /changes lists too, labelled exactly as /changes labels it. With no
 	// registered worktree the list is just `main`, so the extra step is skipped.
 	const filePickerScopes = async (ctx: ExtensionContext): Promise<FileScope[]> => {
 		const main = filePickerRoot(ctx);
 		const scopes: FileScope[] = [{ root: main, label: "main", kind: "main", lastModifiedMs: scopeRecency(changes, main) }];
 		const sessionId = ctx.sessionManager.getSessionId();
 		let roots: string[] = [];
-		try { roots = registry && registry.sessionId === sessionId ? registry.roots() : []; }
+		try { roots = [...new Set(sessionChangeRoots(sessionId, ctx.sessionManager.getEntries()).filter((root) => deps.rootExists(root) && !isHomeOrBroadUserDirectory(root)))]; }
 		catch { roots = []; }
-		for (const root of roots) {
-			if (root === main) continue;
+		const others = roots.filter((root) => root !== main);
+		const trees = await Promise.all(others.map(async (root): Promise<FileScope> => {
 			const known = changes?.worktrees.find((tree) => tree.root === root)?.branch;
-			const branch = known ?? await foreignRootBranch(deps.gitRunner(root)).catch(() => undefined);
-			scopes.push({ root, label: `${branch ?? "detached"} · ${basename(root)}`, kind: "worktree", lastModifiedMs: scopeRecency(changes, root) });
-		}
+			// A rejected branch lookup is unknown, never "detached": git never
+			// answered, so the root's HEAD state is not known (lib/shell-changes.ts).
+			const branch = known ?? await foreignRootBranch(deps.gitRunner(root)).catch(() => UNKNOWN_BRANCH);
+			return { root, label: `${branch ?? "detached"} · ${basename(root)}`, kind: "worktree", lastModifiedMs: scopeRecency(changes, root) };
+		}));
+		scopes.push(...trees);
 		return scopes;
 	};
 	const openFilePicker = async (ctx: ExtensionContext) => {
@@ -3119,7 +3122,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					loadPreview: async (relative) => readFilePreview(scope.root, relative),
 					// Enter formats and pastes, then the picker closes with focus back in
 					// the prompt: the message is never sent from here.
-					onInsert: (paths) => ctx.ui.pasteToEditor(formatFileInsertion(paths, scope)),
+					onInsert: (paths) => ctx.ui.pasteToEditor(formatFileInsertion(paths, { root: scope.root, kind: scope.kind, cwd: ctx.cwd })),
 					onOpen: (relative) => { editorPath = join(scope.root, relative); },
 					onClose: () => close(null),
 					requestRender: () => tui.requestRender(),

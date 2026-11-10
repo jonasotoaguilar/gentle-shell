@@ -162,7 +162,7 @@ test("the card frame is exact at two widths, with the title, esc hint and key fo
 test("the footer carries the whole key list when the width allows it and truncates to one line when it does not", async () => {
 	const { view } = await openView();
 	const roomy = stripAnsi(view.render(200)[view.render(200).length - 2]!);
-	for (const key of ["type to search", "tab select", "ctrl+u clear", "ctrl+j/k move", "ctrl+shift+j/k scroll", "enter insert", "ctrl+e editor", "esc close"]) {
+	for (const key of ["type to search", "tab select", "ctrl+u clear", "ctrl+j/k move", "ctrl+shift+j/k scroll", "enter insert", "ctrl+e editor", "esc/ctrl+c close"]) {
 		assert.ok(roomy.includes(key), `footer must list ${JSON.stringify(key)}: ${roomy}`);
 	}
 	const narrow = view.render(80);
@@ -481,6 +481,20 @@ test("esc and ctrl+c close exactly once", async () => {
 	const ctrlC = await openView();
 	ctrlC.view.handleInput("\x03");
 	assert.equal(ctrlC.calls.close, 1);
+});
+
+test("a throwing paste or editor callback still closes the panel exactly once", async () => {
+	const insert = await openView({ onInsert() { throw new Error("paste failed"); } }, [entry("a.ts")]);
+	assert.throws(() => insert.view.handleInput("\r"), /paste failed/);
+	assert.equal(insert.calls.close, 1, "onClose runs even when the paste throws");
+	insert.view.handleInput("\r");
+	assert.equal(insert.calls.close, 1, "a completed panel never closes twice");
+
+	const open = await openView({ onOpen() { throw new Error("editor failed"); } }, [entry("a.ts")]);
+	assert.throws(() => open.view.handleInput("\x05"), /editor failed/);
+	assert.equal(open.calls.close, 1, "onClose runs even when the editor handoff throws");
+	open.view.handleInput("\x05");
+	assert.equal(open.calls.close, 1);
 });
 
 test("a changed row shows its state badge and the age computed once when the panel opened", async () => {
