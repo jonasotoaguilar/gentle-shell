@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { FilePickerView, type FilePickerDeps, type FilePickerTheme } from "../lib/file-picker-view.ts";
-import { FILE_PREVIEW_BINARY_NOTICE, type FilePreview, type RepositoryListing } from "../lib/file-index.ts";
+import { FILE_PREVIEW_BINARY_NOTICE, type FileEntry, type FilePreview, type RepositoryEntriesResult } from "../lib/file-index.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
 // The file picker overlay: repository files on the left, a lazy preview on
@@ -13,6 +13,14 @@ const CTRL_SHIFT_J = "\x1b[106;6u";
 const CTRL_SHIFT_K = "\x1b[107;6u";
 const PAGE_DOWN = "\x1b[6~";
 const PAGE_UP = "\x1b[5~";
+const TAB = "\t";
+
+// A fixed clock: the row ages are computed once when the panel opens, so a
+// test can advance the clock and prove the painted ages never move.
+const NOW = 1_700_000_000_000;
+const MINUTE = 60_000;
+const HOUR = 3_600_000;
+const DAY = 86_400_000;
 
 const plainTheme: FilePickerTheme = {
 	fg(_color: string, text: string) {
@@ -26,7 +34,7 @@ const taggedTheme: FilePickerTheme = {
 	},
 };
 
-const FILES = ["README.md", "src/app.ts", "src/lib/util.ts"];
+const FILES: FileEntry[] = [{ path: "README.md", state: "clean" }, { path: "src/app.ts", state: "clean" }, { path: "src/lib/util.ts", state: "clean" }];
 
 type MouseEvent = {
 	type: "press" | "release" | "move" | "drag" | "click" | "wheel";
@@ -45,14 +53,18 @@ type MouseEvent = {
 
 interface Calls {
 	open: string[];
-	insert: string[];
+	insert: string[][];
 	close: number;
 	render: number;
 	trace: string[];
 }
 
-function listing(files: string[]): RepositoryListing {
-	return { ok: true, files };
+function entry(path: string, state: FileEntry["state"] = "clean", mtimeMs?: number): FileEntry {
+	return mtimeMs === undefined ? { path, state } : { path, state, mtimeMs };
+}
+
+function entries(list: FileEntry[]): RepositoryEntriesResult {
+	return { ok: true, entries: list };
 }
 
 function preview(lines: string[], truncated = false): FilePreview {
@@ -63,13 +75,14 @@ async function settle(): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function createView(overrides: Partial<FilePickerDeps> = {}, files = FILES): { view: FilePickerView; calls: Calls } {
+function createView(overrides: Partial<FilePickerDeps> = {}, list: FileEntry[] = FILES): { view: FilePickerView; calls: Calls } {
 	const calls: Calls = { open: [], insert: [], close: 0, render: 0, trace: [] };
 	const deps: FilePickerDeps = {
 		theme: plainTheme,
 		rows: 20,
-		async listFiles() {
-			return listing(files);
+		now: () => NOW,
+		async listEntries() {
+			return entries(list);
 		},
 		async loadPreview(relativePath) {
 			return preview([`preview of ${relativePath}`, "second line"]);
@@ -78,9 +91,9 @@ function createView(overrides: Partial<FilePickerDeps> = {}, files = FILES): { v
 			calls.open.push(relativePath);
 			calls.trace.push(`open:${relativePath}`);
 		},
-		onInsert(relativePath) {
-			calls.insert.push(relativePath);
-			calls.trace.push(`insert:${relativePath}`);
+		onInsert(relativePaths) {
+			calls.insert.push(relativePaths);
+			calls.trace.push(`insert:${relativePaths.join(",")}`);
 		},
 		onClose() {
 			calls.close += 1;
@@ -94,8 +107,8 @@ function createView(overrides: Partial<FilePickerDeps> = {}, files = FILES): { v
 	return { view: new FilePickerView(deps), calls };
 }
 
-async function openView(overrides: Partial<FilePickerDeps> = {}, files = FILES): Promise<{ view: FilePickerView; calls: Calls }> {
-	const created = createView(overrides, files);
+async function openView(overrides: Partial<FilePickerDeps> = {}, list: FileEntry[] = FILES): Promise<{ view: FilePickerView; calls: Calls }> {
+	const created = createView(overrides, list);
 	created.view.render(120);
 	await settle();
 	created.view.render(120);
@@ -118,6 +131,13 @@ function rowOf(lines: readonly string[], text: string): number {
 	return y;
 }
 
+/** The left pane cell of the row showing `text`, without the card border. */
+function listCell(lines: readonly string[], text: string): string {
+	const row = stripAnsi(lines[rowOf(lines, text)] ?? "");
+	const cell = row.split(" │ ")[0] ?? "";
+	return cell.replace(/^│ /, "");
+}
+
 function mouse(lines: readonly string[], x: number, y: number, type: MouseEvent["type"] = "click", button: MouseEvent["button"] = "left", wheelDelta?: number, width = visibleWidth(lines[0] ?? "")): MouseEvent {
 	const height = lines.length;
 	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false, wheelDelta };
@@ -137,10 +157,20 @@ test("the card frame is exact at two widths, with the title, esc hint and key fo
 	}
 	const wide = view.render(120).map((line) => stripAnsi(line));
 	assert.match(wide[1]!, /^│ File picker +esc +│$/, "the header carries the title on the left and esc on the right");
-	const footer = wide[wide.length - 2]!;
-	for (const key of ["type to search", "ctrl+j/k move", "ctrl+shift+j/k scroll", "enter insert", "ctrl+e editor", "esc close"]) {
-		assert.ok(footer.includes(key), `footer must list ${JSON.stringify(key)}: ${footer}`);
+});
+
+test("the footer carries the whole key list when the width allows it and truncates to one line when it does not", async () => {
+	const { view } = await openView();
+	const roomy = stripAnsi(view.render(200)[view.render(200).length - 2]!);
+	for (const key of ["type to search", "tab select", "ctrl+u clear", "ctrl+j/k move", "ctrl+shift+j/k scroll", "enter insert", "ctrl+e editor", "esc close"]) {
+		assert.ok(roomy.includes(key), `footer must list ${JSON.stringify(key)}: ${roomy}`);
 	}
+	const narrow = view.render(80);
+	const footer = stripAnsi(narrow[narrow.length - 2]!);
+	assert.ok(footer.includes("type to search"));
+	assert.match(footer, /… +│$/, "a narrow footer is truncated instead of wrapping");
+	assert.equal(narrow.length, 20, "the truncated footer never adds a row");
+	for (const line of narrow) assert.equal(visibleWidth(line), 80);
 });
 
 test("the body is two panes split by one vertical rule, with the list and preview content", async () => {
@@ -153,7 +183,7 @@ test("the body is two panes split by one vertical rule, with the list and previe
 });
 
 test("typing narrows the list without navigating or firing an action, and resets the selection to the first match", async () => {
-	const { view, calls } = await openView({}, ["alpha.ts", "alpine.ts", "src/beta.ts"]);
+	const { view, calls } = await openView({}, [entry("alpha.ts"), entry("alpine.ts"), entry("src/beta.ts")]);
 	view.handleInput("\x1b[B");
 	assert.match(selectedRow(view.render(120)), /alpine\.ts/);
 	for (const character of "al") view.handleInput(character);
@@ -193,19 +223,31 @@ test("backspace edits the query, ctrl+u clears it, and a multi-character paste n
 	assert.ok(bodyText(view.render(120)).includes("README.md"), "backspace on an empty query is a no-op");
 });
 
+test("ctrl+u restores the whole listing and keeps the Tab selection", async () => {
+	const { view } = await openView({}, [entry("app.ts"), entry("README.md")]);
+	view.handleInput(TAB);
+	assert.match(selectedRow(view.render(120)), /✓/, "the highlighted row is now selected");
+	for (const character of "app") view.handleInput(character);
+	assert.ok(!bodyText(view.render(120)).includes("README.md"), "the query filters the list");
+	view.handleInput("\x15");
+	const lines = view.render(120);
+	assert.ok(bodyText(lines).includes("README.md"), "ctrl+u clears the query");
+	assert.match(stripAnsi(lines[rowOf(lines, "app.ts")]!), /✓/, "clearing the query keeps the selection");
+});
+
 test("a failed listing shows its message and an empty repository shows an explicit line", async () => {
-	const failed = await openView({ listFiles: async () => ({ ok: false, message: "Cannot list repository files: not a repository." }) });
+	const failed = await openView({ listEntries: async () => ({ ok: false, message: "Cannot list repository files: not a repository." }) });
 	const failedBody = bodyText(failed.view.render(120));
 	assert.ok(failedBody.includes("Cannot list repository files: not a repository."));
 	assert.ok(!failedBody.includes("Loading files"));
 
-	const empty = await openView({ listFiles: async () => listing([]) });
+	const empty = await openView({ listEntries: async () => entries([]) });
 	const emptyBody = bodyText(empty.view.render(120));
 	assert.ok(emptyBody.includes("No files in this repository."));
 });
 
 test("ctrl+j/ctrl+k and the arrows move the selection and clamp at both ends; a line feed moves rather than inserts", async () => {
-	const { view, calls } = await openView({}, ["a.ts", "b.ts", "c.ts"]);
+	const { view, calls } = await openView({}, [entry("a.ts"), entry("b.ts"), entry("c.ts")]);
 	const selected = () => selectedRow(view.render(120));
 	assert.match(selected(), /a\.ts/);
 	view.handleInput("\x1b[B");
@@ -226,7 +268,7 @@ test("ctrl+j/ctrl+k and the arrows move the selection and clamp at both ends; a 
 });
 
 test("a long selection window keeps the selected row visible with the more indicators", async () => {
-	const files = Array.from({ length: 30 }, (_, index) => `file-${String(index).padStart(2, "0")}.ts`);
+	const files = Array.from({ length: 30 }, (_, index) => entry(`file-${String(index).padStart(2, "0")}.ts`));
 	const { view } = await openView({ rows: 10 }, files);
 	for (let index = 0; index < 20; index += 1) view.handleInput("\x1b[B");
 	const lines = view.render(120);
@@ -303,7 +345,7 @@ test("hover paints the shared hover role over an unselected row and clears when 
 });
 
 test("a click on a row selects it without inserting or closing", async () => {
-	const { view, calls } = await openView({}, ["a.ts", "b.ts", "c.ts"]);
+	const { view, calls } = await openView({}, [entry("a.ts"), entry("b.ts"), entry("c.ts")]);
 	let lines = view.render(120);
 	const result = view.handleMouse(mouse(lines, 3, rowOf(lines, "b.ts")));
 	assert.deepEqual(result, { handled: true, render: true });
@@ -316,22 +358,108 @@ test("a click on a row selects it without inserting or closing", async () => {
 });
 
 test("Enter inserts the selected path then closes exactly once", async () => {
-	const { view, calls } = await openView({}, ["a.ts", "b.ts"]);
+	const { view, calls } = await openView({}, [entry("a.ts"), entry("b.ts")]);
 	view.handleInput("\x1b[B");
 	view.handleInput("\r");
-	assert.deepEqual(calls.insert, ["b.ts"]);
+	assert.deepEqual(calls.insert, [["b.ts"]]);
 	assert.equal(calls.close, 1);
 	assert.deepEqual(calls.trace, ["insert:b.ts", "close"]);
 	view.handleInput("\r");
 	view.handleInput("\x05");
 	view.handleInput("\x1b");
-	assert.deepEqual(calls.insert, ["b.ts"], "a completed panel cannot fire again");
+	assert.deepEqual(calls.insert, [["b.ts"]], "a completed panel cannot fire again");
 	assert.equal(calls.close, 1);
 	assert.deepEqual(calls.open, []);
 });
 
+// A real ANSI accent, so the painted marker can be asserted the way the
+// terminal receives it (a fake tag theme would count as visible text).
+const accentTheme: FilePickerTheme = {
+	fg(color: string, text: string) {
+		return color === "accent" ? `\x1b[35m${text}\x1b[39m` : text;
+	},
+};
+
+test("Tab marks the highlighted row with its own accent marker, distinct from the plain highlight", async () => {
+	const list = [entry("a.ts"), entry("b.ts"), entry("c.ts")];
+	const { view } = await openView({ theme: accentTheme }, list);
+	view.handleInput("\x1b[B");
+	let lines = view.render(120);
+	assert.match(lines[rowOf(lines, "b.ts")]!, /▸/, "the highlight alone keeps the cursor marker");
+	assert.doesNotMatch(bodyText(lines), /\x1b\[35m✓/, "nothing is selected before Tab");
+	view.handleInput(TAB);
+	lines = view.render(120);
+	assert.match(lines[rowOf(lines, "b.ts")]!, /\x1b\[35m✓\x1b\[39m/, "Tab marks the highlighted row in the accent role");
+	assert.doesNotMatch(lines[rowOf(lines, "a.ts")]!, /✓/, "other rows stay unmarked");
+	view.handleInput(TAB);
+	lines = view.render(120);
+	assert.doesNotMatch(bodyText(lines), /✓/, "Tab twice clears the selection");
+	assert.match(lines[rowOf(lines, "b.ts")]!, /▸/, "the highlight survives the toggle");
+});
+
+test("Tab does not type into the query and moves to a second row without losing the first mark", async () => {
+	const list = [entry("a.ts"), entry("b.ts"), entry("c.ts")];
+	const { view } = await openView({}, list);
+	view.handleInput(TAB);
+	assert.match(bodyText(view.render(120)), /c\.ts/, "Tab never becomes query text");
+	view.handleInput("\x1b[B");
+	view.handleInput(TAB);
+	const lines = view.render(120);
+	assert.match(stripAnsi(lines[rowOf(lines, "a.ts")]!), /✓/, "the first mark stays");
+	assert.match(stripAnsi(lines[rowOf(lines, "b.ts")]!), /✓/, "the second mark lands on the moved-to row");
+	view.handleInput("b");
+	const filtered = view.render(120);
+	assert.match(bodyText(filtered), /b\.ts/, "the query is still the only thing typing changes");
+	assert.doesNotMatch(bodyText(filtered), /a\.ts/, "a filtered-out row is not painted");
+});
+
+test("Enter emits every selected path in list order and never duplicates the highlighted one", async () => {
+	const list = [entry("a.ts"), entry("b.ts"), entry("c.ts"), entry("d.ts")];
+	const { view, calls } = await openView({}, list);
+	for (let index = 0; index < 3; index += 1) view.handleInput("\x1b[B");
+	view.handleInput(TAB);
+	view.handleInput("\x1b[A");
+	view.handleInput("\x1b[A");
+	view.handleInput(TAB);
+	assert.deepEqual(calls.insert, [], "Tab never inserts");
+	view.handleInput("\r");
+	assert.deepEqual(calls.insert, [["b.ts", "d.ts"]], "selection order is the list order, not the marking order");
+	assert.equal(calls.close, 1);
+});
+
+test("Enter includes the highlighted path when it was never selected", async () => {
+	const list = [entry("a.ts"), entry("b.ts"), entry("c.ts")];
+	const { view, calls } = await openView({}, list);
+	view.handleInput("\x1b[B");
+	view.handleInput(TAB);
+	view.handleInput("\x1b[B");
+	view.handleInput("\r");
+	assert.deepEqual(calls.insert, [["b.ts", "c.ts"]]);
+	assert.equal(calls.close, 1);
+});
+
+test("Enter never duplicates a highlighted path that is already selected", async () => {
+	const { view, calls } = await openView({}, [entry("a.ts"), entry("b.ts")]);
+	view.handleInput(TAB);
+	view.handleInput("\r");
+	assert.deepEqual(calls.insert, [["a.ts"]]);
+	assert.equal(calls.close, 1);
+});
+
+test("a selection filtered out of view is emitted after the visible ones", async () => {
+	const list = [entry("alpha.ts"), entry("beta.ts"), entry("gamma.ts")];
+	const { view, calls } = await openView({}, list);
+	view.handleInput("\x1b[B");
+	view.handleInput(TAB);
+	for (const character of "al") view.handleInput(character);
+	view.handleInput(TAB);
+	view.handleInput("\r");
+	assert.deepEqual(calls.insert, [["alpha.ts", "beta.ts"]], "the hidden selection keeps its marking order after the visible rows");
+	assert.equal(calls.close, 1);
+});
+
 test("ctrl+e opens the selected path then closes exactly once", async () => {
-	const { view, calls } = await openView({}, ["a.ts", "b.ts"]);
+	const { view, calls } = await openView({}, [entry("a.ts"), entry("b.ts")]);
 	view.handleInput("\x1b[B");
 	view.handleInput("\x05");
 	assert.deepEqual(calls.open, ["b.ts"]);
@@ -353,6 +481,55 @@ test("esc and ctrl+c close exactly once", async () => {
 	const ctrlC = await openView();
 	ctrlC.view.handleInput("\x03");
 	assert.equal(ctrlC.calls.close, 1);
+});
+
+test("a changed row shows its state badge and the age computed once when the panel opened", async () => {
+	let clock = NOW;
+	const list = [
+		entry("fresh.ts", "new", NOW - 5_000),
+		entry("edited.ts", "updated", NOW - 3 * HOUR - 5 * MINUTE),
+		entry("stale.ts", "updated", NOW - 2 * DAY - HOUR),
+		entry("untouched.ts", "clean", NOW - 4 * MINUTE),
+	];
+	const { view } = await openView({ now: () => clock }, list);
+	const first = view.render(120);
+	assert.match(listCell(first, "fresh.ts"), /^▸ {2}fresh\.ts +new 5s$/, "the age is right-aligned after the badge");
+	assert.match(listCell(first, "edited.ts"), /^ {3}edited\.ts +upt 3h$/);
+	assert.match(listCell(first, "stale.ts"), /^ {3}stale\.ts +upt 2d$/);
+	assert.match(listCell(first, "untouched.ts"), /^ {3}untouched\.ts *$/, "a clean row shows neither badge nor age");
+
+	clock = NOW + 30 * DAY;
+	assert.match(listCell(view.render(120), "edited.ts"), /^ {3}edited\.ts +upt 3h$/, "ages are never recomputed");
+});
+
+test("a changed row without an mtime shows its badge and no age", async () => {
+	const { view } = await openView({}, [entry("brand-new.ts", "new"), entry("plain.ts")]);
+	const changed = listCell(view.render(120), "brand-new.ts");
+	assert.match(changed, /brand-new\.ts +new$/);
+	assert.doesNotMatch(changed, /\b\d+[smhd]\b/, "no age without an mtime");
+	assert.doesNotMatch(listCell(view.render(120), "plain.ts"), /\bnew\b|\bupt\b/);
+});
+
+test("an empty query keeps the order the listing returned and a query still ranks", async () => {
+	const list = [entry("z-changed.ts", "new", NOW - MINUTE), entry("m-updated.ts", "updated", NOW - 2 * MINUTE), entry("a-clean.ts")];
+	const { view } = await openView({}, list);
+	let lines = view.render(120);
+	assert.ok(rowOf(lines, "z-changed.ts") < rowOf(lines, "m-updated.ts"));
+	assert.ok(rowOf(lines, "m-updated.ts") < rowOf(lines, "a-clean.ts"), "the listing order is painted, never re-sorted alphabetically");
+	for (const character of "clean") view.handleInput(character);
+	lines = view.render(120);
+	assert.match(selectedRow(lines), /a-clean\.ts/, "ranking still chooses the match");
+	assert.doesNotMatch(bodyText(lines), /z-changed\.ts/);
+});
+
+test("a narrow list pane truncates the name and keeps the badge", async () => {
+	const { view } = await openView({}, [entry("a-very-long-file-name.ts", "new", NOW - 5 * MINUTE), entry("b.ts")]);
+	const lines = view.render(40);
+	const changed = stripAnsi(lines[rowOf(lines, "new")]!);
+	assert.match(changed, /new 5m/);
+	assert.ok(!changed.includes("a-very-long-file-name.ts"), "the name gives way first");
+	assert.match(changed, /…/, "the name is elided");
+	for (const line of lines) assert.equal(visibleWidth(line), 40, "no row is ragged");
 });
 
 test("a binary preview renders the binary notice, not its bytes", async () => {
@@ -391,16 +568,18 @@ test("a theme with a background paints the selected row as a full-width bar", as
 	const row = lines[rowOf(lines, "README.md")]!;
 	assert.match(row, /\x1b\[44m/, "the selected row uses the selected background");
 	assert.doesNotMatch(row, /▸/, "a full-width bar replaces the marker");
+	view.handleInput(TAB);
+	assert.match(view.render(120)[rowOf(lines, "README.md")]!, /✓/, "a marked row keeps its check mark inside the bar");
 	for (const line of lines) assert.equal(visibleWidth(line), 120);
 });
 
 test("the async listing and preview loads request a render, and the first render before they resolve does not crash", async () => {
-	let resolveList: (result: RepositoryListing) => void = () => {};
+	let resolveList: (result: RepositoryEntriesResult) => void = () => {};
 	let resolvePreview: (result: FilePreview) => void = () => {};
 	const previewCalls: string[] = [];
 	let renders = 0;
 	const { view } = createView({
-		listFiles: () => new Promise<RepositoryListing>((resolve) => { resolveList = resolve; }),
+		listEntries: () => new Promise<RepositoryEntriesResult>((resolve) => { resolveList = resolve; }),
 		loadPreview: (relativePath) => {
 			previewCalls.push(relativePath);
 			return new Promise<FilePreview>((resolve) => { resolvePreview = resolve; });
@@ -412,7 +591,7 @@ test("the async listing and preview loads request a render, and the first render
 	assert.match(bodyText(first), /Loading files/);
 	assert.equal(renders, 0, "a pending listing does not spin");
 
-	resolveList(listing(["a.ts"]));
+	resolveList(entries([entry("a.ts")]));
 	await settle();
 	assert.equal(renders, 1, "the listing requests a render when it lands");
 	assert.deepEqual(previewCalls, ["a.ts"]);
@@ -428,9 +607,9 @@ test("the listing and each preview are loaded at most once and previews are cach
 	let listCalls = 0;
 	const previewCalls: string[] = [];
 	const { view } = createView({
-		async listFiles() {
+		async listEntries() {
 			listCalls += 1;
-			return listing(["a.ts", "b.ts"]);
+			return entries([entry("a.ts"), entry("b.ts")]);
 		},
 		async loadPreview(relativePath) {
 			previewCalls.push(relativePath);

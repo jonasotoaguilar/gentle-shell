@@ -1,7 +1,7 @@
-import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { posix } from "node:path";
-import { CARD_PADDING, rankPaletteGroups, renderPaletteCard, renderPaletteSelection, type CommandPaletteGroup } from "./command-palette.ts";
-import { FILE_PREVIEW_BINARY_NOTICE, type FilePreview, type RepositoryListing } from "./file-index.ts";
+import { CARD_PADDING, rankPaletteGroups, renderPaletteCard, type CommandPaletteGroup } from "./command-palette.ts";
+import { FILE_PREVIEW_BINARY_NOTICE, formatAge, type FileEntry, type FilePreview, type RepositoryEntriesResult } from "./file-index.ts";
 import { paintHoverable } from "./shell-hover.ts";
 import { sanitizeTerminalText, stripAnsi } from "./terminal-theme.ts";
 
@@ -15,46 +15,19 @@ export interface FilePickerTheme {
 	bg?(color: string, text: string): string;
 }
 
-// pi-tui's public mouse shapes. The installed 0.74.0 in this worktree does
-// not export them from the package root yet, so mirror the interface the
-// repository targets; the method surface stays identical for callers.
-type TuiMouseEventType = "press" | "release" | "move" | "drag" | "click" | "wheel";
-type TuiMouseButton = "left" | "middle" | "right" | "none";
-
-interface TuiMouseEvent {
-	type: TuiMouseEventType;
-	button: TuiMouseButton;
-	x: number;
-	y: number;
-	screenX: number;
-	screenY: number;
-	width: number;
-	height: number;
-	shift: boolean;
-	alt: boolean;
-	ctrl: boolean;
-	wheelDelta?: number;
-	clickCount?: number;
-}
-
-interface TuiMouseEventResult {
-	handled?: boolean;
-	capture?: boolean;
-	focus?: boolean;
-	render?: boolean;
-}
-
 export interface FilePickerDeps {
 	theme: FilePickerTheme;
 	rows: number | (() => number);
-	listFiles(): Promise<RepositoryListing>;
+	listEntries(): Promise<RepositoryEntriesResult>;
 	loadPreview(relativePath: string): Promise<FilePreview>;
 	/** ctrl+e on the highlighted file. */
 	onOpen(relativePath: string): void;
-	/** Enter on the highlighted file. */
-	onInsert(relativePath: string): void;
+	/** Enter: every file to insert, in list order. Never empty. */
+	onInsert(relativePaths: string[]): void;
 	onClose(): void;
 	requestRender(): void;
+	/** Clock for the row ages, read once when the panel opens (S12). Defaults to Date.now. */
+	now?(): number;
 }
 
 const MAX_CARD_HEIGHT = 24;
@@ -64,13 +37,17 @@ const MIN_CARD_HEIGHT = 4;
 const MIN_WIDTH = CARD_PADDING + 4;
 const LIST_RATIO = 0.4;
 const LIST_MAX_WIDTH = 48;
+// Cursor cell, selection cell and the space before the name.
+const MARKER_WIDTH = 3;
 const SEPARATOR = " │ ";
 const SEPARATOR_WIDTH = SEPARATOR.length;
 const LOADING_FILES = "Loading files …";
 const LOADING_PREVIEW = "Loading preview …";
 const NO_FILES = "No files in this repository.";
 const TRUNCATED_NOTICE = "… preview truncated.";
-const FOOTER = "type to search • ctrl+j/k move • ctrl+shift+j/k scroll • enter insert • ctrl+e editor • esc close";
+const FOOTER = "type to search • tab select • ctrl+u clear • ctrl+j/k move • ctrl+shift+j/k scroll • enter insert • ctrl+e editor • esc close";
+const NEW_BADGE = "new";
+const UPDATED_BADGE = "upt";
 
 type Tone = "border" | "accent" | "muted" | "text" | "error";
 
@@ -139,9 +116,12 @@ export class FilePickerView {
 	private previewScroll = 0;
 	private hovered: number | undefined;
 	private pointerFrame: PointerFrame | undefined;
-	private files: string[] = [];
+	private entries: FileEntry[] = [];
 	private loaded = false;
 	private listingError: string | undefined;
+	/** Tab multi-select (S14), in the order each file was marked. */
+	private readonly selection = new Set<string>();
+	private readonly openedAt: number;
 	private readonly previews = new Map<string, PreviewEntry>();
 	private completed = false;
 	private disposed = false;
@@ -149,6 +129,7 @@ export class FilePickerView {
 
 	constructor(deps: FilePickerDeps) {
 		this.deps = deps;
+		this.openedAt = deps.now ? deps.now() : Date.now();
 		void this.loadListing();
 	}
 
@@ -223,6 +204,10 @@ export class FilePickerView {
 		}
 		if (matchesKey(data, Key.up) || matchesKey(data, Key.ctrl("k"))) {
 			this.moveSelection(-1);
+			return;
+		}
+		if (matchesKey(data, Key.tab)) {
+			this.toggleSelection();
 			return;
 		}
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
@@ -306,14 +291,14 @@ export class FilePickerView {
 
 	private async loadListing(): Promise<void> {
 		try {
-			const result = await this.deps.listFiles();
+			const result = await this.deps.listEntries();
 			if (this.disposed || this.completed) return;
 			this.loaded = true;
 			if (result.ok === false) {
-				this.files = [];
+				this.entries = [];
 				this.listingError = result.message;
 			} else {
-				this.files = result.files;
+				this.entries = result.entries;
 				this.listingError = undefined;
 			}
 			this.selected = 0;
@@ -323,28 +308,37 @@ export class FilePickerView {
 		} catch (error) {
 			if (this.disposed || this.completed) return;
 			this.loaded = true;
-			this.files = [];
+			this.entries = [];
 			this.listingError = `Cannot list repository files: ${errorMessage(error)}`;
 			this.deps.requestRender();
 		}
 	}
 
-	private matches(): string[] {
-		if (!this.loaded || this.files.length === 0) return [];
+	private matches(): FileEntry[] {
+		if (!this.loaded || this.entries.length === 0) return [];
 		// rankPaletteGroups already ranks basename starts-with, then basename
 		// contains, then subsequence, then full-path contains (the directory).
+		// It keeps the input order for an empty query, so the listing's own
+		// order (changed first, newest first, S12) is what those rows paint.
 		const group: CommandPaletteGroup = {
 			title: "Files",
-			items: this.files.map((path) => ({ command: path, label: posix.basename(path) })),
+			items: this.entries.map((entry) => ({ command: entry.path, label: posix.basename(entry.path) })),
 		};
 		const ranked = rankPaletteGroups([group], this.query)[0];
-		return ranked ? ranked.items.map((item) => item.command) : [];
+		if (!ranked) return [];
+		const byPath = new Map(this.entries.map((entry) => [entry.path, entry]));
+		const matched: FileEntry[] = [];
+		for (const item of ranked.items) {
+			const entry = byPath.get(item.command);
+			if (entry) matched.push(entry);
+		}
+		return matched;
 	}
 
 	private selectedPath(): string | undefined {
 		const matches = this.matches();
 		if (matches.length === 0) return undefined;
-		return matches[Math.max(0, Math.min(matches.length - 1, this.selected))];
+		return matches[Math.max(0, Math.min(matches.length - 1, this.selected))]?.path;
 	}
 
 	private setQuery(query: string): void {
@@ -371,9 +365,37 @@ export class FilePickerView {
 		return true;
 	}
 
+	private toggleSelection(): boolean {
+		const path = this.selectedPath();
+		if (path === undefined) return false;
+		if (this.selection.has(path)) this.selection.delete(path);
+		else this.selection.add(path);
+		return true;
+	}
+
+	/**
+	 * Enter's payload (S14): the visible selections in list order, then the ones
+	 * a query hid in their marking order, and the highlighted file last when Tab
+	 * never selected it. A file is never emitted twice.
+	 */
+	private insertionPaths(): string[] {
+		const paths: string[] = [];
+		const visible = new Set<string>();
+		for (const entry of this.matches()) {
+			visible.add(entry.path);
+			if (this.selection.has(entry.path)) paths.push(entry.path);
+		}
+		for (const path of this.selection) if (!visible.has(path)) paths.push(path);
+		const highlighted = this.selectedPath();
+		if (highlighted !== undefined && !this.selection.has(highlighted)) paths.push(highlighted);
+		return paths;
+	}
+
 	private scrollPreview(delta: number): boolean {
 		if (delta === 0) return false;
-		const total = this.selectedPath() ? this.previewLines(this.selectedPath()!).length : 0;
+		const path = this.selectedPath();
+		if (!path) return false;
+		const total = this.previewLines(path).length;
 		const visible = this.bodyRows();
 		const next = Math.max(0, Math.min(Math.max(0, total - visible), this.previewScroll + Math.trunc(delta)));
 		if (next === this.previewScroll) return false;
@@ -420,26 +442,31 @@ export class FilePickerView {
 
 	private finish(action: "insert" | "open" | "close"): void {
 		if (this.completed || this.disposed) return;
-		const path = action === "close" ? undefined : this.selectedPath();
-		if (action !== "close" && path === undefined) return;
+		if (action === "insert") {
+			const paths = this.insertionPaths();
+			if (paths.length === 0) return;
+			this.complete();
+			this.deps.onInsert(paths);
+			this.deps.onClose();
+			return;
+		}
+		const path = action === "open" ? this.selectedPath() : undefined;
+		if (action === "open" && path === undefined) return;
+		this.complete();
+		if (path !== undefined) this.deps.onOpen(path);
+		this.deps.onClose();
+	}
+
+	private complete(): void {
 		this.completed = true;
 		this.pointerFrame = undefined;
 		this.hovered = undefined;
-		if (action === "insert") {
-			this.deps.onInsert(path!);
-			this.deps.onClose();
-		} else if (action === "open") {
-			this.deps.onOpen(path!);
-			this.deps.onClose();
-		} else {
-			this.deps.onClose();
-		}
 	}
 
 	private emptyState(): { text: string; tone: Tone } | undefined {
 		if (this.listingError !== undefined) return { text: this.listingError, tone: "error" };
 		if (!this.loaded) return { text: LOADING_FILES, tone: "muted" };
-		if (this.files.length === 0) return { text: NO_FILES, tone: "muted" };
+		if (this.entries.length === 0) return { text: NO_FILES, tone: "muted" };
 		if (this.matches().length === 0) return { text: `No files match "${this.query}"`, tone: "muted" };
 		return undefined;
 	}
@@ -472,15 +499,41 @@ export class FilePickerView {
 		return lines.slice(0, bodyRows);
 	}
 
-	private renderListRow(path: string, index: number, selectedIndex: number, listWidth: number): string {
-		const selected = index === selectedIndex;
-		const hovered = !selected && index === this.hovered;
-		const name = displayText(posix.basename(path));
-		const directory = posix.dirname(path);
-		const label = directory === "." ? name : `${name}  ${displayText(directory)}`;
-		if (selected) return fit(renderPaletteSelection(label, listWidth, true, this.deps.theme), listWidth);
-		const text = truncateToWidth(label, Math.max(0, listWidth - 2), "…", true);
-		return fit(`  ${paintHoverable(this.deps.theme, text, hovered, "muted")}`, listWidth);
+	private rowLabel(entry: FileEntry): string {
+		const name = displayText(posix.basename(entry.path));
+		const directory = posix.dirname(entry.path);
+		return directory === "." ? name : `${name}  ${displayText(directory)}`;
+	}
+
+	/** The trailing badge and age of a changed row; a clean row has neither (S12). */
+	private rowSuffix(entry: FileEntry): string {
+		if (entry.state === "clean") return "";
+		const badge = entry.state === "new" ? NEW_BADGE : UPDATED_BADGE;
+		const parts = [this.deps.theme.fg("accent", badge)];
+		if (entry.mtimeMs !== undefined) parts.push(this.deps.theme.fg("muted", formatAge(entry.mtimeMs, this.openedAt)));
+		return parts.join(" ");
+	}
+
+	// The name leads and the badge and age trail: the name is truncated first so
+	// a narrow list pane never costs the row its state.
+	private renderListRow(entry: FileEntry, index: number, selectedIndex: number, listWidth: number): string {
+		const theme = this.deps.theme;
+		const cursor = index === selectedIndex;
+		const marked = this.selection.has(entry.path);
+		const hovered = !cursor && !marked && index === this.hovered;
+		const suffix = this.rowSuffix(entry);
+		const suffixWidth = visibleWidth(stripAnsi(suffix));
+		const showsSuffix = suffixWidth > 0 && suffixWidth + MARKER_WIDTH <= listWidth;
+		const labelRoom = Math.max(0, listWidth - MARKER_WIDTH - (showsSuffix ? suffixWidth + 1 : 0));
+		const label = truncateToWidth(this.rowLabel(entry), labelRoom, "…");
+		const gap = " ".repeat(Math.max(0, listWidth - MARKER_WIDTH - visibleWidth(label) - (showsSuffix ? suffixWidth : 0)));
+		if (cursor && theme.bg) {
+			const inner = `${marked ? "✓ " : "  "}${label}${showsSuffix ? `${gap}${stripAnsi(suffix)}` : ""}`;
+			return theme.bg("selectedBg", inner + " ".repeat(Math.max(0, listWidth - visibleWidth(stripAnsi(inner)))));
+		}
+		const marker = `${cursor ? theme.fg("accent", "▸") : " "}${marked ? theme.fg("accent", "✓") : " "} `;
+		const painted = marked ? theme.fg("accent", label) : cursor ? theme.fg("text", label) : paintHoverable(theme, label, hovered, "muted");
+		return fit(`${marker}${painted}${gap}${showsSuffix ? suffix : ""}`, listWidth);
 	}
 
 	private previewColumn(layout: PaneLayout, bodyRows: number): string[] {
