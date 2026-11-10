@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FILE_PREVIEW_BINARY_NOTICE, FILE_PREVIEW_LIMITS, listRepositoryFiles, readFilePreview } from "../lib/file-index.ts";
+import { FILE_PREVIEW_BINARY_NOTICE, FILE_PREVIEW_LIMITS, formatAge, listRepositoryEntries, listRepositoryFiles, readFilePreview } from "../lib/file-index.ts";
 
 // The file picker's data source: Git lists the repository's files (S10) and
 // one bounded read previews a file (S3). Git is injected, like
@@ -156,4 +156,157 @@ test("a file with a NUL byte previews as a binary notice instead of bytes", (t) 
 test("a missing file previews as an error instead of throwing", (t) => {
 	const root = scratch(t);
 	assert.deepEqual(readFilePreview(root, "gone.txt"), { kind: "error", message: "Cannot read gone.txt (ENOENT)." });
+});
+
+// --- entry-level listing (S12): change state, mtime and a coarse age label ---
+
+const LIST_ARGS = ["ls-files", "-z", "--cached", "--others", "--exclude-standard"];
+const STATUS_ARGS = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+const ROOT_ARGS = ["rev-parse", "--show-toplevel"];
+
+// Second-based on purpose: utimes takes seconds, and the gap makes the order real.
+const BASE_MTIME = 1_700_000_000;
+
+function setMtime(root: string, relative: string, seconds: number): void {
+	utimesSync(join(root, relative), seconds, seconds);
+}
+
+/** One modified tracked file, one new untracked file, one ignored file and two untouched files. */
+function changedRepository(t: { after(fn: () => void): void }) {
+	const root = scratch(t);
+	const git = gitIn(root);
+	git("init", "-q", "--initial-branch=main");
+	writeFileSync(join(root, ".gitignore"), "ignored.txt\n");
+	writeFileSync(join(root, "README.md"), "readme\n");
+	writeFileSync(join(root, "src.ts"), "export {};\n");
+	git("add", ".gitignore", "README.md", "src.ts");
+	git("commit", "-q", "-m", "base");
+	writeFileSync(join(root, "src.ts"), "export const changed = true;\n");
+	writeFileSync(join(root, "new.ts"), "brand new\n");
+	writeFileSync(join(root, "ignored.txt"), "git ignores this\n");
+	setMtime(root, "new.ts", BASE_MTIME);
+	setMtime(root, "src.ts", BASE_MTIME + 10);
+	return { root, run: gitRunner(root) };
+}
+
+test("a new file is new, a modified tracked file is updated, an untouched one is clean, and changed sorts first", async (t) => {
+	const { run } = changedRepository(t);
+	const result = await listRepositoryEntries(run);
+	if (result.ok === false) throw new Error(result.message);
+	assert.deepEqual(result.entries.map((entry) => [entry.path, entry.state]), [
+		["src.ts", "updated"],
+		["new.ts", "new"],
+		[".gitignore", "clean"],
+		["README.md", "clean"],
+	]);
+});
+
+test("mtimeMs is filled for changed entries only, and the most recently modified changed entry leads", async (t) => {
+	const { root, run } = changedRepository(t);
+	const result = await listRepositoryEntries(run);
+	if (result.ok === false) throw new Error(result.message);
+	const byPath = new Map(result.entries.map((entry) => [entry.path, entry]));
+	const modified = statSync(join(root, "src.ts")).mtimeMs;
+	const created = statSync(join(root, "new.ts")).mtimeMs;
+	assert.ok(modified > created, "the fixture's mtimes really differ");
+	assert.equal(byPath.get("src.ts")?.mtimeMs, modified);
+	assert.equal(byPath.get("new.ts")?.mtimeMs, created);
+	assert.equal(result.entries[0]?.path, "src.ts", "the newer change leads");
+	assert.equal(byPath.get(".gitignore")?.mtimeMs, undefined);
+	assert.ok(!("mtimeMs" in (byPath.get(".gitignore") as object)), "a clean entry carries no mtime key");
+	assert.ok(!("mtimeMs" in (byPath.get("README.md") as object)), "a clean entry carries no mtime key");
+});
+
+test("the entries are the same file set the flat listing produces", async (t) => {
+	const { run } = changedRepository(t);
+	const listing = await listRepositoryFiles(run);
+	const result = await listRepositoryEntries(run);
+	if (listing.ok === false) throw new Error(listing.message);
+	if (result.ok === false) throw new Error(result.message);
+	assert.deepEqual(result.entries.map((entry) => entry.path).sort(), listing.files);
+	assert.ok(!result.entries.some((entry) => entry.path === "ignored.txt"), "an ignored file is never an entry");
+});
+
+test("a changed file that is gone from disk keeps no mtime and does not throw", async (t) => {
+	const root = scratch(t);
+	const git = gitIn(root);
+	git("init", "-q", "--initial-branch=main");
+	writeFileSync(join(root, "gone.ts"), "export {};\n");
+	git("add", "gone.ts");
+	git("commit", "-q", "-m", "base");
+	rmSync(join(root, "gone.ts"));
+	assert.deepEqual(await listRepositoryEntries(gitRunner(root)), { ok: true, entries: [{ path: "gone.ts", state: "updated" }] });
+});
+
+test("a filename listing that fails is an explicit failure, never an empty success", async () => {
+	const calls: string[][] = [];
+	const result = await listRepositoryEntries(async (args) => {
+		calls.push(args);
+		return { stdout: "", code: 128 };
+	});
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.match(result.message, /^Cannot list repository files: /);
+	assert.match(result.message, /128/);
+	assert.deepEqual(calls, [LIST_ARGS]);
+});
+
+test("a status that fails is an explicit failure, never an empty success", async () => {
+	const result = await listRepositoryEntries(async (args) => (args[0] === "status" ? { stdout: "", code: 2 } : { stdout: "a.ts\0", code: 0 }));
+	assert.deepEqual(result, { ok: false, message: "Cannot read repository changes: git status exited with code 2." });
+});
+
+test("a status runner that rejects is reported, not thrown", async () => {
+	const result = await listRepositoryEntries(async (args) => {
+		if (args[0] === "status") throw new Error("spawn git ENOENT");
+		return { stdout: "a.ts\0", code: 0 };
+	});
+	assert.deepEqual(result, { ok: false, message: "Cannot read repository changes: spawn git ENOENT" });
+});
+
+test("a status Git cut short is a failure, never a silent partial state", async () => {
+	const result = await listRepositoryEntries(async (args) => (args[0] === "status" ? { stdout: "?? a.ts\0", code: 0, truncated: true } : { stdout: "a.ts\0", code: 0 }));
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.match(result.message, /truncated/);
+});
+
+test("one status call decides every state, and a rename's original path never becomes an entry", async () => {
+	const calls: string[][] = [];
+	const result = await listRepositoryEntries(async (args) => {
+		calls.push(args);
+		if (args[0] === "ls-files") return { stdout: "clean.ts\0mod.ts\0new.ts\0renamed.ts\0", code: 0 };
+		if (args[0] === "status") return { stdout: "?? new.ts\0 M mod.ts\0R  renamed.ts\0old.ts\0", code: 0 };
+		return { stdout: "", code: 128 };
+	});
+	assert.deepEqual(result, {
+		ok: true,
+		entries: [
+			{ path: "mod.ts", state: "updated" },
+			{ path: "new.ts", state: "new" },
+			{ path: "renamed.ts", state: "updated" },
+			{ path: "clean.ts", state: "clean" },
+		],
+	});
+	assert.deepEqual(calls, [LIST_ARGS, STATUS_ARGS, ROOT_ARGS]);
+});
+
+test("the age label uses s, m, h and d, and a future timestamp clamps to 0s", () => {
+	const now = BASE_MTIME * 1000;
+	const label = (elapsedMs: number) => formatAge(now - elapsedMs, now);
+	assert.equal(label(0), "0s");
+	assert.equal(label(45_000), "45s");
+	assert.equal(label(59_000), "59s");
+	assert.equal(label(59_999), "59s");
+	assert.equal(label(60_000), "1m");
+	assert.equal(label(5 * 60_000), "5m");
+	assert.equal(label(12 * 60_000), "12m");
+	assert.equal(label(3_599_000), "59m");
+	assert.equal(label(3_600_000), "1h");
+	assert.equal(label(5 * 3_600_000), "5h");
+	assert.equal(label(86_399_000), "23h");
+	assert.equal(label(86_400_000), "1d");
+	assert.equal(label(3 * 86_400_000), "3d");
+	assert.equal(label(-1), "0s");
+	assert.equal(label(-10 * 86_400_000), "0s");
 });
