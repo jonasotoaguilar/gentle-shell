@@ -48,7 +48,7 @@ test("every action and palette command has a Keymaps row with its current key, p
 	const { rows } = setup({ GENTLE_PI_AGENTS_VIEW_KEY: "alt+w" });
 	assert.ok(rows.every((row) => row.category === "Keymaps"));
 	assert.deepEqual(rows.map(label), [
-		"Command palette: alt+k", "Browse changes: alt+g", "Subscription usage: alt+u", "Cycle visual preset: alt+l",
+		"Command palette: alt+k", "Browse changes: alt+g", "File picker: alt+p", "Subscription usage: alt+u", "Cycle visual preset: alt+l",
 		"Subagents overlay: alt+w (GENTLE_PI_AGENTS_VIEW_KEY)", "Stop active subagents: alt+s", "Collapse the agents card: ctrl+shift+a",
 		"Collapse the jobs card: ctrl+shift+j", "Collapse the todo list: ctrl+shift+t", "Usage stats: none",
 		"/gentle:design · Design · HTML artboards: none", "Reload now to apply keymap changes",

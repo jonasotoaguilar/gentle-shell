@@ -214,6 +214,14 @@ You should not have to run `git status` in every worktree to find out what your 
 
 ---
 
+### Gentle Files — The repository's files, one keystroke from the prompt
+
+Knowing what your agents left behind also means knowing what is in the tree. `alt+p` or `/gentle:files` opens a two-pane picker over this session's repository — searchable file list on the left, live preview on the right — with the keys in the footer. Typing filters immediately, `tab` multi-selects, and `Enter` inserts the chosen references into the prompt without sending it: `@` plus the repository-relative path for the session's own files, the full absolute path for a file from a registered worktree, space-separated when you pick several. With worktrees registered, a scope step first lets you pick `main` or one of them; `ctrl+e` drops the highlighted file into `$VISUAL`/`$EDITOR`.
+
+**[Docs →](docs/gentle-shell.md#file-picker)**
+
+---
+
 ### Gentle Agents — Parallel work with a live view
 
 <img width="100%" src="docs/assets/features/agents-view.png" alt="Gentle Agents overlay showing a completed subagent thread with model, tokens, and elapsed columns, and the structured handoff it returned">

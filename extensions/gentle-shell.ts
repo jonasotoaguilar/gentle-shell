@@ -14,10 +14,14 @@ import { fileURLToPath } from "node:url";
 import { profilesFilePath, profileRoleEntries, readProfilesFileResult } from "../lib/agent-profiles.ts";
 import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles } from "../lib/session-profile-freeze.ts";
 import * as os from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, basename, join, resolve } from "node:path";
 import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellSidebarBar, renderShellStatusBar, renderShellStatusSections, renderShellChromeBar, renderShellChromePad, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
+import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, foreignRootBranch, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
+import { FilePickerView } from "../lib/file-picker-view.ts";
+import { FileScopeView, type FileScope } from "../lib/file-scope-view.ts";
+import { listRepositoryEntries, readFilePreview } from "../lib/file-index.ts";
+import { formatFileInsertion } from "../lib/file-picker-insert.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { windowsProcessTreeKiller, type ProcessTreeKiller } from "../lib/native-review-cli.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
@@ -1636,6 +1640,8 @@ function renderDoubleEscCancelReport(
 const CHANGES_WIDGET_KEY = "gentle-shell-changes";
 const HEADER_WIDGET_KEY = "gentle-shell-below-input-header";
 const CHANGES_COMMAND_NAME = "gentle:changes";
+const FILES_COMMAND_NAME = "gentle:files";
+const NO_EDITOR_NOTICE = "No editor configured. Set $VISUAL or $EDITOR.";
 const IMAGES_COMMAND_NAME = "gentle:images";
 const CHANGES_POLL_DEFAULT_MS = 2000;
 const GIT_TIMEOUT_MS = 5000;
@@ -1741,6 +1747,10 @@ export function changesShortcut(env: NodeJS.ProcessEnv = process.env, bindings: 
 	return effectiveKey("changes", env, bindings);
 }
 
+export function filesShortcut(env: NodeJS.ProcessEnv = process.env, bindings: KeymapBindings = {}): string | undefined {
+	return effectiveKey("files", env, bindings);
+}
+
 export function presetShortcut(env: NodeJS.ProcessEnv = process.env, bindings: KeymapBindings = {}): string | undefined {
 	return effectiveKey("preset", env, bindings);
 }
@@ -1769,6 +1779,32 @@ const usageFetchTimeoutMs = (env: NodeJS.ProcessEnv): number => positiveMs(env.G
 // models without a stored digest fall back to computing it here.
 function changesFingerprint(model: ChangesModel): string {
 	return model.digest ?? changesDigest(model);
+}
+
+/** The mtime a change's `diffRevision` carries: the `<size>:<mtimeMs>` fileRevision binds it to. */
+function revisionMtime(revision: string | undefined): number | undefined {
+	const separator = revision?.lastIndexOf(":") ?? -1;
+	if (separator < 0 || revision === undefined) return undefined;
+	const value = Number(revision.slice(separator + 1));
+	return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * How recently a root was worked in, for the picker's scope order only. The
+ * recency `/changes` already holds wins: each scanned root's newest changed
+ * file carries its mtime in that file's `diffRevision`. A root with no scan
+ * yet, or with no changed file, falls back to one stat of the root directory.
+ * Neither path lists the root's files, so ordering costs no listing per root.
+ */
+function scopeRecency(tracker: WorktreeChangesTracker | undefined, root: string): number {
+	let newest = 0;
+	const tree = tracker?.worktrees.find((candidate) => candidate.root === root);
+	for (const file of tree?.model.files ?? []) {
+		const mtime = revisionMtime(file.diffRevision);
+		if (mtime !== undefined && mtime > newest) newest = mtime;
+	}
+	if (newest > 0) return newest;
+	try { return statSync(root).mtimeMs; } catch { return 0; }
 }
 
 interface OverlayDeps {
@@ -1814,7 +1850,7 @@ async function showChangesOverlay(ctx: ExtensionContext, deps: OverlayDeps): Pro
 		);
 		if (!chosen || !host) return;
 		try {
-			if (!openInExternalEditor(host, chosen.file.path, process.env, spawnSync, chosen.root)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
+			if (!openInExternalEditor(host, chosen.file.path, process.env, spawnSync, chosen.root)) ctx.ui.notify(NO_EDITOR_NOTICE, "warning");
 		} catch (error) {
 			ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
 		}
@@ -3026,6 +3062,78 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			for (const entry of cached) ctx.ui.notify(`${entry.token} ${entry.path}`, "info");
 		},
 	});
+	// The picker browses a repository root, not the cwd: its paths are relative
+	// to that root and the preview joins them back onto it.
+	const filePickerRoot = (ctx: ExtensionContext): string => {
+		try { return deps.resolveWorktree(ctx.cwd, ctx.cwd)?.root ?? ctx.cwd; }
+		catch { return ctx.cwd; }
+	};
+	// `main` is always the session repository; every other scope is a worktree
+	// this session registered, labelled exactly as /changes labels it. With no
+	// registered worktree the list is just `main`, so the extra step is skipped.
+	const filePickerScopes = async (ctx: ExtensionContext): Promise<FileScope[]> => {
+		const main = filePickerRoot(ctx);
+		const scopes: FileScope[] = [{ root: main, label: "main", kind: "main", lastModifiedMs: scopeRecency(changes, main) }];
+		const sessionId = ctx.sessionManager.getSessionId();
+		let roots: string[] = [];
+		try { roots = registry && registry.sessionId === sessionId ? registry.roots() : []; }
+		catch { roots = []; }
+		for (const root of roots) {
+			if (root === main) continue;
+			const known = changes?.worktrees.find((tree) => tree.root === root)?.branch;
+			const branch = known ?? await foreignRootBranch(deps.gitRunner(root)).catch(() => undefined);
+			scopes.push({ root, label: `${branch ?? "detached"} · ${basename(root)}`, kind: "worktree", lastModifiedMs: scopeRecency(changes, root) });
+		}
+		return scopes;
+	};
+	const openFilePicker = async (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) return;
+		const scopes = await filePickerScopes(ctx);
+		const scope = scopes.length > 1
+			? await ctx.ui.custom<FileScope | null>(
+				(tui, theme, _keybindings, done) => {
+					const close = withOverlayRepaint(tui, done);
+					return new FileScopeView({
+						theme,
+						rows: () => Math.max(0, tui.terminal.rows),
+						scopes,
+						onSelect: (chosen) => close(chosen),
+						onClose: () => close(null),
+						requestRender: () => tui.requestRender(),
+					});
+				},
+				{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" } },
+			)
+			: scopes[0];
+		if (!scope) return;
+		let host: ExternalEditorHost | undefined;
+		let editorPath: string | undefined;
+		await ctx.ui.custom<null>(
+			(tui, theme, _keybindings, done) => {
+				const close = withOverlayRepaint(tui, done);
+				host = tui;
+				return new FilePickerView({
+					theme,
+					rows: () => Math.max(0, tui.terminal.rows),
+					listEntries: () => listRepositoryEntries(deps.gitRunner(scope.root)),
+					loadPreview: async (relative) => readFilePreview(scope.root, relative),
+					// Enter formats and pastes, then the picker closes with focus back in
+					// the prompt: the message is never sent from here.
+					onInsert: (paths) => ctx.ui.pasteToEditor(formatFileInsertion(paths, scope)),
+					onOpen: (relative) => { editorPath = join(scope.root, relative); },
+					onClose: () => close(null),
+					requestRender: () => tui.requestRender(),
+				});
+			},
+			{ overlay: true, overlayOptions: { anchor: "center", width: "85%", minWidth: 76, maxHeight: "90%" } },
+		);
+		if (editorPath === undefined || !host) return;
+		try {
+			if (!openInExternalEditor(host, editorPath, process.env, spawnSync, scope.root)) ctx.ui.notify(NO_EDITOR_NOTICE, "warning");
+		} catch (error) {
+			ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+		}
+	};
 	pi.registerCommand(CHANGES_COMMAND_NAME, {
 		description: "Browse uncommitted Git changes (working tree vs HEAD, untracked included) in this session's repository and its subagents' worktrees. Press o to open $EDITOR.",
 		handler: async (_args, ctx) => openChanges(ctx),
@@ -3035,6 +3143,17 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		pi.registerShortcut(shortcut as Parameters<ExtensionAPI["registerShortcut"]>[0], {
 			description: "Open the session's uncommitted Git changes",
 			handler: async (ctx) => openChanges(ctx),
+		});
+	}
+	pi.registerCommand(FILES_COMMAND_NAME, {
+		description: "Browse this session's repository or a registered worktree with a live preview (default alt+p). Enter inserts the path, ctrl+e opens $EDITOR.",
+		handler: async (_args, ctx) => openFilePicker(ctx),
+	});
+	const filesShortcutKey = filesShortcut(env, keymaps.bindings);
+	if (filesShortcutKey) {
+		pi.registerShortcut(filesShortcutKey as Parameters<ExtensionAPI["registerShortcut"]>[0], {
+			description: "Open the file picker",
+			handler: async (ctx) => openFilePicker(ctx),
 		});
 	}
 	pi.registerCommand(COMMANDS_COMMAND_NAME, {

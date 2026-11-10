@@ -61,6 +61,7 @@ In fullscreen, visible click targets use the shared orange hover role (`warning`
 | `/gentle:customize` | Click a category, setting row or value. Clicking a value applies it; compact `‹`/`›` arrows follow the same immediate or preview-first behavior as the keyboard arrows. Confirmations still require an explicit click on `y yes` (or the `y` key); click `cancel` to decline when visible. |
 | `/gentle:commands` | Click a visible command to run it; use the wheel to navigate the filtered list. Headers and clipped rows are not targets, and mouse activation is disabled during shortcut capture. |
 | `/gentle:jobs` | Click a visible job to select it, and use the visible list/details, Stop and close controls. Stop applies only to a currently running job; hovering never changes the selected job or stops it. |
+| `/gentle:files` | Click a list row to select it, the wheel over the list to move the selection, and the wheel over the preview to scroll it. Clicking the preview itself never breaks the panel. |
 | Questionnaires and response selectors | Existing option clicks keep their single-select, multi-select and custom-answer behavior; selectable labels now use the same hover role. Questionnaire tabs remain keyboard-controlled. |
 
 Moving to blank space inside a modal, keyboard navigation, resizing and disposal clear its hover. Native centered-overlay routing does not deliver motion outside the card, so the previous highlight can remain until the pointer returns or the view changes. Hover also depends on the terminal forwarding motion events; clicks remain usable when a multiplexer does not forward plain motion.
@@ -184,6 +185,17 @@ Captured evidence (`gentle-pi.session-change/v1`) is still stored for session st
 - On a file, `o` or Enter opens the actual current file in `$VISUAL` or `$EDITOR`, with its worktree as cwd. Editor launches pass paths as literal arguments, never through a shell. On Windows, configure a direct executable (for example `notepad.exe`); `.cmd`/`.bat` editor shims are refused. Launch failures appear as warnings after the terminal UI is restored. This also applies when opening an Agents session transcript. Editor commands retain literal-space splitting: quoted executable paths and shell expressions are not supported.
 - `GENTLE_PI_SHELL_CHANGES_KEY` rebinds the shortcut; `off` disables it. `GENTLE_PI_SHELL_CHANGES_POLL_MS` controls how often the open overlay re-reads Git. `GENTLE_PI_SHELL_CHANGES_WATCH_MS` no longer enables filesystem polling.
 - No uncommitted changes in the session's roots means no widget and an informational notice.
+
+### File picker
+
+`/gentle:files` or `alt+p` opens a two-pane picker over the repository: the file list on the left, the highlighted file's preview on the right, the keys in the footer. The list comes from Git (`ls-files` plus untracked files Git does not ignore), so `.gitignore` is respected; changed files sort above unchanged ones with a `new`/`upt` badge and their age, computed once when the panel opens.
+
+- Typing filters the list immediately, exactly like the command palette; there is no search mode to enter. `ctrl+j`/`ctrl+k` or the arrows move the selection, `ctrl+shift+j`/`ctrl+shift+k` or Page Up/Down scroll the preview, `ctrl+u` clears the query, `backspace` edits it, `tab` toggles a file in the multi-selection and `esc` closes.
+- The preview is a bounded read: a large file is marked truncated, a binary file shows a notice instead of bytes, and no file can stall the render.
+- `Enter` inserts the reference into the prompt and closes the panel with focus back in the editor; it never sends the message. A file from the session repository is inserted as `@` plus its repository-relative path (`@AGENTS.md`, `@src/index.ts`), which Pi resolves against the session path; a file from a registered worktree is inserted as its full absolute path, because `@` would resolve against the session path and name a different file. Several selected files are inserted space-separated, in list order.
+- `ctrl+e` opens the highlighted file in `$VISUAL` or `$EDITOR` through the same helper Changes uses, with the browsed root as cwd; with neither set the panel reports `No editor configured. Set $VISUAL or $EDITOR.`
+- When the session has registered worktrees, a scope step comes first: `main` for the session repository plus each registered worktree, most recently used first, labelled as Changes labels it (`branch · directory`). Choosing one opens the picker on that root. With no registered worktree the picker opens directly on the session path, so the extra step never appears when it has nothing to offer.
+- `GENTLE_PI_FILES_KEY` rebinds the shortcut; `off` disables it. The key is assignable in `/gentle:customize` → **Keymaps** like every other action. The default is `alt+p`, not `ctrl+f`: `ctrl+f` stays Pi's editor cursor binding and can still be assigned in Keymaps.
 
 ### Command palette
 

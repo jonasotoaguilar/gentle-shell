@@ -12,7 +12,7 @@ import {
 // first (unchanged behavior), then the saved keymaps.json, then the default.
 
 const DEFAULTS: Record<string, string | undefined> = {
-	commands: "alt+k", changes: "alt+g", usage: "alt+u", preset: "alt+l", "agents.view": "alt+a",
+	commands: "alt+k", changes: "alt+g", files: "alt+p", usage: "alt+u", preset: "alt+l", "agents.view": "alt+a",
 	"agents.stop": "alt+s", "agents.collapse": "ctrl+shift+a", "jobs.collapse": "ctrl+shift+j", "todo.collapse": "ctrl+shift+t", "stats.view": undefined,
 };
 
