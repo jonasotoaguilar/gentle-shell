@@ -1021,6 +1021,112 @@ test("a preview pane narrower than a double-width grapheme paints it on its own 
 	assert.equal(previewCell(lines, 3), "   ", "the row count matches what is painted, so no extra row is left over");
 });
 
+// The injected highlighter (S39): the view never calls Pi, so these tests fake
+// the already-ANSI lines Pi's own highlighter returns and assert the pane the
+// way the terminal receives it.
+const CODE_TONE = "\x1b[36m";
+const CODE_RESET = "\x1b[39m";
+const DIM_TONE = "\x1b[2m";
+const MUTED_TONE = "\x1b[90m";
+const CELL_RESET = "\x1b[0m";
+
+const roleTheme: FilePickerTheme = {
+	fg(color: string, text: string) {
+		if (color === "dim") return `${DIM_TONE}${text}${ROLE_END}`;
+		if (color === "muted") return `${MUTED_TONE}${text}${ROLE_END}`;
+		return text;
+	},
+};
+
+test("the preview paints the file's syntax through the injected highlighter and keeps the gutter dim", async () => {
+	const highlighted: { code: string; lang?: string }[] = [];
+	const { view } = await openView({
+		theme: roleTheme,
+		loadPreview: async () => preview(["const answer = 42;", "// done"], true),
+		languageForPath: (path) => (path.endsWith(".ts") ? "typescript" : undefined),
+		highlight(code, lang) {
+			highlighted.push({ code, lang });
+			return code.split("\n").map((line) => (line.startsWith("const") ? `${CODE_TONE}const${CODE_RESET}${line.slice("const".length)}` : `${CODE_TONE}${line}${CODE_RESET}`));
+		},
+	}, [entry("src/app.ts")]);
+	const lines = view.render(120);
+	assert.deepEqual(highlighted, [{ code: "const answer = 42;\n// done", lang: "typescript" }], "the already-bounded preview is highlighted with the language of the previewed path");
+	assert.equal(rawPreviewCell(lines, 1).trimEnd(), `${DIM_TONE}1${ROLE_END} ${CODE_TONE}const${CODE_RESET} answer = 42;${CELL_RESET}`, "the file line keeps the highlighter's colour and its number keeps the dim tone");
+	assert.equal(rawPreviewCell(lines, 2).trimEnd(), `${DIM_TONE}2${ROLE_END} ${CODE_TONE}// done${CODE_RESET}${CELL_RESET}`, "the gutter is painted after highlighting, never through it");
+	assert.match(previewCell(lines, 1), /^1 const answer = 42; *$/, "the painted text is the file's own text");
+	assert.match(previewCell(lines, 0), /^ *1\/2\+$/, "the position indicator still counts the file's lines");
+	assert.equal(previewCell(lines, 3).trim(), "… preview truncated.", "the truncation notice is a notice, not highlighted code");
+});
+
+test("a coloured line wider than the pane wraps onto continuation rows that each keep their fragment's colour", async () => {
+	const wide = "abcdefghij".repeat(18);
+	const { view } = await openView({
+		rows: 20,
+		loadPreview: async () => preview(["first", wide, "second"]),
+		languageForPath: () => "typescript",
+		highlight: (code) => code.split("\n").map((line) => `${CODE_TONE}${line}${CODE_RESET}`),
+	}, [entry("src/app.ts")]);
+	const lines = view.render(120);
+	for (const painted of lines) assert.equal(visibleWidth(painted), 120, "a wrapped coloured row is never ragged");
+	assert.match(previewCell(lines, 0), /^ *1\/3$/, "the position still counts file lines, not painted rows");
+	assert.match(previewCell(lines, 1), /^ *1 first */, "the first line keeps its own number");
+
+	const stripped = [2, 3, 4].map((offset) => previewCell(lines, offset)!);
+	assert.match(stripped[0]!, /^ *2 abcdefghij/, "the wide line's number sits on its first row");
+	const textColumn = stripped[0]!.indexOf("abcdefghij");
+	for (const [index, row] of stripped.entries()) {
+		const raw = rawPreviewCell(lines, 2 + index)!;
+		assert.match(raw, new RegExp(`\\x1b\\[36m`), "a continuation row keeps the colour of its fragment");
+		assert.ok(raw.trimEnd().endsWith(CELL_RESET), "the colour run ends with its row instead of bleeding into the border");
+		assert.equal(raw.slice(0, raw.indexOf(CODE_TONE)).trim(), index === 0 ? "2" : "", "only the first row carries the line number; a continuation row leaves the gutter blank");
+		assert.doesNotMatch(row, /…/, "a wrapped coloured line is never truncated with an ellipsis");
+	}
+	const reassembled = stripped.map((row) => row.slice(textColumn).trimEnd()).join("");
+	assert.equal(reassembled, wide, "the whole coloured line is painted across the rows");
+	assert.match(previewCell(lines, 5), /^ *3 second/, "the following file line keeps its own number");
+});
+
+test("every highlighting failure paints exactly the plain preview the pane painted before", async () => {
+	// The baseline is today's rendering: the same file, the same preview, and no
+	// highlighter wired at all.
+	const baseline = (await openView({}, [entry("src/app.ts")])).view.render(120);
+
+	const withoutHighlighter = await openView({ languageForPath: () => "typescript" }, [entry("src/app.ts")]);
+	assert.deepEqual(withoutHighlighter.view.render(120), baseline, "no highlighter paints the plain preview");
+
+	let unknownCalls = 0;
+	const unknownLanguage = await openView({ languageForPath: () => undefined, highlight: () => { unknownCalls += 1; return []; } }, [entry("src/app.ts")]);
+	assert.equal(unknownCalls, 0, "an unknown language never asks the highlighter");
+	assert.deepEqual(unknownLanguage.view.render(120), baseline, "an unknown language paints the plain preview");
+
+	const throwing = await openView({ languageForPath: () => "typescript", highlight: () => { throw new Error("Theme not initialized. Call initTheme() first."); } }, [entry("src/app.ts")]);
+	assert.deepEqual(throwing.view.render(120), baseline, "a highlighter that throws paints the plain preview rather than an error or a blank pane");
+
+	const misaligned = await openView({ languageForPath: () => "typescript", highlight: () => [`${CODE_TONE}one line for two${CODE_RESET}`] }, [entry("src/app.ts")]);
+	assert.deepEqual(misaligned.view.render(120), baseline, "painted lines that do not line up with the file are not used");
+});
+
+test("the preview is highlighted when it loads, never once per repaint", async () => {
+	let calls = 0;
+	const { view } = await openView({
+		languageForPath: () => "typescript",
+		highlight: (code) => {
+			calls += 1;
+			return code.split("\n").map((line) => `${CODE_TONE}${line}${CODE_RESET}`);
+		},
+	}, [entry("a.ts"), entry("b.ts")]);
+	assert.equal(calls, 1, "the first preview is highlighted once when it lands");
+	view.render(120);
+	view.render(80);
+	view.render(120);
+	assert.equal(calls, 1, "repainting never highlights again");
+	view.handleInput("\x1b[B");
+	await settle();
+	assert.equal(calls, 2, "a second file is its own preview load");
+	view.render(120);
+	assert.equal(calls, 2, "and that load is highlighted only once too");
+});
+
 test("an error preview renders its message", async () => {
 	const { view } = await openView({ loadPreview: async () => ({ kind: "error", message: "Cannot read src/app.ts (EACCES)." }) });
 	assert.ok(bodyText(view.render(120)).includes("Cannot read src/app.ts (EACCES)."));

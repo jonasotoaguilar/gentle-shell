@@ -187,7 +187,7 @@ async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionC
 	for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
 }
 
-function fakeContext(options: { theme?: typeof plainTheme & { getBgAnsi?(): string }; hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; idle?: boolean; editorFactory?: unknown; token?: string; select?: (title: string, options: string[]) => Promise<string | undefined> } = {}): { ctx: ExtensionContext; ui: FakeUi; overlayReady: Promise<void> } {
+function fakeContext(options: { theme?: typeof plainTheme & { getBgAnsi?(): string }; hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; idle?: boolean; editorFactory?: unknown; token?: string; cwd?: string; select?: (title: string, options: string[]) => Promise<string | undefined> } = {}): { ctx: ExtensionContext; ui: FakeUi; overlayReady: Promise<void> } {
 	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), widgetSets: 0, workingVisible: undefined, notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined, customOptions: [], pastes: [], overlayCompletions: 0 };
 	let resolveOverlay: () => void;
 	const overlayReady = new Promise<void>((resolve) => { resolveOverlay = resolve; });
@@ -197,10 +197,10 @@ function fakeContext(options: { theme?: typeof plainTheme & { getBgAnsi?(): stri
 		mode: "tui",
 		hasPendingMessages: () => options.pending ?? false,
 		isIdle: () => options.idle ?? true,
-		cwd: "/repo",
+		cwd: options.cwd ?? "/repo",
 		model: { id: "gpt-5.5", provider: "openai-codex", reasoning: true, contextWindow: 272_000 },
 		sessionManager: {
-			getCwd: () => "/repo",
+			getCwd: () => options.cwd ?? "/repo",
 			getSessionName: () => "Release notes",
 			getEntries: () => entries,
 			getSessionId: () => "shell-session",
@@ -5458,6 +5458,62 @@ test("the picker title row shows the chosen scope's path", async () => {
 	ui.overlayView!.handleInput("\x1b");
 	await opened;
 	await fire(h.handlers, "session_shutdown", ctx);
+});
+
+// S39: the preview is coloured by Pi's own highlighter through the active
+// theme, and the language comes from the previewed file's path. The wiring is
+// the extension's — the view never imports Pi — so this drives real files
+// through /gentle:files and reads the escape sequences the terminal receives.
+test("the picker previews the file's syntax in the active theme's colours, and an unavailable language stays plain", async () => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-files-preview-"));
+	writeFileSync(join(root, "CODEOWNERS"), "/sample.ts @owner\n");
+	writeFileSync(join(root, "README.md"), "# Title\n\nSome prose.\n");
+	writeFileSync(join(root, "sample.ts"), "const answer = 42; // done\n");
+	try {
+		const h = fakePi();
+		filePickerGit(h.pi, { [root]: ["CODEOWNERS", "README.md", "sample.ts"] });
+		gentleShell(h.pi, {});
+		const { ctx, ui, overlayReady } = fakeContext({ cwd: root });
+		await fire(h.handlers, "session_start", ctx);
+		const opened = h.commands.get("gentle:files")!.handler("", ctx);
+		await overlayReady;
+		const frame = () => ui.overlayView!.render(120);
+		const painted = () => frame().map((line) => stripAnsi(line)).join("\n");
+		const previewCells = (text: string): string[] => {
+			const row = frame().find((line) => stripAnsi(line).includes(text));
+			assert.ok(row, `missing ${JSON.stringify(text)} in the rendered frame:\n${frame().join("\n")}`);
+			return row.replace(/^│ /, "").replace(/ │$/, "").split(" │ ");
+		};
+		// The dim gutter number is the only escape sequence a plain row carries.
+		const gutterOnly = (row: string): boolean => {
+			const cells = previewCells(row);
+			const cell = cells[cells.length - 1] ?? "";
+			const gutter = /^(?:\x1b\[[0-9;]*m)*\d+(?:\x1b\[[0-9;]*m)* /.exec(cell);
+			return gutter !== null && !cell.slice(gutter[0].length).includes("\x1b[");
+		};
+
+		await until(() => painted().includes("/sample.ts @owner"));
+		assert.ok(gutterOnly("/sample.ts @owner"), "a file with no language paints the plain preview");
+
+		ui.overlayView!.handleInput("\x1b[B");
+		await until(() => painted().includes("Some prose."));
+		assert.ok(gutterOnly("Some prose."), "a lazily loaded grammar that is not registered paints the plain preview instead of a uniform colour");
+
+		ui.overlayView!.handleInput("\x1b[B");
+		await until(() => painted().includes("const answer"));
+		assert.ok(!gutterOnly("const answer"), "Pi's highlighter colours a registered language");
+		const code = previewCells("const answer").at(-1) ?? "";
+		const gutter = /^(?:\x1b\[[0-9;]*m)*\d+(?:\x1b\[[0-9;]*m)* /.exec(code);
+		assert.ok(gutter, "the row still starts with its gutter number");
+		assert.match(code.slice(gutter[0].length), /\x1b\[/, "the code after the gutter carries the active theme's syntax colour");
+		assert.equal(stripAnsi(code).trimEnd(), "1 const answer = 42; // done", "the painted text is still the file's own text");
+
+		ui.overlayView!.handleInput("\x1b");
+		await opened;
+		await fire(h.handlers, "session_shutdown", ctx);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 // S26 at the picker's narrowest usable card: the overlay opens with

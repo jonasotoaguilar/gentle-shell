@@ -1,4 +1,4 @@
-import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { posix } from "node:path";
 import { CARD_PADDING, rankPaletteGroups, renderPaletteCard, type CommandPaletteGroup } from "./command-palette.ts";
 import { FILE_PREVIEW_BINARY_NOTICE, formatAge, type FileEntry, type FilePreview, type RepositoryEntriesResult } from "./file-index.ts";
@@ -30,6 +30,17 @@ export interface FilePickerDeps {
 	now?(): number;
 	/** The path this picker is listing, painted in the title's top-right corner. */
 	root?: string;
+	/**
+	 * The library name of a previewed path (Pi's `getLanguageFromPath`, wired by
+	 * the extension). Absent, or returning nothing, leaves the preview plain (S39).
+	 */
+	languageForPath?(path: string): string | undefined;
+	/**
+	 * The syntax highlighter (Pi's `highlightCode`, wired by the extension): code
+	 * and language in, already-ANSI-painted lines out. Absent leaves the preview
+	 * plain, and the view never imports Pi itself (S39).
+	 */
+	highlight?(code: string, lang?: string): string[];
 }
 
 // The card fills the terminal like the Commands palette instead of a fixed
@@ -65,6 +76,9 @@ const LOADING_FILES = "Loading files …";
 const LOADING_PREVIEW = "Loading preview …";
 const NO_FILES = "No files in this repository.";
 const TRUNCATED_NOTICE = "… preview truncated.";
+// Every painted cell ends its own colour run, so a highlighted preview row can
+// never tint the rule, the border or the padding after it (S39).
+const ANSI_RESET = "\u001b[0m";
 // One option per action (S19): ctrl+c, ctrl+shift+j/k and home/end keep working
 // but are not advertised. Keys paint in the theme's key colour and the labels
 // in the neutral tone, one painted cell per role (S31).
@@ -110,6 +124,8 @@ interface PreviewLine {
 	tone: Tone;
 	/** Real file line number; absent on a notice row. */
 	number?: number;
+	/** The text already carries the highlighter's colour, so it is not re-toned (S39). */
+	highlighted?: boolean;
 }
 
 /**
@@ -133,7 +149,7 @@ interface PreviewMeta {
 	truncated: boolean;
 }
 
-type PreviewEntry = { status: "loading" } | { status: "ready"; preview: FilePreview };
+type PreviewEntry = { status: "loading" } | { status: "ready"; preview: FilePreview; highlighted?: string[] };
 
 interface PointerHit {
 	y: number;
@@ -652,7 +668,7 @@ export class FilePickerView {
 		void pending.then(
 			(preview) => {
 				if (this.disposed || this.completed) return;
-				this.previews.set(path, { status: "ready", preview });
+				this.previews.set(path, { status: "ready", preview, highlighted: this.highlightedLines(path, preview) });
 				this.deps.requestRender();
 			},
 			(error: unknown) => {
@@ -661,6 +677,31 @@ export class FilePickerView {
 				this.deps.requestRender();
 			},
 		);
+	}
+
+	/**
+	 * The preview's lines painted by the injected highlighter, computed once when
+	 * the preview lands — on the text the byte budget already bounded, never per
+	 * repaint (S3, S39). Every failure degrades to the plain preview the pane painted
+	 * before colour existed: no highlighter, no language for the path, a highlighter
+	 * that throws because no theme is initialised, and painted output that does not
+	 * line up with the file (the gutter, the position and the truncation notice all
+	 * count file lines).
+	 */
+	private highlightedLines(path: string, preview: FilePreview): string[] | undefined {
+		const highlight = this.deps.highlight;
+		const languageForPath = this.deps.languageForPath;
+		if (preview.kind !== "text" || !highlight || !languageForPath) return undefined;
+		const lines = preview.lines.map(displayPreviewText);
+		try {
+			const lang = languageForPath(path);
+			if (!lang) return undefined;
+			const painted = highlight(lines.join("\n"), lang);
+			if (!Array.isArray(painted) || painted.length !== lines.length) return undefined;
+			return painted;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
@@ -847,7 +888,10 @@ export class FilePickerView {
 		const rowStarts: number[] = [];
 		for (const line of lines) {
 			rowStarts.push(rows.length);
-			rows.push(...wrapByCells(line.text, textWidth));
+			// A coloured line wraps through the ANSI-aware wrapper so a colour run
+			// survives the break and each continuation row keeps its fragment's
+			// colour; the plain path keeps its grapheme-exact cell wrap (S30, S39).
+			rows.push(...(line.highlighted && textWidth > 0 ? wrapTextWithAnsi(line.text, textWidth) : wrapByCells(line.text, textWidth)));
 		}
 		return { lines, gutterWidth, textWidth, rows, rowStarts, totalRows: rows.length };
 	}
@@ -924,7 +968,11 @@ export class FilePickerView {
 		const borrowsGap = cells > room;
 		const showsText = cells > 0 && (!borrowsGap || window.gutterWidth + cells <= width);
 		const gap = borrowsGap ? "" : " ".repeat(PREVIEW_GUTTER_GAP);
-		return fit(`${gutter}${gap}${showsText ? this.renderText(text, entry.tone) : ""}`, width);
+		// The gutter is painted after highlighting and keeps its own dim tone, so a
+		// line number is never coloured (S39). A highlighted row is painted as the
+		// highlighter returned it and is closed with its own reset.
+		const painted = entry.highlighted ? `${text}${ANSI_RESET}` : this.renderText(text, entry.tone);
+		return fit(`${gutter}${gap}${showsText ? painted : ""}`, width);
 	}
 
 	private previewLines(path: string): PreviewLine[] {
@@ -933,7 +981,14 @@ export class FilePickerView {
 		const preview = entry.preview;
 		if (preview.kind === "binary") return [{ text: FILE_PREVIEW_BINARY_NOTICE, tone: "muted" }];
 		if (preview.kind === "error") return [{ text: preview.message, tone: "error" }];
-		const lines: PreviewLine[] = preview.lines.map((line, index) => ({ text: displayPreviewText(line), tone: "text", number: index + 1 }));
+		const lines: PreviewLine[] = preview.lines.map((line, index) => {
+			const text = displayPreviewText(line);
+			const painted = entry.highlighted?.[index];
+			// A line the highlighter left untouched keeps the plain tone, so a file
+			// it could not paint reads exactly as it did before (S39).
+			if (painted === undefined || painted === text) return { text, tone: "text", number: index + 1 };
+			return { text: painted, tone: "text", highlighted: true, number: index + 1 };
+		});
 		if (preview.truncated) lines.push({ text: TRUNCATED_NOTICE, tone: "muted" });
 		return lines;
 	}

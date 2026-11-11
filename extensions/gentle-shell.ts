@@ -1,5 +1,5 @@
 import { sharedCooldown, syncUsageCooldown } from "../lib/model-fallback-policy.ts";
-import { CustomEditor, keyHint, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, getLanguageFromPath, highlightCode, keyHint, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { isHomeOrBroadUserDirectory } from "../lib/bounded-writer-admission.ts";
 import { Editor, Image, Key, decodeKittyPrintable, getCapabilities, isKeyRelease, matchesKey, parseKey, truncateToWidth, visibleWidth, type Component, type EditorTheme, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { readClipboardImage, type ClipboardImage } from "../lib/clipboard-image.ts";
@@ -3075,6 +3075,22 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		try { return deps.resolveWorktree(ctx.cwd, ctx.cwd)?.root ?? ctx.cwd; }
 		catch { return ctx.cwd; }
 	};
+	// Pi's own highlighter, wired here because the view never imports Pi (S39):
+	// the token-to-colour table is Pi's, so the preview is painted in the active
+	// theme's colours and never a foreign palette. A language whose grammar is not
+	// loaded — the lazily imported `markdown`, `yaml`, `toml`, `css` and `xml` —
+	// comes back from `highlightCode` painted with the same uniform code-block tone
+	// it uses when it is given no language at all, which is not syntax colour.
+	// Comparing the two passes is the only supported way to tell, since
+	// `supportsLanguage` is not exported from the package root; that file then
+	// keeps the plain text the pane painted before colour existed.
+	const filePickerHighlight = (code: string, lang?: string): string[] => {
+		if (!lang) return code.split("\n");
+		const painted = highlightCode(code, lang);
+		const fallback = highlightCode(code);
+		const unloaded = painted.length === fallback.length && painted.every((line, index) => line === fallback[index]);
+		return unloaded ? code.split("\n") : painted;
+	};
 	// `main` is always the session repository; every other scope is a root
 	// /changes lists too, labelled exactly as /changes labels it. With no
 	// registered worktree the list is just `main`, so the extra step is skipped.
@@ -3156,6 +3172,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					rows: () => Math.max(0, tui.terminal.rows),
 					listEntries: () => listRepositoryEntries(deps.gitRunner(scope.root)),
 					loadPreview: async (relative) => readFilePreview(scope.root, relative),
+					// The preview's syntax colour: Pi's own mapper and highlighter, so the
+					// colours are the active theme's (S39).
+					languageForPath: (relative) => getLanguageFromPath(relative),
+					highlight: filePickerHighlight,
 					// Enter formats and pastes, then the picker closes with focus back in
 					// the prompt: the message is never sent from here.
 					onInsert: (paths) => ctx.ui.pasteToEditor(formatFileInsertion(paths, { root: scope.root, kind: scope.kind, cwd: ctx.cwd })),
