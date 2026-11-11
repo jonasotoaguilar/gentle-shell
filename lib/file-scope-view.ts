@@ -1,6 +1,6 @@
 import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { CARD_PADDING, renderPaletteCard, renderPaletteSelection } from "./command-palette.ts";
-import { scopeDetailLine, type ScopeDetail } from "./file-scope-detail.ts";
+import { countCell, scopeDetailLine, type ScopeDetail } from "./file-scope-detail.ts";
 import type { FilePickerTheme } from "./file-picker-view.ts";
 import { paintHoverable } from "./shell-hover.ts";
 import { sanitizeTerminalText, stripAnsi } from "./terminal-theme.ts";
@@ -282,17 +282,18 @@ export class FileScopeView {
 			const text = truncateToWidth(label, Math.max(0, width - 2), "…", true);
 			return fit(`  ${paintHoverable(theme, text, index === this.hovered, "muted")}`, width);
 		}
-		// With a count the label and the count share the row: the count keeps the
-		// theme's key colour at the right edge and the label gets what is left.
-		const count = `${changed} ${changed === 1 ? "file" : "files"} changed`;
-		const countCell = this.renderText(count, KEY_ROLE);
-		const countWidth = visibleWidth(stripAnsi(countCell));
+		// With a count the label and the count share the row: the count is the same
+		// `±n files` cell the detail line paints (S34), keeps the theme's key colour
+		// at the right edge and the label gets what is left.
+		const count = countCell(changed);
+		const countText = this.renderText(count, KEY_ROLE);
+		const countWidth = visibleWidth(stripAnsi(countText));
 		const room = Math.max(0, width - 2 - countWidth - 1);
 		const text = truncateToWidth(label, room, "…", true);
 		const textCell = selected ? this.renderText(text, "text") : paintHoverable(theme, text, index === this.hovered, "muted");
 		const marker = selected ? this.renderText("▸ ", KEY_ROLE) : "  ";
 		const gap = Math.max(1, width - 2 - visibleWidth(stripAnsi(textCell)) - countWidth);
-		const row = fit(`${marker}${textCell}${" ".repeat(gap)}${countCell}`, width);
+		const row = fit(`${marker}${textCell}${" ".repeat(gap)}${countText}`, width);
 		return selected && theme.bg ? theme.bg("selectedBg", row) : row;
 	}
 

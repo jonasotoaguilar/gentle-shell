@@ -345,7 +345,9 @@ test("a long scope list keeps the selected row visible with the more indicators 
 
 // S32: each row reports how many files the scope has changed in the working
 // tree, right-aligned and in the theme's key colour, and a scope with no
-// uncommitted file paints no count at all.
+// uncommitted file paints no count at all. S34 supersedes the wording: the
+// count is the `±` glyph plus the noun, which is what says these are files and
+// not changed lines, so it keeps its singular/plural branch.
 test("each scope row reports its uncommitted files at the right, in the theme's key colour", () => {
 	const scopes: FileScope[] = [
 		{ ...SCOPES[0]!, detail: { changedFiles: 3 } },
@@ -357,10 +359,10 @@ test("each scope row reports its uncommitted files at the right, in the theme's 
 	for (const line of lines) assert.equal(visibleWidth(line), 100, "a count never widens the card");
 	const rows = lines.map((line) => stripAnsi(line));
 	const mainRow = rowOf(lines, "main");
-	assert.match(rows[mainRow]!, /^│ ▸ main +3 files changed │$/, `the count sits at the right edge of the selected row: ${rows[mainRow]}`);
-	assert.match(rows[rowOf(lines, "feat/alpha")]!, /^│   feat\/alpha · alpha +1 file changed │$/, "one changed file is singular");
+	assert.match(rows[mainRow]!, /^│ ▸ main +±3 files │$/, `the count sits at the right edge of the selected row: ${rows[mainRow]}`);
+	assert.match(rows[rowOf(lines, "feat/alpha")]!, /^│   feat\/alpha · alpha +±1 file │$/, "the noun is singular for one changed file");
 	assert.match(rows[rowOf(lines, "fix/beta")]!, /^│   fix\/beta · beta +│$/, "a scope with no uncommitted file paints no count");
-	assert.ok(lines[mainRow]!.includes(`${ANSI_ACCENT}3 files changed`), "the count takes the theme's key colour");
+	assert.ok(lines[mainRow]!.includes(`${ANSI_ACCENT}±3 files`), "the count takes the theme's key colour");
 	assert.ok(mainRow < rowOf(lines, "feat/alpha") && rowOf(lines, "feat/alpha") < rowOf(lines, "fix/beta"), "main is the first row and the worktrees follow by recency");
 });
 
@@ -390,11 +392,11 @@ test("the row above the footer paints the focused scope's detail and never a zer
 	const { view } = createView({ now }, scopes);
 	const detail = (frame: readonly string[]): string => stripAnsi(frame[frame.length - 3]!).slice(2, -2).trim();
 	let lines = view.render(120);
-	assert.equal(detail(lines), "3 files changed · 5h · feat: add the picker · 2 ahead of main", "the zero `behind` field is not painted");
+	assert.equal(detail(lines), "±3 files · 5h · feat: add the picker · ↑2 main", "the zero `behind` field is not painted");
 	assert.equal(footerText(lines), "↑/↓ move • enter choose scope • esc close", "the detail line sits directly above the footer");
 	view.handleInput("\x1b[B");
 	lines = view.render(120);
-	assert.equal(detail(lines), "3d · fix: alpha only · 1 behind main", "a zero `changedFiles` field is not painted");
+	assert.equal(detail(lines), "3d · fix: alpha only · ↓1 main", "a zero `changedFiles` field is not painted");
 	view.handleInput("\x1b[B");
 	lines = view.render(120);
 	assert.equal(detail(lines), "", "a scope with no measured detail paints an empty line, not a fabricated zero");
@@ -439,12 +441,17 @@ test("a failed, truncated or unparsable lookup leaves its field absent instead o
 
 test("scopeDetailLine names only the fields that carry a value", () => {
 	const now = 1_700_010_000_000;
-	assert.equal(scopeDetailLine({}, now), "");
-	assert.equal(scopeDetailLine({ changedFiles: 1 }, now), "1 file changed");
-	assert.equal(scopeDetailLine({ changedFiles: 2, ahead: 0, behind: 0, comparison: "main" }, now), "2 files changed", "level with main paints neither side");
+	assert.equal(scopeDetailLine({}, now), "", "nothing measured paints an empty line");
+	assert.equal(scopeDetailLine({ changedFiles: 1 }, now), "±1 file", "the noun is singular at one");
+	assert.equal(scopeDetailLine({ changedFiles: 2, ahead: 0, behind: 0, comparison: "main" }, now), "±2 files", "level with main paints neither side");
 	assert.equal(scopeDetailLine({ lastModifiedMs: now - 30_000 }, now), "30s");
 	assert.equal(scopeDetailLine({ lastModifiedMs: now - 2 * 3_600_000 }, now), "2h");
 	assert.equal(scopeDetailLine({ lastModifiedMs: now - 4 * 86_400_000 }, now), "4d");
-	assert.equal(scopeDetailLine({ behind: 2, comparison: "origin/main" }, now), "2 behind origin/main");
-	assert.equal(scopeDetailLine({ ahead: 1, comparison: "main" }, now), "1 ahead of main");
+	assert.equal(scopeDetailLine({ behind: 2, comparison: "origin/main" }, now), "↓2 origin/main", "behind keeps the ref last so the main row still reads");
+	assert.equal(scopeDetailLine({ ahead: 1, comparison: "main" }, now), "↑1 main");
+	assert.equal(
+		scopeDetailLine({ changedFiles: 3, lastModifiedMs: now - 5 * 3_600_000, lastCommitSubject: "feat: add the picker", ahead: 0, behind: 2, comparison: "origin/main" }, now),
+		"±3 files · 5h · feat: add the picker · ↓2 origin/main",
+		"every field keeps the ` · ` separator and joins the glyphs to the same terse values",
+	);
 });

@@ -74,6 +74,19 @@ export async function loadScopeDetail(git: GitRunner, comparison: string): Promi
 }
 
 const SEPARATOR = " · ";
+// S34: the data paints with symbols, not words -- `±n files` for the uncommitted
+// files, `↑n <ref>` ahead and `↓n <ref>` behind -- while the age and the commit
+// subject keep their terse form. The count keeps the noun because `±3` alone
+// reads as changed lines, the way `+1 -1` does in /changes. The ref stays last
+// so the `main` row's `↓2 origin/main` still says what it is measured against.
+const CHANGED_SYMBOL = "±";
+const AHEAD_SYMBOL = "↑";
+const BEHIND_SYMBOL = "↓";
+
+/** The uncommitted count: the glyph plus the noun, singular at one. */
+export function countCell(files: number): string {
+	return `${CHANGED_SYMBOL}${files} ${files === 1 ? "file" : "files"}`;
+}
 
 /**
  * The detail line's text: the uncommitted files, the last modification's age,
@@ -84,11 +97,11 @@ const SEPARATOR = " · ";
 export function scopeDetailLine(detail: ScopeDetail, nowMs: number): string {
 	const fields: string[] = [];
 	const files = detail.changedFiles ?? 0;
-	if (files > 0) fields.push(`${files} ${files === 1 ? "file" : "files"} changed`);
+	if (files > 0) fields.push(countCell(files));
 	if (detail.lastModifiedMs !== undefined && detail.lastModifiedMs > 0) fields.push(formatAge(detail.lastModifiedMs, nowMs));
 	if (detail.lastCommitSubject) fields.push(detail.lastCommitSubject);
 	const comparison = detail.comparison;
-	if (comparison !== undefined && (detail.ahead ?? 0) > 0) fields.push(`${detail.ahead} ahead of ${comparison}`);
-	if (comparison !== undefined && (detail.behind ?? 0) > 0) fields.push(`${detail.behind} behind ${comparison}`);
+	if (comparison !== undefined && (detail.ahead ?? 0) > 0) fields.push(`${AHEAD_SYMBOL}${detail.ahead} ${comparison}`);
+	if (comparison !== undefined && (detail.behind ?? 0) > 0) fields.push(`${BEHIND_SYMBOL}${detail.behind} ${comparison}`);
 	return fields.join(SEPARATOR);
 }
