@@ -27,7 +27,7 @@ S10. **Listing source.** The list comes from Git (`git ls-files`-style), so trac
 
 S11. **No regressions.** Existing keymap, palette and changes tests keep passing; a new keymap action must be reflected in the keymap defaults test and in the docs that list keys and commands.
 
-S12. **Changed files first, with state and age.** Files changed in the working tree sort above unchanged ones. A newly created file shows `new`, a modified tracked file shows `upt`, and both show their age at the right in `s`/`h`/`d` units. Ages are computed once when the panel opens and are never recomputed or refreshed live ("igual esto se calcula al abrir no se recalcula/actualiza en vivo").
+S12. **Changed files first, with state and age.** Files changed in the working tree sort above unchanged ones. A newly created file shows `new`, a modified tracked file shows `upd`, and both show their age at the right in `s`/`h`/`d` units. Ages are computed once when the panel opens and are never recomputed or refreshed live ("igual esto se calcula al abrir no se recalcula/actualiza en vivo").
 
 S13. **Clear-search key.** `ctrl+u` clears the query and the footer lists it alongside the other keys.
 
@@ -47,7 +47,7 @@ S20. **Stable row geometry when marking.** `Tab` must repaint the row in place: 
 
 S21. **Preview gutter and position.** The preview shows line numbers in a left gutter and the position of the top visible line as `line/total` at the preview's top-right, using the Pi theme colours.
 
-S22. **Picker geometry.** The panel is narrower and taller than the first cut: it must use the vertical room the terminal offers instead of a wide, short card, matching the Commands panel's proportions.
+S22. **Picker geometry.** The panel is taller than the first cut: it must use the vertical room the terminal offers instead of a short card, matching the Commands panel's proportions. Width is not governed here — S27 is the current width authority and supersedes this spec's original narrower-card wording.
 
 S23. **Editor handoff without jank.** Opening `$EDITOR` from the picker and returning must feel the same as in `/changes`: no extra full repaint before the terminal is stopped.
 
@@ -56,6 +56,20 @@ S24. **`ctrl+j/k` and `ctrl+shift+j/k` both scroll the preview**; arrows move th
 S25. **`.gitignore` is respected.** The listing excludes ignored paths; confirm with evidence rather than assuming.
 
 S26. **Listing path in the title row.** The picker's title row shows the path being listed, at its top-right next to the `esc` hint, so the user can see which scope (session repository or a registered worktree) the list belongs to. "Falta conectar scope.root al encabezado del picker, verificar que se vea la ruta del scope elegido"
+
+S27. **Wider card, same height.** The card is wider than the current cut while keeping the height it already has. "primero lo quiero mas ancho, manten el alto esta perfecto"
+
+S28. **`home` / `end` compatibility.** `home` moves the selection to the first file and `end` to the last; `ctrl+home` jumps the preview to its first line and `ctrl+end` to the end of the file. These are compatibility bindings only and are never named in the footer. "Agrega compatiblidad keybinding con home y end. Con home voy al inicio de la lista y con End al final de la lista y con ctrl home al inicio en rpeview y ctrl end al final del archivo en preview. No lo pongas en keybinding solo pon compativilidad."
+
+S29. **Listing order selector.** `ctrl+o` cycles the listing order and the footer names it. The active order is always visible in the panel. Default order is `modified` — most recently modified first. The other orders are `path` — directory-major alphabetical, the way an IDE explorer lists a tree, so every file of a folder and of its subfolders comes together — and `ext` — grouped by extension (all `.md`, all `.ts`, …). "Tabmein agrega keybinding (este si va texto) contrl + o que es para alterar el order ( y pones que orden esta activo) por defecto es el de mas nuevo, newest o algo asi talvez? o modified? otros orden son por ruta o sea como ide [Image#2] que ponga por orden alfabetico pero de cada carpeta y sigiendo, o sea seria todos los archivos ahi en base a la imagenan dentro de .gigub y sus subcarpetas. (lo de que filtro esta activo nose si en la keybinding o arriba abajo en los, por donde esta search, files, u otra zona, que sugieres? ... Otro orden seria por extensio, o sea ordenado todo los .md, .ts, etc."
+
+S30. **Long lines wrap.** A preview line wider than the pane wraps onto continuation rows instead of being truncated with an ellipsis. The gutter numbers the line once and its continuation rows align under the same text column, so it is clear which line a wrapped fragment continues. "si la liena es muy larga no la muestra completa sino que sale como ..., ahi deberia hacer como el salto de linea algo como / 3 linea muy larga / que sigue aqui / 4 siguiente linea / que se vea completa, cn los numeros sabe que es la misma o conitunaucion."
+
+S31. **Theme-coloured hints.** The `esc` hint in the title row and every key token in the footer use the Pi theme's key colour, with the labels in the neutral text colour, matching the `/agents` panel, instead of one flat muted tone. "el esc de arriba derecho color usar color del tema, y las keybinding la tecla debe usar color del tema igual, el texto del color neutral que tiene esta bien [Image#5] algo asi como en /agents"
+
+S32. **Scope rows report uncommitted files.** Each row of the scope step shows, at its right and in theme colour, how many files it has changed in the working tree (`n files changed`). `main` is always the first row; the registered worktrees follow ordered by their most recent change. "tambien mejreos el selector, que salga a la rececha los archvios cambiados (uncommited). Igual main ssiempre va arriba primero, leug ode ese se ordenan del cambio mas reciente. Lo de archivos cambiado le pones con color del tema, "n files chaged" algo asi. En esa vista igual las keybing la tecla de color."
+
+S33. **Focused scope detail line.** The data about a scope does not sit at the row's right; the scope step paints a detail line for the focused scope in the row directly above the footer: uncommitted files, last modification, last commit subject, and how far the scope is ahead of or behind `main` — a registered worktree is compared with the local `main`, and the `main` row shows how far behind the remote `main` it is. A field whose value is zero or absent is not painted at all. "Ademas esta data de files changed y demas no la ponga derecha, ponla mejor abajo, arriba de keybinding ahi sale la data del que tengo focus, sale files changed (uncommited) - ultima modificacion (3 modified, 5h, etc) - ultimo commit (name commit), y cuanto esta adealante/atradaso respecto a main. SI alguno es 0, sin files unocmmited, p esta a la par de main no sale ese campo. Para main seroa cuanto esta atras respecto a main remoto. (el de los worktrees comparadado co el main local)."
 
 ## Tasks
 
@@ -69,6 +83,18 @@ S26. **Listing path in the title row.** The picker's title row shows the path be
 | T6 | S15 | gentle-ai-worker: worktree scope selector + scope-first flow | `8c078277a` |
 | T7 | S11 | verify: typecheck + full suite | done |
 | T8 | S16, S7, S8, S15, S11 | gentle-ai-worker: `@` from the session cwd, `try/finally` close, `/changes` roots parity, docs truth and wiring coverage (reopens T2/T3/T6 surfaces) | `1eab97ea4` |
+
+Tasks for L16 (all reopen the delivered picker surfaces):
+
+| ID | Specs | Route | Commit |
+| --- | --- | --- | --- |
+| T13 | S27, S28, S31 | gentle-ai-worker: wider card, home/end compatibility, theme-coloured hints | `389e9cc6a` (S28, S31) + `cd1b5a772` (S27) |
+| T14 | S30 | gentle-ai-worker: wrapped preview lines with a single gutter number | `389e9cc6a` |
+| T15 | S29 | gentle-ai-worker: `ctrl+o` order cycle (`modified`, `path`, `ext`) and the active order in the info row | `389e9cc6a` |
+| T16 | S32 | gentle-ai-worker: uncommitted-file counts per scope and recency order with `main` first | `cd1b5a772` |
+| T17 | S33 | gentle-ai-worker: focused-scope detail line above the footer | `cd1b5a772` |
+| T18 | S11 | verify and docs: focused suites, typecheck, provider contract, key/footer docs | `cba012870` (docs) + this round's measurement below |
+| T19 | S12 | gentle-ai-worker: rename the updated badge to `upd` in the view and its tests, plus the docs | `389e9cc6a` (view, tests) + `cba012870` (docs) |
 
 ## Delivery
 
@@ -235,3 +261,45 @@ L13 (user, verbatim):
 L14 (parent, verification evidence and delivery state): the round's writer route failed twice with `provider_unavailable` and produced no edits before a third attempt landed, so no other fallback writer was usable. This round's `Risk:` classification is none — no irreversible data, security, contract, concurrency or delivery surface, and every changed behaviour is covered by the focused set — so no independent verifier was run; the verifier admission requires a declared high-risk item and none exists. `odd/` is matched by the machine-global gitignore (`~/.config/git/.gitignore:236`) and this document was never tracked while the repository tracks the other `odd/tasks/*.md` files, so it is force-added for this round's closing commit. Nothing was pushed.
 
 L15 (parent, closing verification): the round is closed with the delivery evidence that was still owed. A clean `CI=true pnpm install --frozen-lockfile` on a fresh, empty `node_modules` replaced the sibling-worktree symlink, and the full unit stage then ran on the final tree: 9629 tests, 9537 pass, 8 fail. The eight failures are pre-existing and unrelated — the same eight names fail at the branch base `1eab97ea4` over the six affected files (329 tests, 314 pass, 8 fail) and the two name sets are identical, so this branch introduces no new failure. `node scripts/check-types.mjs` reports `0 recorded diagnostic(s), no regressions`, and `node scripts/check-provider-contract.mjs` passes with contract 1.4.0, 10 bundle entries and 2 generated baselines. The focused integrated set ends at `tests/gentle-shell.test.ts` 355 tests / 355 pass, superseding the 512/512 wider set recorded above, and the documented `MIN_ROOT_WIDTH` coverage gap is closed by `the picker title row elides a long worktree path at the 60-column floor`: removing `root: scope.root` fails it, restoring the line passes it, and the production file came back byte-identically (`sha256 06fc2329c3588ec841e244306b664bf863dc204856886656e97a1b70effb8f76` before and after). Two commits close the round, `e29ccded6` (`test(files): pin the header elision at the 60-column floor`) and this document's own docs commit, which brings `feat/file-picker` to twelve commits against `origin/main`, with nothing pushed; delivery is still `gentle-ai-chained-pr` and push, PR creation and merge remain the human's decisions. The known limitation stays honest: the elision test relies on the fake worktree resolution (`rootExists: () => true`, path outside `/repo` mapping to itself), so it pins the title-row behaviour, not real worktree canonicalisation.
+
+L16 (user, verbatim):
+
+> [Image#1] funciona perfecto, pero afinemos detalles, primero lo quiero mas ancho, manten el alto esta perfecto.
+>
+> Agrega compatiblidad keybinding con home y end. Con home voy al inicio de la lista y con End al final de la lista y con ctrl home al inicio en rpeview y ctrl end al final del archivo en preview. No lo pongas en keybinding solo pon compativilidad.
+>
+> Tabmein agrega keybinding (este si va texto) contrl + o que es para alterar el order ( y pones que orden esta activo) por defecto es el de mas nuevo, newest o algo asi talvez? o modified? otros orden son por ruta o sea como ide [Image#2] que ponga por orden alfabetico pero de cada carpeta y sigiendo, o sea seria todos los archivos ahi en base a la imagenan dentro de .gigub y sus subcarpetas. (lo de que filtro esta activo nose si en la keybinding o arriba abajo en los, por donde esta search, files, u otra zona, que sugieres?
+>
+> [Image#3] otro error que encontre es que si la liena es muy larga no la muestra completa sino que sale como ..., ahi deberia hacer como el salto de linea algo como
+>
+> 3 linea muy larga
+>   que sigue aqui
+> 4 siguiente linea
+>
+> que se vea completa, cn los numeros sabe que es la misma o conitunaucion.
+> [Image#4] el esc de arriba derecho color usar color del tema, y las keybinding la tecla debe usar color del tema igual, el texto del color neutral que tiene esta bien. [Image#5] algo asi como en /agents
+>
+> [Image#6] tambien mejreos el selector, que salga a la rececha los archvios cambiados (uncommited). Igual main ssiempre va arriba primero, leug ode ese se ordenan del cambio mas reciente. Lo de archivos cambiado le pones con color del tema, "n files chaged" algo asi. En esa vista igual las keybing la tecla de color. Ademas esta data de files changed y demas no la ponga derecha, ponla mejor abajo, arriba de keybinding ahi sale la data del que tengo focus, sale files changed (uncommited) - ultima modificacion (3 modified, 5h, etc) - ultimo commit (name commit), y cuanto esta adealante/atradaso respecto a main. SI alguno es 0, sin files unocmmited, p esta a la par de main no sale ese campo. Para main seroa cuanto esta atras respecto a main remoto. (el de los worktrees comparadado co el main local).
+>
+> Otro orden seria por extensio, o sea ordenado todo los .md, .ts, etc.
+
+L17 (parent, decisions): L16 is a requirement change, recorded as S27-S33 and T13-T18; every unit reopens a delivered surface. On the question L16 leaves open, where the active order is shown: it goes in the info row directly under the search, next to the file and selection count — `109 files (0 selected) · modified` — because it is always visible, it belongs with the data rather than the keys, and the footer stays a pure key list. `path` order is directory-major alphabetical over the flat list: entries are sorted by their path segments so every file of a folder and its subfolders stays together, exactly the order an IDE explorer paints, without adding folder header rows to the two-pane list. The default order is named `modified` rather than `newest`: it is the recency order the picker already uses, and it keeps the `new`/`upt` change-state sort working. `home`/`end` and `ctrl+home`/`ctrl+end` stay out of the footer per the requirement, and `ctrl+o` is added to the footer text per the requirement.
+
+L18 (user, verbatim):
+
+> y un error es que para los archvios actualizados no es "upt" es "upd"
+
+L19 (parent, decisions): L18 is a requirement change and not a cosmetic detail, so it rewrites only S12 and reopens only its task (T19); the L8 entry keeps the old `upt` wording because the log records history verbatim and is never retro-edited. The surfaces the rename reaches are the `UPDATED_BADGE` constant in `lib/file-picker-view.ts`, four assertions in `tests/file-picker-view.test.ts` and the badge sentence in `docs/gentle-shell.md`. S22's width clause was reconciled with S27 because S27 supersedes it, and no other spec changed.
+
+L20 (parent, reconciliation and verification evidence): the L16 round landed in three commits, and this entry records them against T13-T19 plus the round's measurements. `389e9cc6a` carries S28 (`home`/`end`, `ctrl+home`/`ctrl+end`), S29 (`ctrl+o` and `ORDER_CYCLE` of `modified`/`path`/`ext`, the active order in the info row), S30 (wrapped preview rows under one gutter number) and S31 (`KEY_TONE = "accent"` for the `esc` hint and footer keys), and with them the T19 badge rename to `upd` in the view and its four test assertions. `cd1b5a772` carries S27 (the overlay now opens at `width: "85%"`, `minWidth: 76`, height untouched) together with S32 and S33 (scope rows report `n files changed`, `main` stays first, `lib/file-scope-detail.ts` paints the focused scope's detail line above the footer). `cba012870` carries the docs truth for both, including the `new`/`upd` badge sentence.
+
+S26 (the scope path in the title row) was already delivered by `8dbf6c7d7` and pinned by `e29ccded6`, so this round re-verified it rather than rewiring it: `root: scope.root` is passed by the real `/gentle:files` wiring (`extensions/gentle-shell.ts:3155`) into `headerRow`/`rootCell`, and both header tests pass — `the title row shows the path being listed at its top-right` (the whole path when it fits) and `the picker title row elides a long worktree path at the 60-column floor` (the chosen worktree root is still legible at the floor).
+
+Measurements on the final tree, this round:
+
+- Focused integrated set, `node --experimental-strip-types --test --test-reporter=tap tests/file-picker-view.test.ts tests/file-picker-insert.test.ts tests/file-index.test.ts tests/file-scope-view.test.ts tests/shell-changes-view.test.ts tests/gentle-shell.test.ts tests/keymaps.test.ts tests/keymaps-customize.test.ts tests/command-palette.test.ts` — 577 tests, 577 pass, 0 fail, exit 0.
+- `node scripts/check-types.mjs` — `0 recorded diagnostic(s), no regressions`, exit 0.
+- `node scripts/check-provider-contract.mjs` — passed, contract 1.4.0, 10 bundle entries, 2 generated baselines, exit 0.
+- S26 spot check — `--test-name-pattern="elides a long worktree path|title row shows the path|listed path"` on `tests/gentle-shell.test.ts`: 1 pass, 0 fail.
+
+`Risk: none` for this round: no irreversible data, security surface, concurrency, delivery/environment change, and no consumed contract broken — the keymap action, the palette catalog entry and the footer/info text are additive or presentational, and a regression in any of them is caught by the focused set above. No independent verifier was run, because verifier admission requires a declared high-risk item and none exists. The full unit stage was not re-run this round; the previously recorded 9629/9537/8 comparison against the branch base still stands as the whole-branch evidence. Nothing was pushed.
