@@ -58,8 +58,8 @@ const MIN_WIDTH = CARD_PADDING + 4;
 // Below this the title row drops the listing path rather than eliding it to
 // nothing useful, so the title and the close hint stay legible.
 const MIN_ROOT_WIDTH = 8;
-const LIST_RATIO = 0.4;
-const LIST_MAX_WIDTH = 48;
+const LIST_RATIO = 0.45;
+const LIST_MAX_WIDTH = 64;
 // Cursor cell, selection cell and the space before the name. Constant in
 // every row state, so Tab repaints a row in place (S20).
 const MARKER_WIDTH = 3;
@@ -96,8 +96,15 @@ const FOOTER_SEPARATOR = " • ";
 // The theme role the hints paint a key with (the /agents panel's convention).
 const KEY_TONE = "accent";
 const LABEL_TONE = "muted";
-const NEW_BADGE = "new";
-const UPDATED_BADGE = "upd";
+// The row's change letters, borrowed from `/changes` so the two views never
+// spell the same state differently: `U` for a file Git does not track yet and
+// `M` for a tracked file with an uncommitted change (S12). There is no `N`:
+// `/changes` has no such state (lib/shell-changes-view.ts).
+const UNTRACKED_BADGE = "U";
+const MODIFIED_BADGE = "M";
+// The tone `/changes` paints the trailing parent directory with (ROLE.EMPTY),
+// so the name reads as the label and the path as its context (S37).
+const DIRECTORY_TONE = "dim";
 
 /**
  * The listing orders ctrl+o cycles through (S29): the listing's own
@@ -817,23 +824,27 @@ export class FilePickerView {
 		return lines.slice(0, bodyRows);
 	}
 
-	private rowLabel(entry: FileEntry): string {
+	private rowLabel(entry: FileEntry): { text: string; nameLength: number } {
 		const name = displayText(posix.basename(entry.path));
 		const directory = posix.dirname(entry.path);
-		return directory === "." ? name : `${name}  ${displayText(directory)}`;
+		return directory === "." ? { text: name, nameLength: name.length } : { text: `${name}  ${displayText(directory)}`, nameLength: name.length };
 	}
 
 	/** The trailing badge and age of a changed row; a clean row has neither (S12). */
 	private rowSuffix(entry: FileEntry): string {
 		if (entry.state === "clean") return "";
-		const badge = entry.state === "new" ? NEW_BADGE : UPDATED_BADGE;
+		const badge = entry.state === "new" ? UNTRACKED_BADGE : MODIFIED_BADGE;
 		const parts = [this.deps.theme.fg("accent", badge)];
 		if (entry.mtimeMs !== undefined) parts.push(this.deps.theme.fg("muted", formatAge(entry.mtimeMs, this.openedAt)));
 		return parts.join(" ");
 	}
 
 	// The name leads and the badge and age trail: the name is truncated first so
-	// a narrow list pane never costs the row its state.
+	// a narrow list pane never costs the row its state. The name paints in the
+	// row's role and the trailing parent directory in `dim`, the pair `/changes`
+	// paints for the same information (S37); the label is composed and truncated
+	// whole and only then split, so the tone split moves no cell and never
+	// changes which part truncates first.
 	private renderListRow(entry: FileEntry, index: number, selectedIndex: number, listWidth: number): string {
 		const theme = this.deps.theme;
 		const cursor = index === selectedIndex;
@@ -843,7 +854,16 @@ export class FilePickerView {
 		const suffixWidth = visibleWidth(stripAnsi(suffix));
 		const showsSuffix = suffixWidth > 0 && suffixWidth + MARKER_WIDTH <= listWidth;
 		const labelRoom = Math.max(0, listWidth - MARKER_WIDTH - (showsSuffix ? suffixWidth + 1 : 0));
-		const label = truncateToWidth(this.rowLabel(entry), labelRoom, "…");
+		const parts = this.rowLabel(entry);
+		const label = truncateToWidth(parts.text, labelRoom, "…");
+		// A file at the repository root has no directory, so the whole label is
+		// the name (S37).
+		const split = Math.min(label.length, parts.nameLength);
+		const name = label.slice(0, split);
+		const tail = label.slice(split);
+		const gapEnd = tail.slice(0, 2) === "  " ? 2 : tail.search(/[^ ]/);
+		const nameGap = gapEnd === -1 ? tail : tail.slice(0, gapEnd);
+		const directory = tail.slice(nameGap.length);
 		const gap = " ".repeat(Math.max(0, listWidth - MARKER_WIDTH - visibleWidth(label) - (showsSuffix ? suffixWidth : 0)));
 		// The marker column is three cells wide in every state: cursor cell,
 		// selection cell, then the space before the name. A highlighted bar owns
@@ -853,8 +873,9 @@ export class FilePickerView {
 			const inner = `${marker}${label}${showsSuffix ? `${gap}${stripAnsi(suffix)}` : ""}`;
 			return theme.bg("selectedBg", inner + " ".repeat(Math.max(0, listWidth - visibleWidth(stripAnsi(inner)))));
 		}
-		const painted = marked ? theme.fg("accent", label) : cursor ? theme.fg("text", label) : paintHoverable(theme, label, hovered, "muted");
-		return fit(`${marker}${painted}${gap}${showsSuffix ? suffix : ""}`, listWidth);
+		const paintedName = marked ? theme.fg("accent", name) : cursor ? theme.fg("text", name) : paintHoverable(theme, name, hovered, "muted");
+		const paintedLabel = directory.length === 0 ? paintedName : `${paintedName}${nameGap}${theme.fg(DIRECTORY_TONE, directory)}`;
+		return fit(`${marker}${paintedLabel}${gap}${showsSuffix ? suffix : ""}`, listWidth);
 	}
 
 	private previewColumn(layout: PaneLayout, bodyRows: number): string[] {

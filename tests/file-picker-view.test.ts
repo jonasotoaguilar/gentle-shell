@@ -165,6 +165,21 @@ function listCell(lines: readonly string[], text: string): string {
 	return cell.replace(/^│ /, "");
 }
 
+/** The same list cell with its escape sequences intact, for tone assertions. */
+function rawListCell(lines: readonly string[], text: string): string {
+	const row = lines[rowOf(lines, text)] ?? "";
+	return (row.split(" │ ")[0] ?? "").replace(/^│ /, "");
+}
+
+/**
+ * The painted width of the list pane: the columns between the card border and
+ * the ` │ ` pane separator. It is measured from the frame, so it is the same
+ * geometry a click is routed through.
+ */
+function listPaneWidth(lines: readonly string[]): number {
+	return stripAnsi(lines[BODY_TOP] ?? "").indexOf(" │ ") - 2;
+}
+
 function mouse(lines: readonly string[], x: number, y: number, type: MouseEvent["type"] = "click", button: MouseEvent["button"] = "left", wheelDelta?: number, width = visibleWidth(lines[0] ?? "")): MouseEvent {
 	const height = lines.length;
 	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false, wheelDelta };
@@ -363,6 +378,38 @@ test("the body is two panes split by one vertical rule, with the list and previe
 	assert.match(row!, /^│ .*README\.md.* │ .*│$/, "the separator sits between the list and its preview");
 	assert.equal((row!.match(/│/g) ?? []).length, 3, "the body row has the two card borders plus one pane separator");
 	assert.match(previewTop(lines), /^1 preview of README\.md/, "the preview paints its first line, numbered, beside the list");
+});
+
+test("the list pane takes 45% of the card content with a 64-column cap at a narrow, a middle and a wide terminal, and a click still lands on the row it looks like", async () => {
+	const { view } = await openView({}, [entry("a.ts"), entry("b.ts"), entry("c.ts")]);
+	// The card's content is width - CARD_PADDING; the list takes 45% of it and
+	// the preview keeps the rest (S36). Below the cap the card's own width and
+	// height never change.
+	for (const [width, expected] of [[72, 30], [120, 52], [200, 64]] as const) {
+		const lines = view.render(width);
+		for (const line of lines) assert.equal(visibleWidth(line), width, `no row is ragged at ${width} columns`);
+		assert.equal(listPaneWidth(lines), expected, `at ${width} columns the list pane takes its 45% share, capped at 64`);
+		const previewStart = stripAnsi(lines[BODY_TOP] ?? "").indexOf(" │ ") + 3;
+		assert.equal(width - 2 - previewStart, width - 4 - expected - 3, "the preview keeps the rest of the content width");
+	}
+
+	// Painting and hit-testing share paneLayout: the last column of the wider
+	// list pane is still a list column, and it selects the row painted under it (S6).
+	let lines = view.render(120);
+	const lastListColumn = 2 + listPaneWidth(lines) - 1;
+	const target = rowOf(lines, "b.ts");
+	assert.deepEqual(view.handleMouse(mouse(lines, lastListColumn, target)), { handled: true, render: true }, "a click in the pane's last column is a list click");
+	lines = view.render(120);
+	assert.equal(rowOf(lines, "▸"), target, "the selection lands on the row that was under the pointer");
+	assert.match(selectedRow(lines), /b\.ts/);
+
+	lines = view.render(200);
+	const wideLastColumn = 2 + listPaneWidth(lines) - 1;
+	const wideTarget = rowOf(lines, "c.ts");
+	assert.deepEqual(view.handleMouse(mouse(lines, wideLastColumn, wideTarget)), { handled: true, render: true }, "the 64-column cap keeps its last column clickable");
+	lines = view.render(200);
+	assert.match(selectedRow(lines), /c\.ts/);
+	assert.equal(rowOf(lines, "▸"), wideTarget);
 });
 
 test("typing narrows the list without navigating or firing an action, and resets the selection to the first match", async () => {
@@ -747,7 +794,7 @@ test("a throwing paste or editor callback still closes the panel exactly once", 
 	assert.equal(open.calls.close, 1);
 });
 
-test("a changed row shows its state badge and the age computed once when the panel opened", async () => {
+test("a changed row shows its state letter and the age computed once when the panel opened", async () => {
 	let clock = NOW;
 	const list = [
 		entry("fresh.ts", "new", NOW - 5_000),
@@ -757,21 +804,65 @@ test("a changed row shows its state badge and the age computed once when the pan
 	];
 	const { view } = await openView({ now: () => clock }, list);
 	const first = view.render(120);
-	assert.match(listCell(first, "fresh.ts"), /^▸ {2}fresh\.ts +new 5s$/, "the age is right-aligned after the badge");
-	assert.match(listCell(first, "edited.ts"), /^ {3}edited\.ts +upd 3h$/);
-	assert.match(listCell(first, "stale.ts"), /^ {3}stale\.ts +upd 2d$/);
-	assert.match(listCell(first, "untouched.ts"), /^ {3}untouched\.ts *$/, "a clean row shows neither badge nor age");
+	assert.match(listCell(first, "fresh.ts"), /^▸ {2}fresh\.ts +U 5s$/, "an untracked file paints /changes' U and the age right-aligned after it");
+	assert.match(listCell(first, "edited.ts"), /^ {3}edited\.ts +M 3h$/);
+	assert.match(listCell(first, "stale.ts"), /^ {3}stale\.ts +M 2d$/);
+	assert.match(listCell(first, "untouched.ts"), /^ {3}untouched\.ts *$/, "a clean row shows neither a letter nor an age");
+	assert.doesNotMatch(bodyText(first), /\bnew\b|\bupd\b/, "the word badges are gone from the whole frame");
 
 	clock = NOW + 30 * DAY;
-	assert.match(listCell(view.render(120), "edited.ts"), /^ {3}edited\.ts +upd 3h$/, "ages are never recomputed");
+	assert.match(listCell(view.render(120), "edited.ts"), /^ {3}edited\.ts +M 3h$/, "ages are never recomputed");
 });
 
-test("a changed row without an mtime shows its badge and no age", async () => {
+test("a changed row without an mtime shows its state letter and no age", async () => {
 	const { view } = await openView({}, [entry("brand-new.ts", "new"), entry("plain.ts")]);
 	const changed = listCell(view.render(120), "brand-new.ts");
-	assert.match(changed, /brand-new\.ts +new$/);
+	assert.match(changed, /brand-new\.ts +U$/, "an untracked file paints U, never N or new");
 	assert.doesNotMatch(changed, /\b\d+[smhd]\b/, "no age without an mtime");
-	assert.doesNotMatch(listCell(view.render(120), "plain.ts"), /\bnew\b|\bupd\b/, "a clean file paints neither badge");
+	assert.doesNotMatch(listCell(view.render(120), "plain.ts"), /\bnew\b|\bupd\b/, "a clean file paints neither a letter nor a word badge");
+});
+
+test("a row paints its name in the row role and its directory in dim, without moving a painted cell", async () => {
+	const roleTheme: FilePickerTheme = {
+		fg(color: string, text: string) {
+			if (color === "text") return `\x1b[37m${text}\x1b[0m`;
+			if (color === "muted") return `\x1b[90m${text}\x1b[0m`;
+			if (color === "dim") return `\x1b[2m${text}\x1b[0m`;
+			if (color === "accent") return `\x1b[35m${text}\x1b[0m`;
+			if (color === "warning") return `\x1b[33m${text}\x1b[0m`;
+			return text;
+		},
+	};
+	const list = [entry("src/cursor.ts"), entry("src/idle.ts"), entry("README.md")];
+	const { view } = await openView({ theme: roleTheme }, list);
+	const plain = await openView({}, list);
+	let lines = view.render(120);
+
+	// The cursor row: the name takes the row's own role, the directory is dim.
+	assert.match(rawListCell(lines, "cursor.ts"), /\x1b\[37mcursor\.ts\x1b\[0m/, "the highlighted name keeps the row's text role");
+	assert.match(rawListCell(lines, "cursor.ts"), / {2}\x1b\[2msrc\x1b\[0m/, "the trailing directory paints in dim");
+	// An idle row: muted name, still a dim directory.
+	assert.match(rawListCell(lines, "idle.ts"), /\x1b\[90midle\.ts\x1b\[0m/, "an unselected name keeps the idle role");
+	assert.match(rawListCell(lines, "idle.ts"), / {2}\x1b\[2msrc\x1b\[0m/);
+	assert.doesNotMatch(rawListCell(lines, "idle.ts"), /\x1b\[90msrc\x1b\[0m/, "the directory is never painted in the name's tone");
+	// A file at the repository root paints no directory at all.
+	assert.equal(stripAnsi(rawListCell(lines, "README.md")).trimEnd(), "   README.md", "a root file paints its name alone");
+	assert.doesNotMatch(rawListCell(lines, "README.md"), /\x1b\[2m/, "a root file has no directory to paint dim");
+	// Tone only: the painted cells are exactly the ones the plain theme paints.
+	for (const name of ["cursor.ts", "idle.ts", "README.md"]) assert.equal(stripAnsi(rawListCell(lines, name)), listCell(plain.view.render(120), name), `the ${name} row paints the same cells as before`);
+
+	// A hovered row: the shared hover role on the name, the directory still dim.
+	const idleRow = rowOf(lines, "idle.ts");
+	assert.equal(view.handleMouse(mouse(lines, 3, idleRow, "move", "none", undefined, 120))?.render, true);
+	lines = view.render(120);
+	assert.match(rawListCell(lines, "idle.ts"), /\x1b\[33midle\.ts\x1b\[0m/, "hover paints the shared hover role on the name");
+	assert.match(rawListCell(lines, "idle.ts"), / {2}\x1b\[2msrc\x1b\[0m/, "hover never repaints the directory");
+
+	// A marked row: the accent the selection bar uses, the directory still dim.
+	view.handleInput(TAB);
+	lines = view.render(120);
+	assert.match(rawListCell(lines, "cursor.ts"), /\x1b\[35mcursor\.ts\x1b\[0m/, "a marked name takes the accent role");
+	assert.match(rawListCell(lines, "cursor.ts"), / {2}\x1b\[2msrc\x1b\[0m/, "a marked row's directory stays dim");
 });
 
 test("an empty query keeps the order the listing returned and a query still ranks", async () => {
@@ -789,8 +880,8 @@ test("an empty query keeps the order the listing returned and a query still rank
 test("a narrow list pane truncates the name and keeps the badge", async () => {
 	const { view } = await openView({}, [entry("a-very-long-file-name.ts", "new", NOW - 5 * MINUTE), entry("b.ts")]);
 	const lines = view.render(40);
-	const changed = stripAnsi(lines[rowOf(lines, "new")]!);
-	assert.match(changed, /new 5m/);
+	const changed = stripAnsi(lines[rowOf(lines, "U 5m")]!);
+	assert.match(changed, /U 5m/);
 	assert.ok(!changed.includes("a-very-long-file-name.ts"), "the name gives way first");
 	assert.match(changed, /…/, "the name is elided");
 	for (const line of lines) assert.equal(visibleWidth(line), 40, "no row is ragged");
@@ -942,8 +1033,11 @@ test("a preview line wider than the pane wraps onto continuation rows under one 
 	assert.match(previewCell(lines, 0), /^ *1\/3$/, "the position counts file lines, not painted rows");
 
 	const firstRow = previewCell(lines, 1)!;
-	const wrappedRows = [2, 3, 4].map((offset) => previewCell(lines, offset)!);
-	const nextRow = previewCell(lines, 5)!;
+	// How many rows the line needs follows from the preview pane width, which
+	// the list pane's 45% share of the card decides (S36).
+	const wrappedCount = Math.ceil(wide.length / (await previewRoom()));
+	const wrappedRows = Array.from({ length: wrappedCount }, (_, index) => previewCell(lines, 2 + index)!);
+	const nextRow = previewCell(lines, 2 + wrappedCount)!;
 	assert.match(firstRow, /^ *1 first *$/, "the first line keeps its own number");
 	assert.match(wrappedRows[0]!, /^ *2 abcdefghij/, "the wide line's number sits on its first row");
 	const textColumn = wrappedRows[0]!.indexOf("abcdefghij");
@@ -960,7 +1054,7 @@ test("a preview line wider than the pane wraps onto continuation rows under one 
 	for (let index = 0; index < 5; index += 1) small.view.handleInput(CTRL_SHIFT_J);
 	const scrolled = small.view.render(120);
 	assert.match(previewCell(scrolled, 0), /^ *2\/3$/, "a scroll into a wrapped line still reports the file line it belongs to");
-	assert.match(previewCell(scrolled, 2), /^ *3 second/, "scrolling to the last page reaches the end of the file");
+	assert.match(previewCell(scrolled, scrolled.length - 3 - BODY_TOP), /^ *3 second/, "scrolling to the last page reaches the end of the file");
 });
 
 /** The preview's text column in cells, measured from a painted row at `width`. */
@@ -1071,7 +1165,7 @@ test("a coloured line wider than the pane wraps onto continuation rows that each
 	assert.match(previewCell(lines, 0), /^ *1\/3$/, "the position still counts file lines, not painted rows");
 	assert.match(previewCell(lines, 1), /^ *1 first */, "the first line keeps its own number");
 
-	const stripped = [2, 3, 4].map((offset) => previewCell(lines, offset)!);
+	const stripped = Array.from({ length: Math.ceil(wide.length / (await previewRoom())) }, (_, index) => previewCell(lines, 2 + index)!);
 	assert.match(stripped[0]!, /^ *2 abcdefghij/, "the wide line's number sits on its first row");
 	const textColumn = stripped[0]!.indexOf("abcdefghij");
 	for (const [index, row] of stripped.entries()) {
@@ -1083,7 +1177,7 @@ test("a coloured line wider than the pane wraps onto continuation rows that each
 	}
 	const reassembled = stripped.map((row) => row.slice(textColumn).trimEnd()).join("");
 	assert.equal(reassembled, wide, "the whole coloured line is painted across the rows");
-	assert.match(previewCell(lines, 5), /^ *3 second/, "the following file line keeps its own number");
+	assert.match(previewCell(lines, 2 + stripped.length), /^ *3 second/, "the following file line keeps its own number");
 });
 
 test("every highlighting failure paints exactly the plain preview the pane painted before", async () => {
@@ -1255,7 +1349,7 @@ test("the path order keeps every file of a folder and its subfolders together, l
 	assert.equal(countCell(lines), "10 files (0 selected) · path");
 	const painted = paintedList(lines, TREE_BASENAMES);
 	assert.deepEqual(painted, PATH_ORDER, "the whole list is in directory-major alphabetical order");
-	assert.match(listCell(lines, "app.ts"), /app\.ts +src +new 1m/, "a changed row keeps its badge and age");
+	assert.match(listCell(lines, "app.ts"), /app\.ts +src +U 1m/, "a changed row keeps its letter and age");
 	assert.match(listCell(lines, "util.ts"), /^ {3}util\.ts +src\/lib *$/, "an unchanged row still paints neither");
 	for (const line of lines) assert.equal(visibleWidth(line), 120);
 });
