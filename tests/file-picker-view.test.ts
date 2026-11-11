@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
 import { FilePickerView, type FilePickerDeps, type FilePickerTheme } from "../lib/file-picker-view.ts";
 import { FILE_PREVIEW_BINARY_NOTICE, type FileEntry, type FilePreview, type RepositoryEntriesResult } from "../lib/file-index.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -185,23 +185,60 @@ function mouse(lines: readonly string[], x: number, y: number, type: MouseEvent[
 	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false, wheelDelta };
 }
 
-/** The right pane cell at `offset` rows into the body; 0 is the position row. */
-function previewCell(lines: readonly string[], offset: number): string {
-	const row = stripAnsi(lines[BODY_TOP + offset] ?? "");
-	const cells = row.replace(/^│ /, "").replace(/ │$/, "").split(" │ ");
-	return cells[1] ?? "";
+/** The first column of the preview pane, measured from the painted frame. */
+function previewPaneStart(lines: readonly string[]): number {
+	return stripAnsi(lines[BODY_TOP] ?? "").indexOf(" │ ") + 3;
 }
 
-/** The first preview content row, under the position indicator. */
-function previewTop(lines: readonly string[]): string {
-	return previewCell(lines, 1);
+/** The preview pane's painted width, the preview box's own outer columns included. */
+function previewPaneWidth(lines: readonly string[]): number {
+	return visibleWidth(lines[0] ?? "") - 2 - previewPaneStart(lines);
 }
 
-/** The same cell with its escape sequences intact, for role assertions. */
+/** The preview pane's cells at `offset` body rows, box borders included, escapes intact. */
+function rawPreviewPane(lines: readonly string[], offset: number): string {
+	return sliceByColumn(lines[BODY_TOP + offset] ?? "", previewPaneStart(lines), previewPaneWidth(lines));
+}
+
+/** The same cells without their escape sequences. */
+function previewPane(lines: readonly string[], offset: number): string {
+	return stripAnsi(rawPreviewPane(lines, offset));
+}
+
+/** True when the preview paints inside its own rounded box (S38). */
+function previewPaintsBox(lines: readonly string[]): boolean {
+	return previewPane(lines, 0).startsWith("╭");
+}
+
+/** The preview's own content rows: what the scroll keys and the wheel can move through. */
+function previewRowCount(lines: readonly string[]): number {
+	const bodyRows = lines.length - 7;
+	return Math.max(0, bodyRows - (previewPaintsBox(lines) ? 2 : 1));
+}
+
+/** The box's interior at `offset` content rows, escapes intact; 0 is the first content row. */
 function rawPreviewCell(lines: readonly string[], offset: number): string {
-	const row = lines[BODY_TOP + offset] ?? "";
-	const cells = row.replace(/^│ /, "").replace(/ │$/, "").split(" │ ");
-	return cells[1] ?? "";
+	return sliceByColumn(rawPreviewPane(lines, offset + 1), 1, Math.max(0, previewPaneWidth(lines) - 2));
+}
+
+/** The box's interior at `offset` content rows; 0 is the first content row. */
+function previewCell(lines: readonly string[], offset: number): string {
+	return stripAnsi(rawPreviewCell(lines, offset));
+}
+
+/** The first content row, under the box's top border. */
+function previewTop(lines: readonly string[]): string {
+	return previewCell(lines, 0);
+}
+
+/**
+ * The `line/total` indicator itself, wherever the frame paints it: inside the
+ * box's top border when there is one, on the pane's own first row when the body
+ * is too short to box the preview.
+ */
+function positionCell(lines: readonly string[]): string {
+	const pane = previewPane(lines, 0);
+	return (previewPaintsBox(lines) ? pane.replace(/^╭─*/, "").replace(/╮$/, "") : pane).trim();
 }
 
 /** The count row's text: the file and selection counts, then the active order. */
@@ -376,8 +413,11 @@ test("the body is two panes split by one vertical rule, with the list and previe
 	const row = lines.find((line) => line.includes("README.md"));
 	assert.ok(row, "the list shows the repository-relative path");
 	assert.match(row!, /^│ .*README\.md.* │ .*│$/, "the separator sits between the list and its preview");
-	assert.equal((row!.match(/│/g) ?? []).length, 3, "the body row has the two card borders plus one pane separator");
-	assert.match(previewTop(lines), /^1 preview of README\.md/, "the preview paints its first line, numbered, beside the list");
+	assert.equal((row!.match(/│/g) ?? []).length, 3, "the body's top border row has the two card borders plus one pane separator");
+	const contentRow = lines.find((line) => line.includes("1 preview of README.md"));
+	assert.ok(contentRow, "the preview paints its first line beside the list");
+	assert.equal((contentRow!.match(/│/g) ?? []).length, 5, "a content row has the card borders, the pane separator and the preview box's two border columns");
+	assert.match(contentRow!, / │ │1 preview of README\.md/, "the preview's first line is numbered and boxed");
 });
 
 test("the list pane takes 45% of the card content with a 64-column cap at a narrow, a middle and a wide terminal, and a click still lands on the row it looks like", async () => {
@@ -535,14 +575,14 @@ test("ctrl+shift+j/k and pageUp/pageDown scroll the preview and clamp to its con
 	view.handleInput(CTRL_SHIFT_K);
 	assert.match(previewTop(view.render(120)), /line 2/);
 	view.handleInput(PAGE_DOWN);
-	assert.match(previewTop(view.render(120)), /line 7/, "a page moves one preview height");
+	assert.match(previewTop(view.render(120)), /line 6/, "a page moves one preview height");
 	view.handleInput(PAGE_UP);
 	assert.match(previewTop(view.render(120)), /line 2/);
 	for (let index = 0; index < 100; index += 1) view.handleInput(CTRL_SHIFT_K);
 	assert.match(previewTop(view.render(120)), /line 0/, "scrolling clamps at the top");
 	for (let index = 0; index < 100; index += 1) view.handleInput(CTRL_SHIFT_J);
 	const clamped = view.render(120);
-	assert.match(previewTop(clamped), /line 55/, "scrolling clamps at the last full page");
+	assert.match(previewTop(clamped), /line 56/, "scrolling clamps at the last full page");
 	assert.ok(bodyText(clamped).includes("line 59"));
 	const settled = view.render(120).join("\n");
 	view.handleInput(CTRL_SHIFT_J);
@@ -574,7 +614,7 @@ test("the wheel over the list moves the selection and the wheel over the preview
 
 	for (let index = 0; index < 100; index += 1) view.handleMouse(mouse(lines, previewX, BODY_TOP, "wheel", "none", 1));
 	lines = view.render(120);
-	assert.match(previewTop(lines), /line 55/);
+	assert.match(previewTop(lines), /line 56/);
 	assert.deepEqual(view.handleMouse(mouse(lines, previewX, BODY_TOP, "wheel", "none", 1)), { handled: true, render: false }, "the preview wheel clamps at the end");
 });
 
@@ -909,13 +949,15 @@ test("the preview gutter numbers every visible row with its real file line numbe
 	const { view } = await openView({ rows: 16, loadPreview: async () => preview(long) });
 	let lines = view.render(120);
 	assert.match(previewTop(lines), /^ 1 entry 0 +$/, "the first content row is file line 1");
-	for (let index = 1; index < 5; index += 1) {
-		assert.match(previewCell(lines, 1 + index), new RegExp(`^ ${index + 1} entry ${index} `), "every visible row carries its own line number");
+	const rows = previewRowCount(lines);
+	assert.equal(rows, 4, "the box leaves four content rows at this height");
+	for (let index = 1; index < rows; index += 1) {
+		assert.match(previewCell(lines, index), new RegExp(`^ ${index + 1} entry ${index} `), "every visible row carries its own line number");
 	}
 	for (let index = 0; index < 10; index += 1) view.handleInput(CTRL_SHIFT_J);
 	lines = view.render(120);
-	for (let index = 0; index < 5; index += 1) {
-		assert.match(previewCell(lines, 1 + index), new RegExp(`^${11 + index} entry ${10 + index} `), "the gutter keeps the real line number after scrolling");
+	for (let index = 0; index < rows; index += 1) {
+		assert.match(previewCell(lines, index), new RegExp(`^${11 + index} entry ${10 + index} `), "the gutter keeps the real line number after scrolling");
 	}
 });
 
@@ -929,28 +971,227 @@ test("the preview gutter and position indicator use the theme roles", async () =
 	};
 	const { view } = await openView({ theme: roleTheme, loadPreview: async () => preview(["alpha", "beta"]) });
 	const lines = view.render(120);
-	assert.match(rawPreviewCell(lines, 0), /\x1b\[90m1\/2\x1b\[0m/, "the position uses the muted role");
-	assert.match(rawPreviewCell(lines, 1), /\x1b\[2m1\x1b\[0m alpha/, "the gutter number uses the dim role");
-	assert.match(rawPreviewCell(lines, 2), /\x1b\[2m2\x1b\[0m beta/);
+	assert.match(rawPreviewPane(lines, 0), /\x1b\[90m1\/2\x1b\[0m/, "the position uses the muted role");
+	assert.match(rawPreviewCell(lines, 0), /\x1b\[2m1\x1b\[0m alpha/, "the gutter number uses the dim role");
+	assert.match(rawPreviewCell(lines, 1), /\x1b\[2m2\x1b\[0m beta/);
 });
 
-test("the preview shows the top visible line over the total at its top-right, adding + only when the reader truncated", async () => {
+test("the preview shows the top visible line over the total in its top border's right end, adding + only when the reader truncated", async () => {
 	const long = Array.from({ length: 60 }, (_, index) => `line ${index}`);
 	const whole = await openView({ rows: 12, loadPreview: async () => preview(long) });
 	let lines = whole.view.render(120);
-	assert.match(previewCell(lines, 0), /^ *1\/60$/, "the indicator starts at line 1 of the 60 known lines");
+	assert.match(positionCell(lines), /^1\/60$/, "the indicator starts at line 1 of the 60 known lines, in the box's top border");
 	for (let index = 0; index < 10; index += 1) whole.view.handleInput(CTRL_SHIFT_J);
 	lines = whole.view.render(120);
-	assert.match(previewCell(lines, 0), /^ *11\/60$/, "the indicator follows the top visible line");
+	assert.match(positionCell(lines), /^11\/60$/, "the indicator follows the top visible line");
 
 	const truncated = await openView({ rows: 12, loadPreview: async () => preview(long, true) });
 	lines = truncated.view.render(120);
-	assert.match(previewCell(lines, 0), /^ *1\/60\+$/, "a truncated preview never claims the real total");
+	assert.match(positionCell(lines), /^1\/60\+$/, "a truncated preview never claims the real total");
 	for (let index = 0; index < 5; index += 1) truncated.view.handleInput(CTRL_SHIFT_J);
-	assert.match(previewCell(truncated.view.render(120), 0), /^ *6\/60\+$/, "the + survives scrolling");
+	assert.match(positionCell(truncated.view.render(120)), /^6\/60\+$/, "the + survives scrolling");
 
 	const binary = await openView({ loadPreview: async () => ({ kind: "binary", message: "unused" }) });
-	assert.doesNotMatch(previewCell(binary.view.render(120), 0), /\d+\/\d+/, "a binary preview has no line position to claim");
+	assert.doesNotMatch(previewPane(binary.view.render(120), 0), /\d+\/\d+/, "a binary preview has no line position to claim");
+});
+
+// The preview's own box (S38): rounded corners and border columns in the card's
+// border tone, the position indicator embedded in the top border, and the
+// gutter, the text and the wrap all inside the frame.
+const BORDER_TONE = "\x1b[94m";
+
+const boxTheme: FilePickerTheme = {
+	fg(color: string, text: string) {
+		if (color === "border") return `${BORDER_TONE}${text}${ROLE_END}`;
+		if (color === "muted") return `${LABEL_ROLE}${text}${ROLE_END}`;
+		if (color === "dim") return `${DIM_TONE}${text}${ROLE_END}`;
+		return text;
+	},
+};
+
+test("the preview sits in its own rounded box in the border tone, with the position in its top border", async () => {
+	const { view } = await openView({ theme: boxTheme, loadPreview: async () => preview(["alpha", "beta"]) });
+	const lines = view.render(120);
+	for (const line of lines) assert.equal(visibleWidth(line), 120, "the box never makes a row ragged");
+	const paneStart = previewPaneStart(lines);
+	const paneWidth = previewPaneWidth(lines);
+	const interiorWidth = paneWidth - 2;
+	const bodyRows = lines.length - 7;
+	assert.equal(bodyRows, 10, "the box spends two of the ten body rows on its borders");
+
+	// The four corners land on the pane's own columns, and the card's frame is untouched.
+	const top = previewPane(lines, 0);
+	const bottom = previewPane(lines, bodyRows - 1);
+	assert.equal(top.length, paneWidth, "the top border spans exactly the preview pane");
+	assert.equal(top[0], "╭", "the top-left corner sits in the pane's first column");
+	assert.equal(top[paneWidth - 1], "╮", "the top-right corner closes the box at the pane's last column");
+	assert.equal(bottom[0], "╰", "the bottom border starts with its own corner");
+	assert.equal(bottom[paneWidth - 1], "╯");
+	assert.equal(stripAnsi(lines[BODY_TOP]!).slice(paneStart - 3, paneStart), " │ ", "the pane separator sits immediately left of the box's first column");
+	assert.equal(stripAnsi(lines[BODY_TOP]!)[0], "│", "the card's own left border is untouched");
+	assert.equal(stripAnsi(lines[BODY_TOP]!).at(-1), "│", "the card's own right border is untouched");
+	for (let offset = 1; offset < bodyRows - 1; offset += 1) {
+		const row = previewPane(lines, offset);
+		assert.equal(row[0], "│", `the left border column runs down body row ${offset}`);
+		assert.equal(row[paneWidth - 1], "│", `the right border column runs down body row ${offset}`);
+	}
+
+	// Every border cell paints in the theme's border tone.
+	const dashes = interiorWidth - 1 - "1/2".length;
+	const rawTop = rawPreviewPane(lines, 0);
+	assert.ok(rawTop.includes(`${BORDER_TONE}╭`), "the top-left corner starts a border-tone run");
+	assert.ok(rawTop.includes(`${BORDER_TONE}${"─".repeat(dashes)}`), "the top border's dashes are one border-tone run of the interior the indicator leaves");
+	assert.ok(rawTop.includes(` ${LABEL_ROLE}1/2${ROLE_END}`), "the embedded indicator paints in the muted role inside the border");
+	assert.ok(rawTop.includes(`${BORDER_TONE}╮`), "the top-right corner is a border cell too");
+	assert.ok(!rawTop.includes(`${LABEL_ROLE}╭`) && !rawTop.includes(`${LABEL_ROLE}╮`), "no corner takes the label tone");
+	const rawBottom = rawPreviewPane(lines, bodyRows - 1);
+	assert.ok(rawBottom.includes(`${BORDER_TONE}╰`), "the bottom-left corner is a border cell");
+	assert.ok(rawBottom.includes(`${BORDER_TONE}${"─".repeat(interiorWidth)}`), "the bottom border is one continuous border-tone run");
+	assert.ok(rawBottom.includes(`${BORDER_TONE}╯`), "the bottom-right corner is a border cell");
+	assert.equal(rawPreviewPane(lines, 1).split(`${BORDER_TONE}│`).length - 1, 2, "both border columns of a content row paint in the border tone");
+
+	// The position moved out of the content and into the top border's right end.
+	assert.equal(positionCell(lines), "1/2", "the position sits in the top border");
+	assert.equal(top.indexOf("1/2") + "1/2".length, paneWidth - 1, "the indicator ends against the top-right corner");
+	for (let offset = 0; offset < previewRowCount(lines); offset += 1) {
+		assert.doesNotMatch(previewCell(lines, offset), /\d+\/\d+/, "no content row carries the position any more");
+	}
+
+	// The gutter numbers, the file's text and the wrap all live inside the box.
+	assert.equal(previewCell(lines, 0).slice(0, 1), "1", "the gutter number sits in the first interior cell");
+	assert.equal(previewCell(lines, 0).slice(2, 7), "alpha", "the text starts two cells in: the gutter, then its gap");
+	assert.equal(previewCell(lines, 1).slice(2, 6), "beta");
+	for (const offset of [0, 1]) {
+		const row = previewPane(lines, offset + 1);
+		assert.ok(row.startsWith("│") && row.endsWith("│"), "every content row is framed by the box's border columns");
+		assert.ok(!row.includes("╭") && !row.includes("╮"), "only the top border carries corners");
+	}
+});
+
+test("the box's two border columns come out of the wrap width, for a plain line and for a coloured line", async () => {
+	// 58 cells fill the pane's own text column in one row but need two once the
+	// box's border columns are taken out, so the painted rows prove the width.
+	const wide = "x".repeat(58);
+	const variants: Partial<FilePickerDeps>[] = [
+		{},
+		{ languageForPath: () => "typescript", highlight: (code) => code.split("\n").map((line) => `${CODE_TONE}${line}${CODE_RESET}`) },
+	];
+	for (const variant of variants) {
+		const { view } = await openView({ rows: 20, loadPreview: async () => preview([wide, "next"]), ...variant }, [entry("src/app.ts")]);
+		const lines = view.render(120);
+		assert.equal(previewPaintsBox(lines), true, "a boxed pane at this height");
+		const paneWidth = previewPaneWidth(lines);
+		const interiorWidth = paneWidth - 2;
+		const gutterWidth = 1;
+		const textWidth = interiorWidth - gutterWidth - 1;
+		const first = previewCell(lines, 0);
+		const continuation = previewCell(lines, 1).trimEnd();
+		assert.equal(first.indexOf("x"), gutterWidth + 1, "the text starts after the gutter and its gap, inside the frame");
+		assert.equal(first.trimEnd().length - first.indexOf("x"), textWidth, "a row fills exactly the box's interior text column");
+		assert.ok(textWidth < paneWidth - gutterWidth - 1, "the wrap is narrower than the pane by the box's two border columns");
+		assert.equal(continuation.search(/\S/), gutterWidth + 1, "the continuation row keeps the same text column");
+		assert.equal(continuation.slice(gutterWidth + 1), "x".repeat(wide.length - textWidth), "the tail continues inside the box");
+		assert.match(previewCell(lines, 2), /^ *2 next/, "the next file line keeps its own row");
+		for (const line of lines) assert.equal(visibleWidth(line), 120, "a wrapped row of the boxed pane is never ragged");
+	}
+});
+
+test("a click on the box's border or inside it is absorbed, and the wheel inside the box scrolls the preview", async () => {
+	const long = Array.from({ length: 60 }, (_, index) => `line ${index}`);
+	const { view, calls } = await openView({ rows: 16, loadPreview: async () => preview(long) }, [entry("a.ts"), entry("b.ts")]);
+	let lines = view.render(120);
+	assert.equal(previewPaintsBox(lines), true);
+	const paneStart = previewPaneStart(lines);
+	const paneWidth = previewPaneWidth(lines);
+	const bodyRows = lines.length - 7;
+	const firstListRow = rowOf(lines, "a.ts");
+
+	for (const y of [BODY_TOP, BODY_TOP + 2, BODY_TOP + bodyRows - 1]) {
+		for (const x of [paneStart, paneStart + 3, paneStart + paneWidth - 1]) {
+			assert.deepEqual(view.handleMouse(mouse(lines, x, y)), { handled: true, render: false }, `a click at ${x},${y} is absorbed by the preview`);
+		}
+	}
+	const afterClicks = view.render(120);
+	assert.equal(afterClicks.join("\n"), lines.join("\n"), "a box click never repaints or breaks the panel");
+	assert.match(selectedRow(afterClicks), /a\.ts/, "a box click never selects a list row");
+	assert.equal(rowOf(afterClicks, "▸"), firstListRow);
+	assert.deepEqual(calls.insert, []);
+	assert.equal(calls.close, 0);
+
+	// A list row click still lands on the row painted under the pointer.
+	const target = rowOf(lines, "b.ts");
+	assert.deepEqual(view.handleMouse(mouse(lines, 3, target)), { handled: true, render: true });
+	lines = view.render(120);
+	assert.match(selectedRow(lines), /b\.ts/, "a list click is unaffected by the box");
+	await settle();
+	lines = view.render(120);
+	assert.match(previewTop(lines), /line 0/, "the clicked file's preview starts at its top inside the box");
+
+	// The wheel inside the frame scrolls the preview and moves no selection.
+	assert.deepEqual(view.handleMouse(mouse(lines, paneStart + 3, BODY_TOP + 2, "wheel", "none", 1)), { handled: true, render: true });
+	const scrolled = view.render(120);
+	assert.match(previewTop(scrolled), /line 1/, "the wheel inside the box scrolls the preview");
+	assert.match(selectedRow(scrolled), /b\.ts/, "the preview wheel never moves the selection");
+
+	// Hover inside the box leaves every list row alone.
+	assert.notEqual(view.handleMouse(mouse(scrolled, paneStart + 3, BODY_TOP + 2, "move", "none"))?.render, true, "hovering inside the box never lights a list row");
+});
+
+test("a body too short for the box plus one content row paints the unbordered preview it painted before", async () => {
+	const { view } = await openView({ rows: 9, loadPreview: async () => preview(["alpha", "beta"]) });
+	const lines = view.render(120);
+	assert.equal(lines.length, 9, "the smallest card fills the rows it is given");
+	assert.equal(lines.length - 7, 2, "the smallest card has two body rows");
+	assert.equal(previewPaintsBox(lines), false, "no box when the body cannot hold one plus a content row");
+	for (let offset = 0; offset < 2; offset += 1) {
+		for (const glyph of ["╭", "╮", "╰", "╯", "─"]) {
+			assert.ok(!previewPane(lines, offset).includes(glyph), `no box glyph is painted on body row ${offset}`);
+		}
+	}
+	// Exactly the shape the pane painted before the box existed: the position row
+	// at the pane's right, then the content rows.
+	assert.equal(positionCell(lines), "1/2", "the position keeps its own row at the pane's right");
+	assert.match(previewPane(lines, 0), /^ +1\/2 *$/, "the indicator is right-aligned in the pane, not in a border");
+	assert.match(previewPane(lines, 1), /^1 alpha +$/, "the content row sits under the indicator");
+	assert.equal(previewRowCount(lines), 1, "the body still has one usable content row");
+	assert.match(selectedRow(lines), /README\.md/, "the list pane is untouched by the degradation");
+	for (const line of lines) assert.equal(visibleWidth(line), 120);
+
+	// One more body row and the box fits, with exactly one content row inside it.
+	const tight = await openView({ rows: 12, loadPreview: async () => preview(["alpha", "beta"]) });
+	const tightLines = tight.view.render(120);
+	assert.equal(tightLines.length, 10);
+	assert.equal(previewPaintsBox(tightLines), true, "the box paints as soon as the body can hold it plus one content row");
+	assert.equal(previewRowCount(tightLines), 1, "the box leaves exactly one content row at the smallest boxed height");
+	assert.equal(previewCell(tightLines, 0).trim(), "1 alpha");
+	assert.equal(positionCell(tightLines), "1/2", "the indicator is in the top border at the smallest boxed height");
+});
+
+test("the preview's notices paint inside the box when there is one", async () => {
+	const binary = await openView({ loadPreview: async () => ({ kind: "binary", message: "unused" }) });
+	const binaryLines = binary.view.render(120);
+	assert.equal(previewPaintsBox(binaryLines), true);
+	assert.equal(previewCell(binaryLines, 0).trim(), FILE_PREVIEW_BINARY_NOTICE, "the binary notice paints inside the box");
+	assert.equal(positionCell(binaryLines), "", "a file with no lines shows no position in the top border");
+	assert.match(previewPane(binaryLines, 0), /^╭─+╮$/, "the top border is a whole frame with no indicator");
+
+	const truncated = await openView({ loadPreview: async () => preview(["one", "two"], true) });
+	const truncatedLines = truncated.view.render(120);
+	assert.equal(previewCell(truncatedLines, 2).trim(), "… preview truncated.", "the truncation notice paints inside the box");
+
+	const failing = await openView({ loadPreview: async () => ({ kind: "error", message: "Cannot read a.ts (EACCES)." }) });
+	assert.equal(previewCell(failing.view.render(120), 0).trim(), "Cannot read a.ts (EACCES).", "an error paints inside the box");
+
+	let resolvePreview: (value: FilePreview) => void = () => {};
+	const pending = await openView({ loadPreview: () => new Promise<FilePreview>((resolve) => { resolvePreview = resolve; }) }, [entry("a.ts")]);
+	const loadingLines = pending.view.render(120);
+	assert.equal(previewPaintsBox(loadingLines), true);
+	assert.equal(previewCell(loadingLines, 0).trim(), "Loading preview …", "the loading notice paints inside the box");
+	resolvePreview(preview(["one"]));
+	await settle();
+
+	const empty = await openView({ listEntries: async () => entries([]) });
+	assert.ok(bodyText(empty.view.render(120)).includes("No files in this repository."), "an empty repository keeps its own line");
 });
 
 test("home and end jump the selection to the first and last file for every terminal encoding, and stay out of the footer", async () => {
@@ -979,16 +1220,16 @@ test("ctrl+home and ctrl+end jump the preview to its first line and its last pag
 	for (const sequence of CTRL_END_SEQUENCES) {
 		view.handleInput(sequence);
 		const lines = view.render(120);
-		assert.match(previewCell(lines, 0), /^ *56\/60$/, `ctrl+end shows the last page for ${JSON.stringify(sequence)}`);
-		assert.match(previewCell(lines, 5), /60 line 59/, "the end of the file is on screen");
+		assert.match(positionCell(lines), /^57\/60$/, `ctrl+end shows the last page for ${JSON.stringify(sequence)}`);
+		assert.match(previewCell(lines, previewRowCount(lines) - 1), /60 line 59/, "the end of the file is on screen");
 		view.handleInput(CTRL_HOME_SEQUENCES[0]!);
 	}
 	for (const sequence of CTRL_HOME_SEQUENCES) {
 		view.handleInput(CTRL_END_SEQUENCES[0]!);
 		view.handleInput(sequence);
 		const lines = view.render(120);
-		assert.match(previewCell(lines, 0), /^ *1\/60$/, `ctrl+home shows the first line for ${JSON.stringify(sequence)}`);
-		assert.match(previewCell(lines, 1), /1 line 0/, "the top of the file is on screen");
+		assert.match(positionCell(lines), /^1\/60$/, `ctrl+home shows the first line for ${JSON.stringify(sequence)}`);
+		assert.match(previewCell(lines, 0), /1 line 0/, "the top of the file is on screen");
 	}
 	assert.match(selectedRow(view.render(120)), /README\.md/, "the preview jumps never move the selection");
 	assert.deepEqual(calls.insert, []);
@@ -1025,19 +1266,20 @@ test("the esc hint and every footer key token paint in the theme key colour, wit
 	assert.equal(narrow.length, lines.length, "the role-split footer never adds a row");
 });
 
-test("a preview line wider than the pane wraps onto continuation rows under one gutter number, and the next line keeps its own", async () => {
+test("a preview line wider than the box's interior wraps onto continuation rows under one gutter number, and the next line keeps its own", async () => {
 	const wide = "abcdefghij".repeat(18);
 	const { view } = await openView({ rows: 20, loadPreview: async () => preview(["first", wide, "second"]) });
 	const lines = view.render(120);
 	for (const line of lines) assert.equal(visibleWidth(line), 120, "a wrapped row is never ragged");
-	assert.match(previewCell(lines, 0), /^ *1\/3$/, "the position counts file lines, not painted rows");
+	assert.match(positionCell(lines), /^1\/3$/, "the position counts file lines, not painted rows");
 
-	const firstRow = previewCell(lines, 1)!;
-	// How many rows the line needs follows from the preview pane width, which
-	// the list pane's 45% share of the card decides (S36).
+	const firstRow = previewCell(lines, 0)!;
+	// How many rows the line needs follows from the wrap width inside the box,
+	// which the pane width, the box's two border columns and the list pane's 45%
+	// share of the card decide (S30, S36, S38).
 	const wrappedCount = Math.ceil(wide.length / (await previewRoom()));
-	const wrappedRows = Array.from({ length: wrappedCount }, (_, index) => previewCell(lines, 2 + index)!);
-	const nextRow = previewCell(lines, 2 + wrappedCount)!;
+	const wrappedRows = Array.from({ length: wrappedCount }, (_, index) => previewCell(lines, 1 + index)!);
+	const nextRow = previewCell(lines, 1 + wrappedCount)!;
 	assert.match(firstRow, /^ *1 first *$/, "the first line keeps its own number");
 	assert.match(wrappedRows[0]!, /^ *2 abcdefghij/, "the wide line's number sits on its first row");
 	const textColumn = wrappedRows[0]!.indexOf("abcdefghij");
@@ -1050,17 +1292,17 @@ test("a preview line wider than the pane wraps onto continuation rows under one 
 	assert.equal(reassembled, wide, "the whole line is painted across the rows");
 	assert.match(nextRow, /^ *3 second/, "the following file line keeps its own number");
 
-	const small = await openView({ rows: 12, loadPreview: async () => preview(["first", wide, "second"]) });
-	for (let index = 0; index < 5; index += 1) small.view.handleInput(CTRL_SHIFT_J);
-	const scrolled = small.view.render(120);
-	assert.match(previewCell(scrolled, 0), /^ *2\/3$/, "a scroll into a wrapped line still reports the file line it belongs to");
-	assert.match(previewCell(scrolled, scrolled.length - 3 - BODY_TOP), /^ *3 second/, "scrolling to the last page reaches the end of the file");
+	const scrolledView = await openView({ rows: 16, loadPreview: async () => preview(["first", wide, "second"]) });
+	for (let index = 0; index < 5; index += 1) scrolledView.view.handleInput(CTRL_SHIFT_J);
+	const scrolled = scrolledView.view.render(120);
+	assert.match(positionCell(scrolled), /^2\/3$/, "a scroll into a wrapped line still reports the file line it belongs to");
+	assert.match(previewCell(scrolled, previewRowCount(scrolled) - 1), /^ *3 second/, "scrolling to the last page reaches the end of the file");
 });
 
-/** The preview's text column in cells, measured from a painted row at `width`. */
+/** The text column inside the box, in cells, measured from a painted row at `width`. */
 async function previewRoom(width = 120): Promise<number> {
 	const { view } = await openView({ rows: 20, loadPreview: async () => preview(["x".repeat(400)]) });
-	const painted = previewCell(view.render(width), 1) ?? "";
+	const painted = previewCell(view.render(width), 0) ?? "";
 	return painted.trimEnd().length - painted.indexOf("x");
 }
 
@@ -1073,16 +1315,16 @@ test("a double-width grapheme that straddles a wrap boundary starts the next row
 	const { view } = await openView({ rows: 20, loadPreview: async () => preview(["first", line, "second"]) });
 	const lines = view.render(120);
 	for (const painted of lines) assert.equal(visibleWidth(painted), 120, "a wrapped frame of wide graphemes is still exact");
-	assert.match(previewCell(lines, 0), /^ *1\/3$/, "the position still counts file lines");
+	assert.match(positionCell(lines), /^1\/3$/, "the position still counts file lines");
 
-	const wrapped = [2, 3].map((offset) => previewCell(lines, offset)!);
+	const wrapped = [1, 2].map((offset) => previewCell(lines, offset)!);
 	const column = wrapped[0]!.indexOf("a");
 	assert.equal(wrapped[0]!.slice(column).trimEnd(), prefix, "the first row stops before the grapheme it cannot fit");
 	assert.equal(wrapped[1]!.slice(column).trim(), "漢字", "both graphemes of the broken boundary are painted on the next row");
 	const reassembled = wrapped.map((row) => row.slice(column).trimEnd()).join("");
 	assert.equal(reassembled, line, "the whole line is painted, with no CJK grapheme dropped");
 	assert.equal(wrapped[1]!.slice(0, column).trim(), "", "the continuation row leaves the gutter blank");
-	assert.match(previewCell(lines, 4), /^ *3 second/, "the next file line keeps its own row");
+	assert.match(previewCell(lines, 3), /^ *3 second/, "the next file line keeps its own row");
 });
 
 test("an emoji that straddles a wrap boundary is painted whole on the next row, including a joined sequence", async () => {
@@ -1093,9 +1335,9 @@ test("an emoji that straddles a wrap boundary is painted whole on the next row, 
 	const { view } = await openView({ rows: 20, loadPreview: async () => preview([line]) });
 	const lines = view.render(120);
 	for (const painted of lines) assert.equal(visibleWidth(painted), 120, "the wrapped frame of emoji is still exact");
-	assert.match(previewCell(lines, 0), /^ *1\/1$/, "the position still counts the file's single line");
+	assert.match(positionCell(lines), /^1\/1$/, "the position still counts the file's single line");
 
-	const wrapped = [1, 2].map((offset) => previewCell(lines, offset)!);
+	const wrapped = [0, 1].map((offset) => previewCell(lines, offset)!);
 	const column = wrapped[0]!.indexOf("b");
 	assert.equal(wrapped[0]!.slice(column).trimEnd(), prefix, "the first row stops before the emoji it cannot fit");
 	assert.equal(wrapped[1]!.slice(column).trim(), `${family}c`, "the joined emoji sequence is painted intact and is never split");
@@ -1103,16 +1345,17 @@ test("an emoji that straddles a wrap boundary is painted whole on the next row, 
 	assert.equal(reassembled, line, "the whole line is painted, with the emoji present exactly once");
 });
 
-test("a preview pane narrower than a double-width grapheme paints it on its own row instead of dropping it", async () => {
-	// At 14 columns the preview pane is three cells wide: a gutter cell, the
-	// gap and a one-cell text column that can never hold a CJK grapheme.
+test("a box interior narrower than a double-width grapheme paints it on its own row instead of dropping it", async () => {
+	// At 20 columns the preview pane is six cells wide and the box's interior is
+	// four: a gutter cell, the gap and a two-cell text column, so each CJK
+	// grapheme takes a whole row of its own instead of being split or dropped.
 	const { view } = await openView({ rows: 20, loadPreview: async () => preview(["漢字"]) });
-	const lines = view.render(14);
-	for (const painted of lines) assert.equal(visibleWidth(painted), 14, "the narrow card is still exact");
-	assert.match(previewCell(lines, 0), /^1\/1$/, "the position still counts the file's single line");
-	assert.equal(previewCell(lines, 1), "1漢", "the first grapheme is painted beside its line number, one row for it");
-	assert.equal(previewCell(lines, 2), " 字", "the second grapheme gets its own row rather than being lost");
-	assert.equal(previewCell(lines, 3), "   ", "the row count matches what is painted, so no extra row is left over");
+	const lines = view.render(20);
+	for (const painted of lines) assert.equal(visibleWidth(painted), 20, "the narrow card is still exact");
+	assert.match(positionCell(lines), /^1\/1$/, "the position still counts the file's single line");
+	assert.equal(previewCell(lines, 0), "1 漢", "the first grapheme is painted beside its line number, one row for it");
+	assert.equal(previewCell(lines, 1), "  字", "the second grapheme gets its own row rather than being lost");
+	assert.equal(previewCell(lines, 2), "    ", "the row count matches what is painted, so no extra row is left over");
 });
 
 // The injected highlighter (S39): the view never calls Pi, so these tests fake
@@ -1145,14 +1388,14 @@ test("the preview paints the file's syntax through the injected highlighter and 
 	}, [entry("src/app.ts")]);
 	const lines = view.render(120);
 	assert.deepEqual(highlighted, [{ code: "const answer = 42;\n// done", lang: "typescript" }], "the already-bounded preview is highlighted with the language of the previewed path");
-	assert.equal(rawPreviewCell(lines, 1).trimEnd(), `${DIM_TONE}1${ROLE_END} ${CODE_TONE}const${CODE_RESET} answer = 42;${CELL_RESET}`, "the file line keeps the highlighter's colour and its number keeps the dim tone");
-	assert.equal(rawPreviewCell(lines, 2).trimEnd(), `${DIM_TONE}2${ROLE_END} ${CODE_TONE}// done${CODE_RESET}${CELL_RESET}`, "the gutter is painted after highlighting, never through it");
-	assert.match(previewCell(lines, 1), /^1 const answer = 42; *$/, "the painted text is the file's own text");
-	assert.match(previewCell(lines, 0), /^ *1\/2\+$/, "the position indicator still counts the file's lines");
-	assert.equal(previewCell(lines, 3).trim(), "… preview truncated.", "the truncation notice is a notice, not highlighted code");
+	assert.equal(rawPreviewCell(lines, 0).trimEnd(), `${DIM_TONE}1${ROLE_END} ${CODE_TONE}const${CODE_RESET} answer = 42;${CELL_RESET}`, "the file line keeps the highlighter's colour and its number keeps the dim tone");
+	assert.equal(rawPreviewCell(lines, 1).trimEnd(), `${DIM_TONE}2${ROLE_END} ${CODE_TONE}// done${CODE_RESET}${CELL_RESET}`, "the gutter is painted after highlighting, never through it");
+	assert.match(previewCell(lines, 0), /^1 const answer = 42; *$/, "the painted text is the file's own text");
+	assert.match(positionCell(lines), /^1\/2\+$/, "the position indicator still counts the file's lines");
+	assert.equal(previewCell(lines, 2).trim(), "… preview truncated.", "the truncation notice is a notice, not highlighted code");
 });
 
-test("a coloured line wider than the pane wraps onto continuation rows that each keep their fragment's colour", async () => {
+test("a coloured line wider than the box's interior wraps onto continuation rows that each keep their fragment's colour", async () => {
 	const wide = "abcdefghij".repeat(18);
 	const { view } = await openView({
 		rows: 20,
@@ -1162,22 +1405,24 @@ test("a coloured line wider than the pane wraps onto continuation rows that each
 	}, [entry("src/app.ts")]);
 	const lines = view.render(120);
 	for (const painted of lines) assert.equal(visibleWidth(painted), 120, "a wrapped coloured row is never ragged");
-	assert.match(previewCell(lines, 0), /^ *1\/3$/, "the position still counts file lines, not painted rows");
-	assert.match(previewCell(lines, 1), /^ *1 first */, "the first line keeps its own number");
+	assert.match(positionCell(lines), /^1\/3$/, "the position still counts file lines, not painted rows");
+	assert.match(previewCell(lines, 0), /^ *1 first */, "the first line keeps its own number");
 
-	const stripped = Array.from({ length: Math.ceil(wide.length / (await previewRoom())) }, (_, index) => previewCell(lines, 2 + index)!);
+	const stripped = Array.from({ length: Math.ceil(wide.length / (await previewRoom())) }, (_, index) => previewCell(lines, 1 + index)!);
 	assert.match(stripped[0]!, /^ *2 abcdefghij/, "the wide line's number sits on its first row");
 	const textColumn = stripped[0]!.indexOf("abcdefghij");
 	for (const [index, row] of stripped.entries()) {
-		const raw = rawPreviewCell(lines, 2 + index)!;
+		const raw = rawPreviewCell(lines, 1 + index)!;
+		const paintedRow = lines[BODY_TOP + 1 + index]!;
 		assert.match(raw, new RegExp(`\\x1b\\[36m`), "a continuation row keeps the colour of its fragment");
-		assert.ok(raw.trimEnd().endsWith(CELL_RESET), "the colour run ends with its row instead of bleeding into the border");
+		assert.ok(paintedRow.indexOf(CELL_RESET) > paintedRow.indexOf(CODE_TONE) && paintedRow.includes(CELL_RESET), "the colour run is closed with the row's own reset");
+		assert.ok(paintedRow.indexOf(CELL_RESET) < paintedRow.lastIndexOf("│"), "the colour run ends inside the box's interior instead of bleeding into its border");
 		assert.equal(raw.slice(0, raw.indexOf(CODE_TONE)).trim(), index === 0 ? "2" : "", "only the first row carries the line number; a continuation row leaves the gutter blank");
 		assert.doesNotMatch(row, /…/, "a wrapped coloured line is never truncated with an ellipsis");
 	}
 	const reassembled = stripped.map((row) => row.slice(textColumn).trimEnd()).join("");
 	assert.equal(reassembled, wide, "the whole coloured line is painted across the rows");
-	assert.match(previewCell(lines, 2 + stripped.length), /^ *3 second/, "the following file line keeps its own number");
+	assert.match(previewCell(lines, 1 + stripped.length), /^ *3 second/, "the following file line keeps its own number");
 });
 
 test("every highlighting failure paints exactly the plain preview the pane painted before", async () => {

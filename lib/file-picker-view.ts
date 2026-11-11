@@ -71,6 +71,20 @@ const SEARCH_PROMPT = "›";
 const SEARCH_PLACEHOLDER = "Search";
 // One space between the preview's line-number gutter and its text.
 const PREVIEW_GUTTER_GAP = 1;
+// The preview's own rounded box (S38): its corners, its horizontal and vertical
+// border cells, the two border columns and the top and bottom border rows.
+const BOX_TOP_LEFT = "╭";
+const BOX_TOP_RIGHT = "╮";
+const BOX_BOTTOM_LEFT = "╰";
+const BOX_BOTTOM_RIGHT = "╯";
+const BOX_HORIZONTAL = "─";
+const BOX_VERTICAL = "│";
+const BOX_COLUMNS = 2;
+const BOX_ROWS = 2;
+// The box paints only when the body can hold its two border rows plus one
+// usable content row, and when one cell is left between its border columns.
+const BOX_MIN_BODY_ROWS = BOX_ROWS + 1;
+const BOX_MIN_WIDTH = BOX_COLUMNS + 1;
 const SEPARATOR_WIDTH = SEPARATOR.length;
 const LOADING_FILES = "Loading files …";
 const LOADING_PREVIEW = "Loading preview …";
@@ -124,6 +138,14 @@ interface PaneLayout {
 	listWidth: number;
 	previewStart: number;
 	previewWidth: number;
+	/** True when the preview paints inside its own rounded box (S38). */
+	boxed: boolean;
+	/** The box's usable columns between its two border cells; the pane's own width when unbordered. */
+	previewInteriorWidth: number;
+	/** The preview's own content rows inside whatever frame is painted. */
+	previewContentRows: number;
+	/** The text column left for a line once a gutter of `gutterWidth` sits inside the frame. */
+	wrapWidth(gutterWidth: number): number;
 }
 
 interface PreviewLine {
@@ -136,10 +158,11 @@ interface PreviewLine {
 }
 
 /**
- * The preview's lines flattened into the rows they paint at one pane width. A
- * line wider than the pane continues on the following rows under the same text
- * column, so `rowStarts` maps a painted row back to the line that owns it and
- * `rows` holds the text each row paints, whole graphemes only (S30).
+ * The preview's lines flattened into the rows they paint at the interior width
+ * of the pane's box. A line wider than that continues on the following rows
+ * under the same text column, so `rowStarts` maps a painted row back to the line
+ * that owns it and `rows` holds the text each row paints, whole graphemes only
+ * (S30, S38).
  */
 interface PreviewWindow {
 	lines: PreviewLine[];
@@ -176,13 +199,34 @@ interface PointerFrame {
 }
 
 // One geometry feeds painting and hit-testing, so a click always lands on the
-// row or pane that is actually visible.
-function paneLayout(width: number): PaneLayout {
+// row or pane that is actually visible. The preview's box spans the whole
+// preview pane, so its two border columns come out of the wrap width and never
+// out of the list, the separator or the card frame.
+function paneLayout(width: number, bodyRows: number): PaneLayout {
 	const contentWidth = Math.max(1, width - CARD_PADDING);
 	const maxList = Math.max(1, contentWidth - SEPARATOR_WIDTH - 1);
 	const listWidth = Math.max(1, Math.min(LIST_MAX_WIDTH, Math.floor(contentWidth * LIST_RATIO), maxList));
 	const previewStart = listWidth + SEPARATOR_WIDTH;
-	return { contentWidth, listWidth, previewStart, previewWidth: Math.max(0, contentWidth - previewStart) };
+	const previewWidth = Math.max(0, contentWidth - previewStart);
+	// Too short a body (or too narrow a pane) keeps today's unbordered preview
+	// instead of squeezing the content or painting half a frame (S38).
+	const boxed = bodyRows >= BOX_MIN_BODY_ROWS && previewWidth >= BOX_MIN_WIDTH;
+	const previewInteriorWidth = boxed ? previewWidth - BOX_COLUMNS : previewWidth;
+	// The unboxed preview spends one row on the position indicator; the box moves
+	// that indicator into its top border and spends the row on the border itself.
+	const previewContentRows = Math.max(0, bodyRows - (boxed ? BOX_ROWS : 1));
+	return {
+		contentWidth,
+		listWidth,
+		previewStart,
+		previewWidth,
+		boxed,
+		previewInteriorWidth,
+		previewContentRows,
+		wrapWidth(gutterWidth: number) {
+			return Math.max(0, previewInteriorWidth - gutterWidth - PREVIEW_GUTTER_GAP);
+		},
+	};
 }
 
 function displayText(text: string): string {
@@ -304,8 +348,8 @@ export class FilePickerView {
 	private readonly selection = new Set<string>();
 	private readonly openedAt: number;
 	private readonly previews = new Map<string, PreviewEntry>();
-	/** The preview pane width of the last painted frame, so a scroll clamps against what is on screen. */
-	private previewPaneWidth = 0;
+	/** The geometry of the last painted frame: what the box, the scroll and the pointer all follow. */
+	private paintedLayout: PaneLayout | undefined;
 	private completed = false;
 	private disposed = false;
 	private readonly deps: FilePickerDeps;
@@ -326,8 +370,11 @@ export class FilePickerView {
 			this.pointerFrame = undefined;
 			return [fit(this.renderText("File picker", "accent"), width)];
 		}
-		const layout = paneLayout(width);
 		const bodyRows = this.bodyRowCount();
+		const layout = paneLayout(width, bodyRows);
+		// The list, the preview and the scroll math all read this one layout, so a
+		// click, the wheel and a clamp land on what is painted (S6, S38).
+		this.paintedLayout = layout;
 		// Title, search row, a blank row, the count row and then the list (S18).
 		const lines: string[] = [this.headerRow(layout.contentWidth), this.searchRow(layout.contentWidth), "", this.countRow(layout.contentWidth)];
 		const hits: PointerHit[] = [];
@@ -484,6 +531,7 @@ export class FilePickerView {
 	dispose(): void {
 		this.disposed = true;
 		this.pointerFrame = undefined;
+		this.paintedLayout = undefined;
 		this.hovered = undefined;
 		this.previews.clear();
 	}
@@ -501,9 +549,21 @@ export class FilePickerView {
 		return Math.max(0, this.cardHeight() - CHROME_ROWS);
 	}
 
-	/** Rows of preview text: the body minus the position indicator row. */
+	/** Rows of preview content inside the frame the last render painted (S38). */
 	private previewRows(): number {
+		const painted = this.paintedLayout;
+		if (painted) return painted.previewContentRows;
+		// No frame has been painted yet: no box is claimed before the body is known.
 		return Math.max(0, this.bodyRowCount() - 1);
+	}
+
+	/**
+	 * The geometry of the last painted frame, which is what the box's wrap and the
+	 * scroll clamp follow. A frame is painted before any key or wheel reaches the
+	 * panel; the narrowest layout stands in if one somehow does not.
+	 */
+	private painted(): PaneLayout {
+		return this.paintedLayout ?? paneLayout(MIN_WIDTH, this.bodyRowCount());
 	}
 
 	private async loadListing(): Promise<void> {
@@ -646,14 +706,14 @@ export class FilePickerView {
 	private scrollPreviewTo(edge: "start" | "end"): boolean {
 		const path = this.selectedPath();
 		if (!path) return false;
-		const window = this.previewWindow(path, this.previewPaneWidth);
+		const window = this.previewWindow(path, this.painted());
 		return this.setPreviewScroll(edge === "start" ? 0 : this.maxPreviewScroll(window));
 	}
 
 	private setPreviewScroll(next: number): boolean {
 		const path = this.selectedPath();
 		if (!path) return false;
-		const window = this.previewWindow(path, this.previewPaneWidth);
+		const window = this.previewWindow(path, this.painted());
 		const clamped = Math.max(0, Math.min(this.maxPreviewScroll(window), Math.trunc(next)));
 		if (clamped === this.previewScroll) return false;
 		this.previewScroll = clamped;
@@ -881,30 +941,58 @@ export class FilePickerView {
 	private previewColumn(layout: PaneLayout, bodyRows: number): string[] {
 		const path = this.selectedPath();
 		if (!path || bodyRows <= 0) return [];
-		const contentRows = this.previewRows();
-		const window = this.previewWindow(path, layout.previewWidth);
-		this.previewPaneWidth = layout.previewWidth;
-		// The painted window is what a scroll is clamped against, so the last
-		// page is always full and the position indicator never lies.
+		const window = this.previewWindow(path, layout);
+		// The painted window is what a scroll is clamped against, so the last page
+		// is always full and the position indicator never lies.
 		this.previewScroll = Math.max(0, Math.min(this.previewScroll, this.maxPreviewScroll(window)));
-		// The position indicator owns the preview's first row (S21).
-		const lines: string[] = [this.previewPositionRow(window, path, layout.previewWidth)];
-		for (let offset = 0; offset < contentRows; offset += 1) {
+		const lines: string[] = [layout.boxed ? this.previewBoxTop(window, path, layout.previewWidth) : this.previewPositionRow(window, path, layout.previewWidth)];
+		for (let offset = 0; offset < layout.previewContentRows; offset += 1) {
 			const row = this.previewScroll + offset;
-			lines.push(row < window.totalRows ? this.previewRow(window, row, layout.previewWidth) : "");
+			const content = row < window.totalRows ? this.previewRow(window, row, layout.previewInteriorWidth) : "";
+			lines.push(layout.boxed ? this.previewBoxRow(content, layout.previewInteriorWidth) : content);
 		}
+		if (layout.boxed) lines.push(this.previewBoxBottom(layout.previewWidth));
 		return lines;
 	}
 
 	/**
-	 * The preview flattened into painted rows at `width` pane cells. A line wider
-	 * than the pane wraps instead of being truncated, so the scroll and page math
-	 * counts rows while the gutter and the position count file lines (S30).
+	 * The box's top border with the position indicator at its right (S38): the
+	 * dashes fill the interior the indicator leaves, one space separates them, and
+	 * the corners close the pane's own columns.
 	 */
-	private previewWindow(path: string, width: number): PreviewWindow {
+	private previewBoxTop(window: PreviewWindow, path: string, width: number): string {
+		const interiorWidth = Math.max(0, width - BOX_COLUMNS);
+		const label = this.positionLabel(window, path);
+		// A pane too narrow for the whole label keeps its right end rather than
+		// overflowing the card's frame.
+		const position = label === undefined ? undefined : truncateToWidth(this.renderText(label, "muted"), interiorWidth, "…");
+		const positionWidth = position === undefined ? 0 : visibleWidth(stripAnsi(position));
+		const gap = position === undefined ? 0 : Math.min(1, Math.max(0, interiorWidth - positionWidth));
+		const fill = Math.max(0, interiorWidth - positionWidth - gap);
+		return `${this.renderText(BOX_TOP_LEFT, "border")}${this.renderText(BOX_HORIZONTAL.repeat(fill), "border")}${" ".repeat(gap)}${position ?? ""}${this.renderText(BOX_TOP_RIGHT, "border")}`;
+	}
+
+	/** The box's bottom border: one border-tone run between its two corners. */
+	private previewBoxBottom(width: number): string {
+		const interiorWidth = Math.max(0, width - BOX_COLUMNS);
+		return `${this.renderText(BOX_BOTTOM_LEFT, "border")}${this.renderText(BOX_HORIZONTAL.repeat(interiorWidth), "border")}${this.renderText(BOX_BOTTOM_RIGHT, "border")}`;
+	}
+
+	/** One boxed content row: the interior, padded to the box, framed by its two border columns. */
+	private previewBoxRow(content: string, width: number): string {
+		return `${this.renderText(BOX_VERTICAL, "border")}${fit(content, width)}${this.renderText(BOX_VERTICAL, "border")}`;
+	}
+
+	/**
+	 * The preview flattened into painted rows at the layout's wrap width. A line
+	 * wider than the box's interior wraps instead of being truncated, so the
+	 * scroll and page math counts rows while the gutter and the position count
+	 * file lines (S30, S38).
+	 */
+	private previewWindow(path: string, layout: PaneLayout): PreviewWindow {
 		const lines = this.previewLines(path);
 		const gutterWidth = this.previewGutterWidth(path);
-		const textWidth = width - gutterWidth - PREVIEW_GUTTER_GAP;
+		const textWidth = layout.wrapWidth(gutterWidth);
 		const rows: string[] = [];
 		const rowStarts: number[] = [];
 		for (const line of lines) {
@@ -946,12 +1034,19 @@ export class FilePickerView {
 		return Math.max(1, String(this.previewMeta(path)?.total ?? 0).length);
 	}
 
-	/** `top/total` at the preview's top-right; `+` when the total is not known (S21). */
-	private previewPositionRow(window: PreviewWindow, path: string, width: number): string {
+	/** `top/total` plus `+` when the reader truncated; nothing when the total is not known (S21). */
+	private positionLabel(window: PreviewWindow, path: string): string | undefined {
 		const meta = this.previewMeta(path);
-		if (!meta) return "";
+		if (!meta) return undefined;
 		const top = this.topLineNumber(window) ?? meta.total;
-		const indicator = this.renderText(`${Math.min(meta.total, top)}/${meta.total}${meta.truncated ? "+" : ""}`, "muted");
+		return `${Math.min(meta.total, top)}/${meta.total}${meta.truncated ? "+" : ""}`;
+	}
+
+	/** The unboxed position row at the pane's right; the box puts it in its top border instead (S38). */
+	private previewPositionRow(window: PreviewWindow, path: string, width: number): string {
+		const label = this.positionLabel(window, path);
+		if (label === undefined) return "";
+		const indicator = this.renderText(label, "muted");
 		const used = visibleWidth(stripAnsi(indicator));
 		if (used >= width) return truncateToWidth(indicator, width, "…");
 		return `${" ".repeat(width - used)}${indicator}`;

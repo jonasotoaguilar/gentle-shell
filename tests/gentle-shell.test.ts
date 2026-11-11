@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, afterEach, type TestContext } from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext, type SlashCommandInfo, type SourceInfo } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, matchesKey, stripTerminalSequences as stripAnsi, TuiAltScreen, TuiMainScreen, VStack, visibleWidth, type Terminal, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, matchesKey, sliceByColumn, stripTerminalSequences as stripAnsi, TuiAltScreen, TuiMainScreen, VStack, visibleWidth, type Terminal, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import installGentleShell, { backgroundChangeRefreshesSettled, buildShellBarModel, createFooterStatusMemo, createActiveProfileReader, changesShortcut, devBinaryCard, extractQueuedText, fetchCodexUsage, fetchNanUsage, loadFileDiff, shellGitRunner, openInExternalEditor, usageShortcut, GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CODEX_USAGE_URL, NAN_QUOTA_URL, USAGE_SOURCE_EVENT, USAGE_SOURCE_SCHEMA } from "../lib/shell-usage.ts";
 import { bindSessionProfile, clearSessionProfileBinding, resetSessionProfileBindingsForTesting } from "../lib/session-profile-binding.ts";
@@ -5479,15 +5479,19 @@ test("the picker previews the file's syntax in the active theme's colours, and a
 		await overlayReady;
 		const frame = () => ui.overlayView!.render(120);
 		const painted = () => frame().map((line) => stripAnsi(line)).join("\n");
-		const previewCells = (text: string): string[] => {
-			const row = frame().find((line) => stripAnsi(line).includes(text));
-			assert.ok(row, `missing ${JSON.stringify(text)} in the rendered frame:\n${frame().join("\n")}`);
-			return row.replace(/^│ /, "").replace(/ │$/, "").split(" │ ");
+		// The preview box's interior on the row showing `text`: the pane's own
+		// columns, minus the box's two border columns (S38).
+		const previewInterior = (text: string): string => {
+			const rows = frame();
+			const index = rows.findIndex((line) => stripAnsi(line).includes(text));
+			assert.ok(index >= 0, `missing ${JSON.stringify(text)} in the rendered frame:\n${rows.join("\n")}`);
+			const start = stripAnsi(rows[5] ?? "").indexOf(" │ ") + 3;
+			const paneWidth = visibleWidth(rows[0]!) - 2 - start;
+			return sliceByColumn(rows[index]!, start + 1, paneWidth - 2);
 		};
 		// The dim gutter number is the only escape sequence a plain row carries.
-		const gutterOnly = (row: string): boolean => {
-			const cells = previewCells(row);
-			const cell = cells[cells.length - 1] ?? "";
+		const gutterOnly = (text: string): boolean => {
+			const cell = previewInterior(text);
 			const gutter = /^(?:\x1b\[[0-9;]*m)*\d+(?:\x1b\[[0-9;]*m)* /.exec(cell);
 			return gutter !== null && !cell.slice(gutter[0].length).includes("\x1b[");
 		};
@@ -5502,7 +5506,7 @@ test("the picker previews the file's syntax in the active theme's colours, and a
 		ui.overlayView!.handleInput("\x1b[B");
 		await until(() => painted().includes("const answer"));
 		assert.ok(!gutterOnly("const answer"), "Pi's highlighter colours a registered language");
-		const code = previewCells("const answer").at(-1) ?? "";
+		const code = previewInterior("const answer");
 		const gutter = /^(?:\x1b\[[0-9;]*m)*\d+(?:\x1b\[[0-9;]*m)* /.exec(code);
 		assert.ok(gutter, "the row still starts with its gutter number");
 		assert.match(code.slice(gutter[0].length), /\x1b\[/, "the code after the gutter carries the active theme's syntax colour");
