@@ -83,6 +83,8 @@ S38. **Boxed preview pane.** The preview pane sits inside its own rounded box, l
 
 S39. **Coloured preview.** The preview paints the file's syntax using Pi's own highlighter, so the colours are the active theme's and never a foreign palette: `highlightCode(code, lang)` plus `getLanguageFromPath(path)`, imported from the package root of `@earendil-works/pi-coding-agent` — never a deep `dist/...` specifier, which the exports map does not expose. The highlighter is injected through the view's dependencies and defaults to plain text, so the view stays testable without a live theme. The gutter numbers keep their dim tone and are never highlighted. Wrapped lines (S30) go through an ANSI-aware wrapper, so a colour run survives the break and a continuation row keeps the colour of its fragment. A file whose language is unknown or unsupported, a highlighter that throws because no theme is initialised, and the lazily-loaded grammars that may not be ready (`markdown`, `yaml`, `toml`, `css`, `xml`) all paint exactly today's plain text: never blank, never an error, never a partial line. The byte budget and the truncation notice bound what is highlighted (S3), the position indicator is unaffected (S21), and highlighting runs once per preview load on the already-bounded text, never per repaint. "bien, pongamosle color entonces a la preview"
 
+S40. **Commit subject leads the detail line.** The focused-scope detail line paints the last commit subject first and the rest after it, so the line reads as "which commit is this worktree on" before any count: subject, then the uncommitted count, then the age of the last modification, then the distance from the comparison ref. The separator, the glyph shapes and the rule that a zero or absent field is not painted are unchanged; this supersedes S33's field order only, not its content. The scope row's count is unaffected. "igual en la data el ultimo commit siempre primer y luego lo demas como files uncommited, comparacion main y nose cual mas teniamso"
+
 ## Tasks
 
 | ID | Specs | Route | Commit |
@@ -113,9 +115,25 @@ Tasks for L16 (all reopen the delivered picker surfaces):
 | T23 | S36, S6 | gentle-ai-worker: widen the list pane to 45% with a 64-column cap, with its geometry tests and docs | _(pending)_ |
 | T24 | S37 | gentle-ai-worker: paint the directory in `dim` and the name in the row's role, as `/changes` does | _(pending)_ |
 | T25 | S38, S21 | gentle-ai-worker: box the preview pane with rounded corners and move the position indicator into the top border | _(pending)_ |
-| T26 | S39, S30, S3 | gentle-ai-worker: themed syntax colour in the preview through Pi's injected `highlightCode`, with ANSI-aware wrapping and plain-text degradation | _(pending)_ |
+| T26 | S39, S30, S3 | gentle-ai-worker: themed syntax colour in the preview through Pi's injected `highlightCode`, with ANSI-aware wrapping and plain-text degradation | `725cf9132` |
+| T27 | S40, S33 | gentle-ai-worker: paint the commit subject first in the focused-scope detail line, keeping the rest in order | `405e7ecb2` |
 
 ## Delivery
+
+Slice boundary after L45 (recorded before the next commit, per the delivery strategy): the branch stands at 22 commits and 5034 authored changed lines against `origin/main`, far past one reviewable slice, so delivery stays `gentle-ai-chained-pr` — a tracker PR plus one chained PR per unit, in dependency order. The rounds recorded below are the work units, each self-contained with its tests and docs:
+
+| Task | Specs | Commit |
+| --- | --- | --- |
+| T13, T14, T15 | S27, S28, S29, S30, S31 | `389e9cc6a` feat(files): wrap long preview lines, add the order cycle and theme-coloured keys |
+| T16, T17 | S32, S33 | `cd1b5a772` feat(files): widen the picker and report each scope's Git state |
+| T18 | S11 | `cba012870` docs(files): describe the picker's orders, wrapping and scope detail |
+| — | — | `c862b42f9` docs(odd): record the full unit stage on the file picker's final tree |
+| T20 | S32, S33, S34 | `55c9f2009` feat(files): paint the scope count and its distance as glyphs |
+| — | — | `9dc1e7b03` docs(odd): record the file picker's symbol, order and preview rounds |
+| T26 | S39, S30, S3 | `725cf9132` feat(files): colour the preview from the active theme |
+| T27 | S40, S33 | `405e7ecb2` feat(files): lead the scope detail with the last commit subject |
+
+Still open after this boundary: T21 (foldable `path`/`ext` trees, `space` fold and `space` out of the query), T22 (`M`/`U` badges), T23 (wider list pane), T24 (name and directory tones), T25 (boxed preview). Each lands as its own commit so the chained PRs stay reviewable. Nothing is pushed: push, PR creation and merge remain the human's decisions.
 
 Slice boundary after T4/T6: 2049 authored changed lines in 4 commits on `feat/file-picker` (from `main` at `29b57a414`), which is past the ~400-line review slice. Recorded per commit:
 
@@ -398,3 +416,9 @@ L43 (user, verbatim):
 > bien, pongamosle color entonces a la preview
 
 L44 (parent, decisions): L43 authorises L42's route, recorded as S39 and T26. Decisions fixed here so the writer does not improvise: the highlighter is a dependency of the view (`highlight?(code, lang) => string[]`), defaulting to plain text, so unit tests never need a live Pi theme and the extension is the only place that wires the real `highlightCode`; the import is the package root, never the `dist/` path the exports map refuses; the gutter is painted after highlighting and keeps its dim tone; the wrap of S30 moves to an ANSI-aware wrapper for highlighted lines only, so the plain path keeps its current cell-counting behaviour and its tests; and every failure mode — unknown language, unregistered grammar, a throw from the theme proxy — degrades to the plain rendering of today. Queue position: T26 runs before T25 and T21 because the user asked for colour now and because the box changes the wrap width, so wrapping lands correctly on a plain and a coloured line first. The lazy-grammar gap is expected to leave `markdown` plain in some sessions; the tests must pin the degradation rather than pretend the language resolves.
+
+L45 (user, verbatim):
+
+> [Image#9] igual en la data el ultimo commit siempre primer y luego lo demas como files uncommited, comparacion main y nose cual mas teniamso
+
+L46 (parent, decisions): L45 reorders the detail line and is recorded as S40, which supersedes only S33's field order. The user enumerated the subject, the uncommitted files and the main comparison, and admitted not remembering the remaining field — the age of the last modification — so the parent fixed the one open slot: the subject moves to the front and the three remaining fields keep their relative order (`±6 files`, `2m`, `↑18 main`), because a duration dangling at the end of the line reads worse than the count-first shape it already had. Nothing else changes: the same ` · ` separator, the same glyphs, and a zero or absent field is still not painted. The scope row's right-edge count keeps its place and is not part of this reorder. Queue position: T27 runs after T26, because both need `tests/gentle-shell.test.ts` and `docs/gentle-shell.md`, which their assertions and the docs share.
