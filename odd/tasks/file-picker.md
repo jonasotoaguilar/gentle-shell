@@ -114,7 +114,7 @@ Tasks for L16 (all reopen the delivered picker surfaces):
 | T22 | S12 | gentle-ai-worker: paint `M`/`U` instead of `upd`/`new`, reusing the `/changes` letters, in the view, its tests and the docs | `8a9c23637` |
 | T23 | S36, S6 | gentle-ai-worker: widen the list pane to 45% with a 64-column cap, with its geometry tests and docs | `8a9c23637` |
 | T24 | S37 | gentle-ai-worker: paint the directory in `dim` and the name in the row's role, as `/changes` does | `8a9c23637` |
-| T25 | S38, S21 | gentle-ai-worker: box the preview pane with rounded corners and move the position indicator into the top border | _(pending)_ |
+| T25 | S38, S21 | gentle-ai-worker: box the preview pane with rounded corners and move the position indicator into the top border | `935822c5d` |
 | T26 | S39, S30, S3 | gentle-ai-worker: themed syntax colour in the preview through Pi's injected `highlightCode`, with ANSI-aware wrapping and plain-text degradation | `725cf9132` |
 | T27 | S40, S33 | gentle-ai-worker: paint the commit subject first in the focused-scope detail line, keeping the rest in order | `405e7ecb2` |
 
