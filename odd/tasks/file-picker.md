@@ -133,6 +133,13 @@ Slice boundary after T9/T10/T11/T12: the round is covered by exactly three work-
 
 Delivery still follows `gentle-ai-chained-pr`, a tracker PR plus one chained PR per unit, and nothing is pushed without the human's decision.
 
+Closing the round adds two more commits, so `feat/file-picker` stands at twelve commits against `origin/main`:
+
+| Task | Specs | Commit |
+| --- | --- | --- |
+| T12 | S26, S1 | `e29ccded6` test(files): pin the header elision at the 60-column floor |
+| — | — | `docs(odd): record the file picker closing evidence` (this commit's own hash cannot self-reference) |
+
 ## Verification evidence
 
 Baseline parity, unit stage (`node --experimental-strip-types --test tests/*.test.ts`), measured by diffing the failing test names of both trees:
@@ -153,6 +160,24 @@ T9/T10/T11/T12 round, recorded by the parent:
 - `node scripts/check-provider-contract.mjs`: `contract 1.4.0, 10 bundle entries, 2 generated baselines`, exit 0.
 - `command-palette` and `keymaps` pass on this checkout because a `node_modules` symlink to a sibling worktree exists, so the earlier note that they cannot load Pi's theme module no longer applies to this round.
 - The full unit stage (`node --experimental-strip-types --test tests/*.test.ts`) was NOT re-run this round. The baseline-parity evidence above is unchanged, and a clean `pnpm install` plus `pnpm test` and `pnpm typecheck` is still owed before delivery is claimed.
+
+Closing verification of the same round, recorded by the parent once the owed evidence was measured:
+
+- `CI=true pnpm install --frozen-lockfile` succeeded on a fresh, empty `node_modules` in this worktree, so the suite no longer runs against the sibling worktree's symlinked modules. The earlier attempt aborted with `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`, which is a non-interactive prompt failure and says nothing about the code.
+- `node --experimental-strip-types --test --test-reporter=tap tests/*.test.ts` on the final tree: 9629 tests, 9537 pass, 8 fail.
+- Those 8 failures are pre-existing and unrelated: the same eight names fail at the branch base `1eab97ea4`, measured in a temporary worktree of that commit over the six affected files (`review-delivery-preflight`, `writer-feature-document-admission`, `review-candidate-view`, `review-relay-transport-agent`, `review-risk-assessment`, `verifier-admission`), and the two failing-name sets are identical, so this branch introduces no new failure.
+
+| Tree | tests | pass | fail |
+| --- | --- | --- | --- |
+| `1eab97ea4`, six affected files | 329 | 314 | 8 |
+| `feat/file-picker` final tree, full unit stage | 9629 | 9537 | 8 |
+
+- `node scripts/check-types.mjs`: `0 recorded diagnostic(s), no regressions`.
+- `node scripts/check-provider-contract.mjs`: passed, contract 1.4.0, 10 bundle entries, 2 generated baselines.
+- Focused integrated set on the final tree: `tests/gentle-shell.test.ts` alone is 355 tests, 355 pass after the closing test below, which supersedes the 512/512 wider focused set recorded above (it ran before that test).
+- The documented coverage gap is closed: `MIN_ROOT_WIDTH` elision is now exercised end to end at the overlay's 60-column floor by `the picker title row elides a long worktree path at the 60-column floor`, which drives a long worktree root through the real `/gentle:files` wiring. It is load-bearing — temporarily removing `root: scope.root` fails it and restoring the line passes it — and the production file was restored byte-identically (`sha256 06fc2329c3588ec841e244306b664bf863dc204856886656e97a1b70effb8f76` before and after).
+- Remaining known limitation: that test relies on the fake worktree resolution (`rootExists: () => true`, and a path outside `/repo` mapping to itself), so it pins the title-row behaviour, not real worktree canonicalisation.
+- Branch state: twelve commits against `origin/main`, nothing pushed. Delivery is still `gentle-ai-chained-pr`, and push, PR creation and merge remain the human's decisions.
 
 ## Log
 
@@ -208,3 +233,5 @@ L13 (user, verbatim):
 > Falta conectar scope.root al encabezado del picker, verificar que se vea la ruta del scope elegido
 
 L14 (parent, verification evidence and delivery state): the round's writer route failed twice with `provider_unavailable` and produced no edits before a third attempt landed, so no other fallback writer was usable. This round's `Risk:` classification is none — no irreversible data, security, contract, concurrency or delivery surface, and every changed behaviour is covered by the focused set — so no independent verifier was run; the verifier admission requires a declared high-risk item and none exists. `odd/` is matched by the machine-global gitignore (`~/.config/git/.gitignore:236`) and this document was never tracked while the repository tracks the other `odd/tasks/*.md` files, so it is force-added for this round's closing commit. Nothing was pushed.
+
+L15 (parent, closing verification): the round is closed with the delivery evidence that was still owed. A clean `CI=true pnpm install --frozen-lockfile` on a fresh, empty `node_modules` replaced the sibling-worktree symlink, and the full unit stage then ran on the final tree: 9629 tests, 9537 pass, 8 fail. The eight failures are pre-existing and unrelated — the same eight names fail at the branch base `1eab97ea4` over the six affected files (329 tests, 314 pass, 8 fail) and the two name sets are identical, so this branch introduces no new failure. `node scripts/check-types.mjs` reports `0 recorded diagnostic(s), no regressions`, and `node scripts/check-provider-contract.mjs` passes with contract 1.4.0, 10 bundle entries and 2 generated baselines. The focused integrated set ends at `tests/gentle-shell.test.ts` 355 tests / 355 pass, superseding the 512/512 wider set recorded above, and the documented `MIN_ROOT_WIDTH` coverage gap is closed by `the picker title row elides a long worktree path at the 60-column floor`: removing `root: scope.root` fails it, restoring the line passes it, and the production file came back byte-identically (`sha256 06fc2329c3588ec841e244306b664bf863dc204856886656e97a1b70effb8f76` before and after). Two commits close the round, `e29ccded6` (`test(files): pin the header elision at the 60-column floor`) and this document's own docs commit, which brings `feat/file-picker` to twelve commits against `origin/main`, with nothing pushed; delivery is still `gentle-ai-chained-pr` and push, PR creation and merge remain the human's decisions. The known limitation stays honest: the elision test relies on the fake worktree resolution (`rootExists: () => true`, path outside `/repo` mapping to itself), so it pins the title-row behaviour, not real worktree canonicalisation.
