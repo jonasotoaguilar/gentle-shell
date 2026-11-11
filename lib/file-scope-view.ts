@@ -1,5 +1,6 @@
 import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { CARD_PADDING, renderPaletteCard, renderPaletteSelection } from "./command-palette.ts";
+import { scopeDetailLine, type ScopeDetail } from "./file-scope-detail.ts";
 import type { FilePickerTheme } from "./file-picker-view.ts";
 import { paintHoverable } from "./shell-hover.ts";
 import { sanitizeTerminalText, stripAnsi } from "./terminal-theme.ts";
@@ -7,8 +8,9 @@ import { sanitizeTerminalText, stripAnsi } from "./terminal-theme.ts";
 // Gentle Shell worktree scope step: the single-choice card the file picker
 // opens behind when the session has registered worktrees (S15). It knows only
 // about scopes -- never about Git or the Pi session -- so the caller resolves
-// the session repository and its registered worktrees and this component just
-// orders, paints and routes them.
+// the session repository, its registered worktrees, their uncommitted files
+// (S32) and their Git detail (S33), and this component just orders, paints and
+// routes them.
 
 export interface FileScope {
 	/** Stable identifier for the scope: the session repository or a worktree root. */
@@ -18,24 +20,30 @@ export interface FileScope {
 	kind: "main" | "worktree";
 	/** Recency used for ordering only; never rendered. */
 	lastModifiedMs: number;
+	/** The focused-scope line above the footer (S33); absent when nothing was measured. */
+	detail?: ScopeDetail;
 }
 
 /**
- * Changed worktrees first, most recently modified first; the session
- * repository keeps its place when its recency ties. The input array and its
- * entries are left untouched.
+ * `main` keeps the first row (S32) and the registered worktrees follow it,
+ * most recently changed first; recency ties keep their input order. The input
+ * array and its entries are left untouched.
  */
 export function orderScopes(scopes: readonly FileScope[]): FileScope[] {
-	return scopes
-		.map((scope, index) => ({ scope, index }))
-		.sort((a, b) => (b.scope.lastModifiedMs - a.scope.lastModifiedMs) || (a.index - b.index))
-		.map((entry) => entry.scope);
+	const ranked = scopes.map((scope, index) => ({ scope, index }));
+	const byRecency = (a: { scope: FileScope; index: number }, b: { scope: FileScope; index: number }): number =>
+		(b.scope.lastModifiedMs - a.scope.lastModifiedMs) || (a.index - b.index);
+	const main = ranked.filter((entry) => entry.scope.kind === "main").sort(byRecency);
+	const worktrees = ranked.filter((entry) => entry.scope.kind !== "main").sort(byRecency);
+	return [...main, ...worktrees].map((entry) => entry.scope);
 }
 
 export interface FileScopeDeps {
 	theme: FilePickerTheme;
 	rows: number | (() => number);
 	scopes: readonly FileScope[];
+	/** Clock for the detail line's age, read once when the step opens (S33). Defaults to Date.now. */
+	now?: number;
 	onSelect(scope: FileScope): void;
 	onClose(): void;
 	requestRender(): void;
@@ -44,16 +52,26 @@ export interface FileScopeDeps {
 const TITLE = "File picker";
 const SUBTITLE = "Choose a scope";
 const NO_SCOPES = "No worktrees registered.";
-const FOOTER = "↑/↓ move • enter choose scope • esc close";
+// One option per action (S19): ctrl+j/k and ctrl+c keep working but are not
+// advertised. The keys take the theme's key colour, the labels stay neutral (S32).
+const FOOTER_HINTS = [
+	["↑/↓", "move"],
+	["enter", "choose scope"],
+	["esc", "close"],
+] as const;
+const FOOTER_SEPARATOR = " • ";
+const KEY_ROLE = "accent";
+const KEY_LABEL_ROLE = "dim";
 const MAX_CARD_HEIGHT = 24;
-// Header, step subtitle and footer, plus the two card borders.
-const CHROME_ROWS = 5;
+// Header, step subtitle, the focused-scope detail line and footer, plus the two
+// card borders.
+const CHROME_ROWS = 6;
 const MIN_CARD_HEIGHT = CHROME_ROWS + 1;
 const MIN_WIDTH = CARD_PADDING + 4;
 // Card border, header and subtitle precede the first scope row.
 const BODY_TOP = 3;
 
-type Tone = "accent" | "muted";
+type Tone = "accent" | "muted" | "dim" | "text";
 
 interface PointerHit {
 	y: number;
@@ -82,10 +100,13 @@ export class FileScopeView {
 	private disposed = false;
 	private readonly deps: FileScopeDeps;
 	private readonly scopes: FileScope[];
+	private readonly now: number;
 
 	constructor(deps: FileScopeDeps) {
 		this.deps = deps;
 		this.scopes = orderScopes(deps.scopes);
+		// The age is computed once when the step opens and never refreshed live.
+		this.now = deps.now ?? Date.now();
 	}
 
 	render(width: number): string[] {
@@ -106,7 +127,8 @@ export class FileScopeView {
 			this.headerRow(innerWidth),
 			fit(this.renderText(SUBTITLE, "muted"), innerWidth),
 			...body,
-			fit(this.renderText(FOOTER, "muted"), innerWidth),
+			this.detailRow(innerWidth),
+			this.footerRow(innerWidth),
 		];
 		const frame = renderPaletteCard(lines, width, this.deps.theme);
 		this.pointerFrame = this.completed || this.disposed ? undefined : {
@@ -251,10 +273,43 @@ export class FileScopeView {
 	}
 
 	private renderScopeRow(scope: FileScope, index: number, selectedIndex: number, width: number): string {
+		const theme = this.deps.theme;
 		const label = sanitizeTerminalText(scope.label);
-		if (index === selectedIndex) return fit(renderPaletteSelection(label, width, true, this.deps.theme), width);
-		const text = truncateToWidth(label, Math.max(0, width - 2), "…", true);
-		return fit(`  ${paintHoverable(this.deps.theme, text, index === this.hovered, "muted")}`, width);
+		const selected = index === selectedIndex;
+		const changed = scope.detail?.changedFiles ?? 0;
+		if (changed <= 0) {
+			if (selected) return fit(renderPaletteSelection(label, width, true, theme), width);
+			const text = truncateToWidth(label, Math.max(0, width - 2), "…", true);
+			return fit(`  ${paintHoverable(theme, text, index === this.hovered, "muted")}`, width);
+		}
+		// With a count the label and the count share the row: the count keeps the
+		// theme's key colour at the right edge and the label gets what is left.
+		const count = `${changed} ${changed === 1 ? "file" : "files"} changed`;
+		const countCell = this.renderText(count, KEY_ROLE);
+		const countWidth = visibleWidth(stripAnsi(countCell));
+		const room = Math.max(0, width - 2 - countWidth - 1);
+		const text = truncateToWidth(label, room, "…", true);
+		const textCell = selected ? this.renderText(text, "text") : paintHoverable(theme, text, index === this.hovered, "muted");
+		const marker = selected ? this.renderText("▸ ", KEY_ROLE) : "  ";
+		const gap = Math.max(1, width - 2 - visibleWidth(stripAnsi(textCell)) - countWidth);
+		const row = fit(`${marker}${textCell}${" ".repeat(gap)}${countCell}`, width);
+		return selected && theme.bg ? theme.bg("selectedBg", row) : row;
+	}
+
+	// S33: the focused scope's data on the line directly above the footer. An
+	// empty line keeps the card's geometry stable when nothing was measured.
+	private detailRow(width: number): string {
+		const scope = this.scopes[this.clampedSelected()];
+		if (scope?.detail === undefined) return fit("", width);
+		const text = sanitizeTerminalText(scopeDetailLine(scope.detail, this.now));
+		if (text.length === 0) return fit("", width);
+		return fit(this.renderText(truncateToWidth(text, width, "…"), "muted"), width);
+	}
+
+	private footerRow(width: number): string {
+		const separator = this.renderText(FOOTER_SEPARATOR, KEY_LABEL_ROLE);
+		const hints = FOOTER_HINTS.map(([key, label]) => `${this.renderText(key, KEY_ROLE)} ${this.renderText(label, KEY_LABEL_ROLE)}`);
+		return fit(hints.join(separator), width);
 	}
 
 	private headerRow(width: number): string {

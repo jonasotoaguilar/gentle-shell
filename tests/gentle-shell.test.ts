@@ -5301,6 +5301,12 @@ async function until(check: () => boolean): Promise<void> {
  for (let attempt = 0; attempt < 200 && !check(); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
 }
 
+function rowOfText(lines: readonly string[], text: string): number {
+	const y = lines.findIndex((line) => line.includes(text));
+	assert.ok(y >= 0, `missing ${JSON.stringify(text)} in the rendered frame:\n${lines.join("\n")}`);
+	return y;
+}
+
 test("Changes lists the session root's Git state at turn end, never at startup", async () => {
  const { pi, handlers, git } = fakePi([{numstat:"2\t0\tlib/b.ts\n",porcelain:" M lib/b.ts\0?? other.ts\0"},{numstat:"3\t0\tlib/b.ts\n",porcelain:" M lib/b.ts\0?? other.ts\0"}]);
  gentleShell(pi,{});
@@ -5454,11 +5460,13 @@ test("the picker title row shows the chosen scope's path", async () => {
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
-// S26 at the narrow floor: the overlay opens with `width: "70%", minWidth: 60`,
-// so 60 columns is the tightest card a terminal can give the picker. A long
-// worktree root has to elide from the left there — dropping the leading
-// segments while keeping the tail that says which scope the list belongs to —
-// instead of costing the title or pushing the esc hint off the row.
+// S26 at the picker's narrowest usable card: the overlay opens with
+// `width: "85%", minWidth: 76` (S27), and a terminal narrower than the floor
+// still gets its own 60 columns, so 60 is the tightest card the picker can be
+// asked to draw. A long worktree root has to elide from the left there —
+// dropping the leading segments while keeping the tail that says which scope
+// the list belongs to — instead of costing the title or pushing the esc hint
+// off the row.
 test("the picker title row elides a long worktree path at the 60-column floor", async () => {
 	const root = "/home/dev/projects/gentle-shell-worktrees/a-very-long-worktree-name";
 	const h = fakePi();
@@ -5547,6 +5555,88 @@ test("a root /changes no longer lists adds no scope step", async () => {
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
+// S32/S33: one Git fake for the scope step's own reads — working-tree status,
+// the last commit and the ahead/behind range — keyed by root, so a test can
+// omit a root's answer and watch the field degrade to absent.
+function scopeStepGit(pi: ExtensionAPI, options: { changed?: Record<string, string>; subject?: Record<string, string>; range?: Record<string, string> } = {}) {
+	const calls: string[][] = [];
+	const changed = options.changed ?? { "/repo": " M a.ts\0 M b.ts\0?? c.ts\0", "/linked": " M only.ts\0" };
+	const subject = options.subject ?? { "/repo": "chore: seed the repo", "/linked": "feat: linked work" };
+	const range = options.range ?? { "/repo": "2\t0\n", "/linked": "0\t1\n" };
+	(pi as unknown as { exec(command: string, args: string[]): Promise<unknown> }).exec = async (_command, args) => {
+		calls.push(args);
+		const root = args[1];
+		const rest = args.slice(2);
+		const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, killed: false });
+		if (rest.includes("ls-files")) return ok(({ "/repo": ["AGENTS.md"], "/linked": ["linked-only.ts"] } as Record<string, string[]>)[root]?.map((path) => `${path}\0`).join("") ?? "");
+		if (rest.includes("worktree")) return ok("worktree /repo\0branch refs/heads/main\0\0");
+		if (rest.includes("symbolic-ref")) return root === "/linked" ? ok("fix/beta\n") : { stdout: "", stderr: "", code: 1, killed: false };
+		if (rest[0] === "rev-list") return range[root] === undefined ? { stdout: "", stderr: "", code: 128, killed: false } : ok(range[root]);
+		if (rest[0] === "log") return subject[root] === undefined ? { stdout: "", stderr: "", code: 128, killed: false } : ok(`${subject[root]}\n`);
+		if (rest.includes("status")) return ok(changed[root] ?? "");
+		if (rest.includes("numstat")) return ok("");
+		if (rest.includes("rev-parse")) return ok(root ?? "");
+		return ok("");
+	};
+	return calls;
+}
+
+// S32/S33: the scope step reads the same working-tree state /changes keeps, so
+// each row reports its uncommitted files and the focused scope's detail lands
+// on the line directly above the footer.
+test("the scope step reports each root's uncommitted files and the focused scope's Git detail", async () => {
+	const h = fakePi();
+	const calls = scopeStepGit(h.pi);
+	gentleShell(h.pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	await h.tools.get("session_worktree_register")!.execute("r", { path: "/linked" }, undefined, undefined, ctx);
+	const previous = ui.overlayView;
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await until(() => ui.overlayView !== previous && ui.overlayView !== undefined);
+	const scopeView = ui.overlayView!;
+	const frame = () => scopeView.render(120).map((line) => stripAnsi(line));
+	const detail = () => frame()[frame().length - 3]!.slice(2, -2).trim();
+
+	let lines = frame();
+	assert.match(lines.join("\n"), /Choose a scope/);
+	assert.match(lines[rowOfText(lines, "▸ main")]!, /▸ main +3 files changed │$/, "the session repository leads and reports its uncommitted files");
+	assert.match(lines[rowOfText(lines, "fix/beta")]!, /fix\/beta · linked +1 file changed │$/, "a registered worktree reports its own count, singular at one");
+	assert.equal(detail(), "3 files changed · chore: seed the repo · 2 behind origin/main", "main is measured against the remote main, and its zero `ahead` is silent");
+	assert.ok(rowOfText(lines, "▸ main") < rowOfText(lines, "fix/beta"), "main is always the first row");
+
+	scopeView.handleInput("\x1b[B");
+	lines = frame();
+	assert.equal(detail(), "1 file changed · feat: linked work · 1 ahead of main", "a worktree is compared with the local main, and its zero `behind` is silent");
+	assert.ok(calls.some((args) => args.join(" ") === "-C /repo rev-list --left-right --count origin/main...HEAD"), "main asks for its range against the remote main");
+	assert.ok(calls.some((args) => args.join(" ") === "-C /linked rev-list --left-right --count main...HEAD"), "a worktree asks for its range against the local main");
+	assert.ok(calls.some((args) => args.join(" ") === "-C /linked log -1 --format=%s"), "the last commit subject comes from Git, not the label");
+
+	scopeView.handleInput("\x1b");
+	await opened;
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
+// S33: a repository with no remote degrades by painting less, never by
+// claiming the scope is level with a main it could not read.
+test("a scope whose Git answers nothing paints no comparison field", async () => {
+	const h = fakePi();
+	scopeStepGit(h.pi, { range: { "/linked": "0\t1\n" } });
+	gentleShell(h.pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	await h.tools.get("session_worktree_register")!.execute("r", { path: "/linked" }, undefined, undefined, ctx);
+	const previous = ui.overlayView;
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await until(() => ui.overlayView !== previous && ui.overlayView !== undefined);
+	const scopeView = ui.overlayView!;
+	const detail = () => stripAnsi(scopeView.render(120).at(-3)!).slice(2, -2).trim();
+	assert.equal(detail(), "3 files changed · chore: seed the repo", "no remote means no comparison, and no fabricated zero");
+	scopeView.handleInput("\x1b");
+	await opened;
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
 test("ctrl+e closes the picker before the editor handoff and reports the missing editor", async (t) => {
 	const saved = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR };
 	delete process.env.VISUAL;
@@ -5574,12 +5664,12 @@ test("ctrl+e closes the picker before the editor handoff and reports the missing
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
-// S22: the picker sits in the Commands/Customization family — 70% wide with a
-// 60-column floor instead of the first cut's 85%/76 — so the card is narrower,
-// and its height budget is the whole terminal: Pi truncates an overlay's rows
-// from the bottom, which at 90% would eat the footer line of the 24-row card
-// the view draws in any terminal short enough.
-test("the picker opens with the Commands-family width and the full vertical budget", async (t) => {
+// S27: the card is wider than the earlier cut and keeps the height it already
+// had — 85% of the terminal with a 76-column floor, against the Commands
+// palette's 70%/60 — while the height budget stays the whole terminal: Pi
+// truncates an overlay's rows from the bottom, which at 90% would eat the
+// footer line of the 24-row card the view draws in any terminal short enough.
+test("the picker opens with a wider card and the full vertical budget", async (t) => {
 	const savedRows = fakeTui.terminal.rows;
 	t.after(() => { fakeTui.terminal.rows = savedRows; });
 	const h = fakePi();
@@ -5590,7 +5680,7 @@ test("the picker opens with the Commands-family width and the full vertical budg
 	const opened = h.commands.get("gentle:files")!.handler("", ctx);
 	await overlayReady;
 	const options = (ui.customOptions?.at(-1) as { overlayOptions: { width?: number | string; minWidth?: number; maxHeight?: number | string } }).overlayOptions;
-	assert.deepEqual(options, { anchor: "center", width: "70%", minWidth: 60, maxHeight: "100%" });
+	assert.deepEqual(options, { anchor: "center", width: "85%", minWidth: 76, maxHeight: "100%" });
 	const percent = (value: number | string | undefined, fallback: number): number => {
 		const parsed = Number(String(value).replace("%", ""));
 		return Number.isFinite(parsed) ? parsed : fallback;
@@ -5598,8 +5688,9 @@ test("the picker opens with the Commands-family width and the full vertical budg
 	// The same resolution Pi applies: a percentage of the terminal, floored, and
 	// never below minWidth (or above the terminal).
 	const resolvedWidth = (columns: number): number => Math.min(columns, Math.max(Math.floor((columns * percent(options.width, 100)) / 100), options.minWidth ?? 0));
-	assert.equal(resolvedWidth(120), 84, "84 columns at 120, against the first cut's 102");
-	assert.equal(resolvedWidth(80), 60, "a narrow terminal still gets the 60-column floor the two panes need");
+	assert.equal(resolvedWidth(120), 102, "102 columns at 120, wider than the earlier 84");
+	assert.equal(resolvedWidth(80), 76, "a narrow terminal still gets the 76-column floor the two panes need");
+	assert.equal(resolvedWidth(60), 60, "the card is never wider than the terminal itself");
 	for (const rows of [40, 30, 24, 18]) {
 		fakeTui.terminal.rows = rows;
 		const drawn = ui.overlayView!.render(resolvedWidth(120)).length;
@@ -5611,8 +5702,8 @@ test("the picker opens with the Commands-family width and the full vertical budg
 	await opened;
 	const palette = h.commands.get("gentle:commands")!.handler("", ctx);
 	await until(() => ui.customOptions?.length === 2);
-	const paletteOptions = (ui.customOptions?.at(-1) as { overlayOptions: { width?: unknown; minWidth?: unknown } }).overlayOptions;
-	assert.deepEqual({ width: options.width, minWidth: options.minWidth }, { width: paletteOptions.width, minWidth: paletteOptions.minWidth }, "the picker takes the Commands palette's width proportions");
+	const paletteOptions = (ui.customOptions?.at(-1) as { overlayOptions: { width?: number | string; minWidth?: number } }).overlayOptions;
+	assert.ok(percent(options.width, 0) > percent(paletteOptions.width, 0) && (options.minWidth ?? 0) > (paletteOptions.minWidth ?? 0), "S27 widens the picker past the Commands palette's 70%/60 proportions");
 	ui.closeOverlay?.();
 	await palette;
 	await fire(h.handlers, "session_shutdown", ctx);

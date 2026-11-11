@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { FilePickerTheme } from "../lib/file-picker-view.ts";
+import { loadScopeDetail, parseAheadBehind, scopeDetailLine } from "../lib/file-scope-detail.ts";
 import { FileScopeView, orderScopes, type FileScope, type FileScopeDeps } from "../lib/file-scope-view.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
@@ -18,6 +19,16 @@ const plainTheme: FilePickerTheme = {
 const taggedTheme: FilePickerTheme = {
 	fg(color: string, text: string) {
 		return `<${color}>${text}</${color}>`;
+	},
+};
+
+// A theme with real escape sequences: widths and stripping stay exact, so a
+// colour can be asserted on a full-width row.
+const ANSI_ACCENT = "\x1b[36m";
+const ROLE_COLOUR: Record<string, string> = { accent: ANSI_ACCENT, text: "\x1b[37m", muted: "\x1b[90m", dim: "\x1b[2m", border: "\x1b[34m" };
+const ansiTheme: FilePickerTheme = {
+	fg(color: string, text: string) {
+		return `${ROLE_COLOUR[color] ?? ""}${text}\x1b[0m`;
 	},
 };
 
@@ -103,7 +114,9 @@ function mouse(lines: readonly string[], x: number, y: number, type: MouseEvent[
 	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false, wheelDelta };
 }
 
-test("orderScopes puts the most recently modified first, keeps ties in input order, and never mutates its input", () => {
+// S32: `main` is always the first row and the registered worktrees follow it,
+// most recently changed first — the session repository never sorts away.
+test("orderScopes keeps main first, then the most recently modified worktree, and never mutates its input", () => {
 	const scopes: FileScope[] = [
 		{ root: REPO, label: "main", kind: "main", lastModifiedMs: 10 },
 		{ root: "/work/a", label: "old · a", kind: "worktree", lastModifiedMs: 5 },
@@ -111,18 +124,19 @@ test("orderScopes puts the most recently modified first, keeps ties in input ord
 	];
 	const snapshot = scopes.map((scope) => ({ ...scope }));
 	const ordered = orderScopes(scopes);
-	assert.deepEqual(ordered.map((scope) => scope.root), ["/work/b", REPO, "/work/a"], "the most recently modified scope comes first");
+	assert.deepEqual(ordered.map((scope) => scope.root), [REPO, "/work/b", "/work/a"], "main keeps the first row and the newest worktree follows it");
 	assert.deepEqual(scopes, snapshot, "ordering never mutates its input");
 	assert.notEqual(ordered, scopes, "ordering returns a new array");
-	assert.equal(ordered[0], scopes[2], "the same scope objects come back");
+	assert.equal(ordered[1], scopes[2], "the same scope objects come back");
 
 	const ties: FileScope[] = [
 		{ root: "/work/b", label: "b", kind: "worktree", lastModifiedMs: 7 },
-		{ root: REPO, label: "main", kind: "main", lastModifiedMs: 7 },
+		{ root: REPO, label: "main", kind: "main", lastModifiedMs: 0 },
 		{ root: "/work/a", label: "a", kind: "worktree", lastModifiedMs: 7 },
 	];
-	assert.deepEqual(orderScopes(ties).map((scope) => scope.root), ["/work/b", REPO, "/work/a"], "recency ties keep their input order, so the session repository keeps its place");
+	assert.deepEqual(orderScopes(ties).map((scope) => scope.root), [REPO, "/work/b", "/work/a"], "recency ties keep their input order, and a stale main stays first");
 	assert.deepEqual(orderScopes([]), [], "no scopes order to nothing");
+	assert.deepEqual(orderScopes([scopes[1]!]).map((scope) => scope.root), ["/work/a"], "a list without main keeps its own order");
 });
 
 test("the card frame is exact at two widths, with the title, esc hint, step subtitle and key footer", () => {
@@ -139,35 +153,35 @@ test("the card frame is exact at two widths, with the title, esc hint, step subt
 	assert.equal(footerText(wide), "↑/↓ move • enter choose scope • esc close", "the footer names one option per action");
 });
 
-test("every scope renders its label, in recency order, and no recency value leaks into the output", () => {
+test("every scope renders its label, with main first and the worktrees by recency, and no recency value leaks into the output", () => {
 	const { view } = createView();
 	const lines = view.render(100);
 	const body = bodyText(lines);
 	for (const scope of SCOPES) assert.ok(body.includes(scope.label), `the label ${JSON.stringify(scope.label)} must be painted`);
 	assert.doesNotMatch(body, /1700000/, "recency is never rendered");
-	assert.match(stripAnsi(lines[3]!), /^│ ▸ feat\/alpha · alpha +│$/, "the most recent scope is selected and the row carries its label only");
+	assert.match(stripAnsi(lines[3]!), /^│ ▸ main +│$/, "the session repository is selected and the row carries its label only");
 	const alphaRow = rowOf(lines, "feat/alpha · alpha");
 	const betaRow = rowOf(lines, "fix/beta · beta");
 	const mainRow = rowOf(lines, "main");
-	assert.ok(alphaRow < betaRow && betaRow < mainRow, "the rows are ordered by recency");
+	assert.ok(mainRow < alphaRow && alphaRow < betaRow, "main is the first row and the worktrees follow by recency");
 });
 
 test("↑/↓ and ctrl+j/ctrl+k move the selection and clamp at both ends; a line feed moves rather than choosing", () => {
 	const { view, calls } = createView();
 	const current = () => selectedRow(view.render(100));
-	assert.match(current(), /│ ▸ feat\/alpha · alpha +│$/);
+	assert.match(current(), /│ ▸ main +│$/);
 	view.handleInput("\x1b[B");
-	assert.match(current(), /│ ▸ fix\/beta · beta +│$/);
+	assert.match(current(), /│ ▸ feat\/alpha · alpha +│$/);
 	view.handleInput("\n");
-	assert.match(current(), /│ ▸ main +│$/, "a bare line feed is ctrl+j, not Enter");
+	assert.match(current(), /│ ▸ fix\/beta · beta +│$/, "a bare line feed is ctrl+j, not Enter");
 	view.handleInput("\x0b");
-	assert.match(current(), /│ ▸ fix\/beta · beta +│$/);
-	view.handleInput("\x1b[A");
 	assert.match(current(), /│ ▸ feat\/alpha · alpha +│$/);
 	view.handleInput("\x1b[A");
-	assert.match(current(), /│ ▸ feat\/alpha · alpha +│$/, "the selection clamps at the top");
+	assert.match(current(), /│ ▸ main +│$/);
+	view.handleInput("\x1b[A");
+	assert.match(current(), /│ ▸ main +│$/, "the selection clamps at the top");
 	for (let index = 0; index < 6; index += 1) view.handleInput("\x1b[B");
-	assert.match(current(), /│ ▸ main +│$/, "the selection clamps at the bottom");
+	assert.match(current(), /│ ▸ fix\/beta · beta +│$/, "the selection clamps at the bottom");
 	assert.deepEqual(calls.select, []);
 	assert.equal(calls.close, 0);
 });
@@ -176,8 +190,8 @@ test("Enter chooses the highlighted scope exactly once and never closes the step
 	const { view, calls } = createView();
 	view.handleInput("\x1b[B");
 	view.handleInput("\r");
-	assert.deepEqual(calls.select.map((scope) => scope.root), [BETA]);
-	assert.deepEqual(calls.trace, [`select:${BETA}`], "choosing hands the scope over without closing it");
+	assert.deepEqual(calls.select.map((scope) => scope.root), [ALPHA]);
+	assert.deepEqual(calls.trace, [`select:${ALPHA}`], "choosing hands the scope over without closing it");
 	view.handleInput("\r");
 	view.handleInput("\x1b");
 	assert.equal(calls.select.length, 1, "a chosen scope cannot fire again");
@@ -211,11 +225,11 @@ test("the scope footer names one option per action while every binding stays fun
 	assert.doesNotMatch(footer, /\bor\b/, "no action is offered twice");
 
 	view.handleInput("\x1b[B");
-	assert.match(selectedRow(view.render(100)), /fix\/beta · beta/, "down still moves");
+	assert.match(selectedRow(view.render(100)), /feat\/alpha · alpha/, "down still moves");
 	view.handleInput("\x0b");
-	assert.match(selectedRow(view.render(100)), /feat\/alpha · alpha/, "the unhinted ctrl+k still moves up");
+	assert.match(selectedRow(view.render(100)), /│ ▸ main +│$/, "the unhinted ctrl+k still moves up");
 	view.handleInput("\x0a");
-	assert.match(selectedRow(view.render(100)), /fix\/beta · beta/, "the unhinted ctrl+j still moves down");
+	assert.match(selectedRow(view.render(100)), /feat\/alpha · alpha/, "the unhinted ctrl+j still moves down");
 	view.handleInput("\x03");
 	assert.equal(calls.close, 1, "the unhinted ctrl+c still closes");
 	assert.deepEqual(calls.select, []);
@@ -232,17 +246,17 @@ test("a throwing scope callback still closes the step exactly once", () => {
 test("the wheel moves the selection and clamps at both ends", () => {
 	const { view } = createView();
 	let lines = view.render(100);
-	assert.match(selectedRow(lines), /feat\/alpha · alpha/);
+	assert.match(selectedRow(lines), /main/);
 	assert.deepEqual(view.handleMouse(mouse(lines, 4, rowOf(lines, "fix/beta"), "wheel", "none", 1)), { handled: true, render: true });
 	lines = view.render(100);
-	assert.match(selectedRow(lines), /fix\/beta · beta/, "the wheel moves the selection");
-	assert.deepEqual(view.handleMouse(mouse(lines, 4, rowOf(lines, "main"), "wheel", "none", 1)), { handled: true, render: true });
+	assert.match(selectedRow(lines), /feat\/alpha · alpha/, "the wheel moves the selection");
+	assert.deepEqual(view.handleMouse(mouse(lines, 4, rowOf(lines, "fix/beta"), "wheel", "none", 1)), { handled: true, render: true });
 	lines = view.render(100);
-	assert.match(selectedRow(lines), /main/);
+	assert.match(selectedRow(lines), /fix\/beta · beta/);
 	assert.deepEqual(view.handleMouse(mouse(lines, 4, rowOf(lines, "main"), "wheel", "none", 1)), { handled: true, render: false }, "the wheel clamps at the end");
-	assert.match(selectedRow(view.render(100)), /│ ▸ main +│$/);
-	assert.deepEqual(view.handleMouse(mouse(lines, 4, rowOf(lines, "main"), "wheel", "none", -1)), { handled: true, render: true });
-	assert.match(selectedRow(view.render(100)), /fix\/beta · beta/, "a wheel up moves back");
+	assert.match(selectedRow(view.render(100)), /│ ▸ fix\/beta · beta +│$/);
+	assert.deepEqual(view.handleMouse(mouse(lines, 4, rowOf(lines, "fix/beta"), "wheel", "none", -1)), { handled: true, render: true });
+	assert.match(selectedRow(view.render(100)), /feat\/alpha · alpha/, "a wheel up moves back");
 });
 
 test("hover paints the shared hover role over an unselected row and clears when the pointer leaves", () => {
@@ -263,6 +277,7 @@ test("a click on a row chooses that row, and a click off the rows chooses nothin
 	let lines = view.render(100);
 	assert.equal(view.handleMouse(mouse(lines, 4, 1)), undefined, "the header row is not a scope");
 	assert.equal(view.handleMouse(mouse(lines, 4, lines.length - 2)), undefined, "the footer row is not a scope");
+	assert.equal(view.handleMouse(mouse(lines, 4, lines.length - 3)), undefined, "the focused-scope detail row is not a scope");
 	assert.deepEqual(calls.select, []);
 	assert.deepEqual(view.handleMouse(mouse(lines, 4, rowOf(lines, "fix/beta"))), { handled: true, render: true });
 	assert.deepEqual(calls.select.map((scope) => scope.root), [BETA], "a click is a confirm on this single-choice step");
@@ -326,4 +341,110 @@ test("a long scope list keeps the selected row visible with the more indicators 
 	for (const line of lines) assert.equal(visibleWidth(line), 100);
 	const hit = rowOf(lines, "branch-20");
 	assert.deepEqual(view.handleMouse(mouse(lines, 4, hit)), { handled: true, render: true }, "a windowed row is clickable where it is painted");
+});
+
+// S32: each row reports how many files the scope has changed in the working
+// tree, right-aligned and in the theme's key colour, and a scope with no
+// uncommitted file paints no count at all.
+test("each scope row reports its uncommitted files at the right, in the theme's key colour", () => {
+	const scopes: FileScope[] = [
+		{ ...SCOPES[0]!, detail: { changedFiles: 3 } },
+		{ ...SCOPES[1]!, detail: { changedFiles: 1 } },
+		{ ...SCOPES[2]!, detail: { changedFiles: 0 } },
+	];
+	const { view } = createView({ theme: ansiTheme }, scopes);
+	const lines = view.render(100);
+	for (const line of lines) assert.equal(visibleWidth(line), 100, "a count never widens the card");
+	const rows = lines.map((line) => stripAnsi(line));
+	const mainRow = rowOf(lines, "main");
+	assert.match(rows[mainRow]!, /^│ ▸ main +3 files changed │$/, `the count sits at the right edge of the selected row: ${rows[mainRow]}`);
+	assert.match(rows[rowOf(lines, "feat/alpha")]!, /^│   feat\/alpha · alpha +1 file changed │$/, "one changed file is singular");
+	assert.match(rows[rowOf(lines, "fix/beta")]!, /^│   fix\/beta · beta +│$/, "a scope with no uncommitted file paints no count");
+	assert.ok(lines[mainRow]!.includes(`${ANSI_ACCENT}3 files changed`), "the count takes the theme's key colour");
+	assert.ok(mainRow < rowOf(lines, "feat/alpha") && rowOf(lines, "feat/alpha") < rowOf(lines, "fix/beta"), "main is the first row and the worktrees follow by recency");
+});
+
+// S32: the scope step's keys are painted like the other panels' — the key in
+// the theme's key colour, the label neutral — while the footer text is the
+// same one option per action list.
+test("the footer keys take the theme's key colour with neutral labels, keeping the text", () => {
+	const tagged = createView({ theme: taggedTheme }).view.render(200);
+	const footer = tagged[tagged.length - 2]!;
+	assert.equal(footerText(createView().view.render(100)), "↑/↓ move • enter choose scope • esc close", "the footer text is unchanged");
+	assert.match(footer, /<accent>↑\/↓<\/accent> <dim>move<\/dim>/, "the move key takes the key colour");
+	assert.match(footer, /<accent>enter<\/accent> <dim>choose scope<\/dim>/, "the choose key takes the key colour");
+	assert.match(footer, /<accent>esc<\/accent> <dim>close<\/dim>/, "the close key takes the key colour");
+	assert.equal(tagged.filter((line) => line.includes("↑/↓ move") || line.includes("<accent>↑/↓</accent>")).length, 1, "the footer is the only row that names the keys");
+});
+
+// S33: the focused scope's data leaves the row and lands on one line directly
+// above the footer — uncommitted files, last modification, last commit and the
+// comparison with its reference — and a field that is zero or absent is silent.
+test("the row above the footer paints the focused scope's detail and never a zero field", () => {
+	const now = 1_700_010_000_000;
+	const scopes: FileScope[] = [
+		{ ...SCOPES[0]!, detail: { changedFiles: 3, lastModifiedMs: now - 5 * 3_600_000, lastCommitSubject: "feat: add the picker", ahead: 2, behind: 0, comparison: "main" } },
+		{ ...SCOPES[1]!, detail: { changedFiles: 0, lastModifiedMs: now - 3 * 86_400_000, lastCommitSubject: "fix: alpha only", ahead: 0, behind: 1, comparison: "main" } },
+		{ ...SCOPES[2]! },
+	];
+	const { view } = createView({ now }, scopes);
+	const detail = (frame: readonly string[]): string => stripAnsi(frame[frame.length - 3]!).slice(2, -2).trim();
+	let lines = view.render(120);
+	assert.equal(detail(lines), "3 files changed · 5h · feat: add the picker · 2 ahead of main", "the zero `behind` field is not painted");
+	assert.equal(footerText(lines), "↑/↓ move • enter choose scope • esc close", "the detail line sits directly above the footer");
+	view.handleInput("\x1b[B");
+	lines = view.render(120);
+	assert.equal(detail(lines), "3d · fix: alpha only · 1 behind main", "a zero `changedFiles` field is not painted");
+	view.handleInput("\x1b[B");
+	lines = view.render(120);
+	assert.equal(detail(lines), "", "a scope with no measured detail paints an empty line, not a fabricated zero");
+	for (const line of lines) assert.equal(visibleWidth(line), 120);
+});
+
+test("a detail line wider than the card is elided instead of breaking the frame", () => {
+	const scopes: FileScope[] = [{ ...SCOPES[0]!, detail: { changedFiles: 1, lastCommitSubject: "x".repeat(200), comparison: "main" } }];
+	const { view } = createView({ now: 1_700_010_000_000 }, scopes);
+	const lines = view.render(72);
+	for (const line of lines) assert.equal(visibleWidth(line), 72);
+	assert.match(stripAnsi(lines[lines.length - 3]!), /…/, "the over-long detail is elided, never wrapped or dropped");
+});
+
+// S33: the Git half of the detail line is injected, so one lookup that fails,
+// is truncated or cannot be parsed must leave its field absent — a repository
+// without a remote or without commits paints less, never a fabricated zero.
+test("loadScopeDetail asks for the comparison range and the last commit subject through the injected runner", async () => {
+	const calls: string[][] = [];
+	const git = async (args: string[]) => {
+		calls.push(args);
+		return args[0] === "rev-list" ? { stdout: "3\t2\n", code: 0 } : { stdout: "fix: the thing\n", code: 0 };
+	};
+	assert.deepEqual(await loadScopeDetail(git, "main"), { comparison: "main", ahead: 2, behind: 3, lastCommitSubject: "fix: the thing" });
+	assert.deepEqual(calls, [["rev-list", "--left-right", "--count", "main...HEAD"], ["log", "-1", "--format=%s"]], "one range and one subject, against the named comparison ref");
+});
+
+test("a failed, truncated or unparsable lookup leaves its field absent instead of a zero", async () => {
+	const failing = async (): Promise<{ stdout: string; code: number }> => { throw new Error("git unavailable"); };
+	assert.deepEqual(await loadScopeDetail(failing, "origin/main"), { comparison: "origin/main" }, "no remote at all paints no comparison");
+	const noRef = async () => ({ stdout: "", code: 128 });
+	assert.deepEqual(await loadScopeDetail(noRef, "origin/main"), { comparison: "origin/main" }, "a missing ref is absent, not level with main");
+	const truncated = async (args: string[]) => args[0] === "rev-list" ? { stdout: "1\t0\n", code: 0, truncated: true } : { stdout: "", code: 0 };
+	assert.deepEqual(await loadScopeDetail(truncated, "main"), { comparison: "main" }, "a truncated range is never read as a count");
+
+	assert.deepEqual(parseAheadBehind("3\t2\n"), { ahead: 2, behind: 3 }, "the left count is behind and the right count ahead");
+	assert.deepEqual(parseAheadBehind("0\t0"), { ahead: 0, behind: 0 }, "a zero range is data; the painter is what drops it");
+	assert.equal(parseAheadBehind(""), undefined);
+	assert.equal(parseAheadBehind("not\tcounts"), undefined);
+	assert.equal(parseAheadBehind("1\t2\t3"), undefined);
+});
+
+test("scopeDetailLine names only the fields that carry a value", () => {
+	const now = 1_700_010_000_000;
+	assert.equal(scopeDetailLine({}, now), "");
+	assert.equal(scopeDetailLine({ changedFiles: 1 }, now), "1 file changed");
+	assert.equal(scopeDetailLine({ changedFiles: 2, ahead: 0, behind: 0, comparison: "main" }, now), "2 files changed", "level with main paints neither side");
+	assert.equal(scopeDetailLine({ lastModifiedMs: now - 30_000 }, now), "30s");
+	assert.equal(scopeDetailLine({ lastModifiedMs: now - 2 * 3_600_000 }, now), "2h");
+	assert.equal(scopeDetailLine({ lastModifiedMs: now - 4 * 86_400_000 }, now), "4d");
+	assert.equal(scopeDetailLine({ behind: 2, comparison: "origin/main" }, now), "2 behind origin/main");
+	assert.equal(scopeDetailLine({ ahead: 1, comparison: "main" }, now), "1 ahead of main");
 });

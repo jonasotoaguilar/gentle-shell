@@ -20,6 +20,7 @@ import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, UNKNOWN_
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { FilePickerView } from "../lib/file-picker-view.ts";
 import { FileScopeView, type FileScope } from "../lib/file-scope-view.ts";
+import { LOCAL_MAIN, REMOTE_MAIN, loadScopeDetail, type ScopeDetail } from "../lib/file-scope-detail.ts";
 import { listRepositoryEntries, readFilePreview } from "../lib/file-index.ts";
 import { formatFileInsertion } from "../lib/file-picker-insert.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
@@ -1790,21 +1791,27 @@ function revisionMtime(revision: string | undefined): number | undefined {
 }
 
 /**
- * How recently a root was worked in, for the picker's scope order only. The
- * recency `/changes` already holds wins: each scanned root's newest changed
- * file carries its mtime in that file's `diffRevision`. A root with no scan
- * yet, or with no changed file, falls back to one stat of the root directory.
- * Neither path lists the root's files, so ordering costs no listing per root.
+ * How recently a root was worked in. The recency `/changes` already holds
+ * wins: each scanned root's newest changed file carries its mtime in that
+ * file's `diffRevision`. A root with no scan yet, or with no changed file,
+ * falls back to one stat of the root directory. Neither path lists the root's
+ * files, so ordering costs no listing per root.
  */
 function scopeRecency(tracker: WorktreeChangesTracker | undefined, root: string): number {
+	const changed = scopeChangedMtime(tracker, root);
+	if (changed !== undefined) return changed;
+	try { return statSync(root).mtimeMs; } catch { return 0; }
+}
+
+/** The working tree's newest change, or undefined when nothing changed. */
+function scopeChangedMtime(tracker: WorktreeChangesTracker | undefined, root: string): number | undefined {
 	let newest = 0;
 	const tree = tracker?.worktrees.find((candidate) => candidate.root === root);
 	for (const file of tree?.model.files ?? []) {
 		const mtime = revisionMtime(file.diffRevision);
 		if (mtime !== undefined && mtime > newest) newest = mtime;
 	}
-	if (newest > 0) return newest;
-	try { return statSync(root).mtimeMs; } catch { return 0; }
+	return newest > 0 ? newest : undefined;
 }
 
 interface OverlayDeps {
@@ -3073,21 +3080,35 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	// registered worktree the list is just `main`, so the extra step is skipped.
 	const filePickerScopes = async (ctx: ExtensionContext): Promise<FileScope[]> => {
 		const main = filePickerRoot(ctx);
-		const scopes: FileScope[] = [{ root: main, label: "main", kind: "main", lastModifiedMs: scopeRecency(changes, main) }];
 		const sessionId = ctx.sessionManager.getSessionId();
 		let roots: string[] = [];
 		try { roots = [...new Set(sessionChangeRoots(sessionId, ctx.sessionManager.getEntries()).filter((root) => deps.rootExists(root) && !isHomeOrBroadUserDirectory(root)))]; }
 		catch { roots = []; }
 		const others = roots.filter((root) => root !== main);
-		const trees = await Promise.all(others.map(async (root): Promise<FileScope> => {
+		// The scope step reports each root's uncommitted files (S32) and its Git
+		// detail (S33) from the same scan /changes reads, so it runs once here,
+		// before the step opens. A scan that fails leaves those fields absent
+		// instead of inventing zeros.
+		if (others.length > 0 && changes) await changes.refresh().catch(() => undefined);
+		const detailFor = async (root: string, kind: FileScope["kind"]): Promise<ScopeDetail> => {
+			const changed = changes?.worktrees.find((tree) => tree.root === root)?.model.files.length;
+			const mtime = scopeChangedMtime(changes, root);
+			return {
+				...(await loadScopeDetail(deps.gitRunner(root), kind === "main" ? REMOTE_MAIN : LOCAL_MAIN)),
+				...(changed === undefined ? {} : { changedFiles: changed }),
+				...(mtime === undefined ? {} : { lastModifiedMs: mtime }),
+			};
+		};
+		const headScope = async (): Promise<FileScope> => ({ root: main, label: "main", kind: "main", lastModifiedMs: scopeRecency(changes, main), detail: await detailFor(main, "main") });
+		const treeScopes = async (): Promise<FileScope[]> => Promise.all(others.map(async (root): Promise<FileScope> => {
 			const known = changes?.worktrees.find((tree) => tree.root === root)?.branch;
 			// A rejected branch lookup is unknown, never "detached": git never
 			// answered, so the root's HEAD state is not known (lib/shell-changes.ts).
 			const branch = known ?? await foreignRootBranch(deps.gitRunner(root)).catch(() => UNKNOWN_BRANCH);
-			return { root, label: `${branch ?? "detached"} · ${basename(root)}`, kind: "worktree", lastModifiedMs: scopeRecency(changes, root) };
+			return { root, label: `${branch ?? "detached"} · ${basename(root)}`, kind: "worktree", lastModifiedMs: scopeRecency(changes, root), detail: await detailFor(root, "worktree") };
 		}));
-		scopes.push(...trees);
-		return scopes;
+		const [head, trees] = await Promise.all([headScope(), treeScopes()]);
+		return [head, ...trees];
 	};
 	const openFilePicker = async (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
@@ -3100,6 +3121,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 						theme,
 						rows: () => Math.max(0, tui.terminal.rows),
 						scopes,
+						now: deps.now(),
 						onSelect: (chosen) => close(chosen),
 						onClose: () => close(null),
 						requestRender: () => tui.requestRender(),
@@ -3142,11 +3164,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					requestRender: () => tui.requestRender(),
 				});
 			},
-			// Narrow like the Commands palette and the Customization panel (70%,
-			// 60-column floor) instead of the first cut's wide card, and the whole
-			// terminal as the height budget: Pi truncates an overlay's rows from the
-			// bottom, so a smaller percentage would drop the card's footer line.
-			{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "100%" } },
+			// Wider than the Commands palette (85% with a 76-column floor, S27) while
+			// the whole terminal stays the height budget: Pi truncates an overlay's
+			// rows from the bottom, so a smaller percentage would drop the card's
+			// footer line.
+			{ overlay: true, overlayOptions: { anchor: "center", width: "85%", minWidth: 76, maxHeight: "100%" } },
 		);
 		if (editorFile === null || !host) return;
 		try {
