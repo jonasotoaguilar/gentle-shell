@@ -392,11 +392,11 @@ test("the row above the footer paints the focused scope's detail and never a zer
 	const { view } = createView({ now }, scopes);
 	const detail = (frame: readonly string[]): string => stripAnsi(frame[frame.length - 3]!).slice(2, -2).trim();
 	let lines = view.render(120);
-	assert.equal(detail(lines), "±3 files · 5h · feat: add the picker · ↑2 main", "the zero `behind` field is not painted");
+	assert.equal(detail(lines), "feat: add the picker · ±3 files · 5h · ↑2 main", "the commit subject leads and the zero `behind` field is not painted");
 	assert.equal(footerText(lines), "↑/↓ move • enter choose scope • esc close", "the detail line sits directly above the footer");
 	view.handleInput("\x1b[B");
 	lines = view.render(120);
-	assert.equal(detail(lines), "3d · fix: alpha only · ↓1 main", "a zero `changedFiles` field is not painted");
+	assert.equal(detail(lines), "fix: alpha only · 3d · ↓1 main", "the subject leads even when a zero `changedFiles` field is not painted");
 	view.handleInput("\x1b[B");
 	lines = view.render(120);
 	assert.equal(detail(lines), "", "a scope with no measured detail paints an empty line, not a fabricated zero");
@@ -451,7 +451,7 @@ test("scopeDetailLine names only the fields that carry a value", () => {
 	assert.equal(scopeDetailLine({ ahead: 1, comparison: "main" }, now), "↑1 main");
 	assert.equal(
 		scopeDetailLine({ changedFiles: 3, lastModifiedMs: now - 5 * 3_600_000, lastCommitSubject: "feat: add the picker", ahead: 0, behind: 2, comparison: "origin/main" }, now),
-		"±3 files · 5h · feat: add the picker · ↓2 origin/main",
-		"every field keeps the ` · ` separator and joins the glyphs to the same terse values",
+		"feat: add the picker · ±3 files · 5h · ↓2 origin/main",
+		"the commit subject leads, and the rest keep their relative order across the same ` · ` separator",
 	);
 });

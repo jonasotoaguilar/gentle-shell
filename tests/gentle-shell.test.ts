@@ -5658,12 +5658,12 @@ test("the scope step reports each root's uncommitted files and the focused scope
 	assert.match(lines.join("\n"), /Choose a scope/);
 	assert.match(lines[rowOfText(lines, "▸ main")]!, /▸ main +±3 files │$/, "the session repository leads and reports its uncommitted files");
 	assert.match(lines[rowOfText(lines, "fix/beta")]!, /fix\/beta · linked +±1 file │$/, "a registered worktree reports its own count, singular at one");
-	assert.equal(detail(), "±3 files · chore: seed the repo · ↓2 origin/main", "main is measured against the remote main, and its zero `ahead` is silent");
+	assert.equal(detail(), "chore: seed the repo · ±3 files · ↓2 origin/main", "the last commit subject leads; main is measured against the remote main, and its zero `ahead` is silent");
 	assert.ok(rowOfText(lines, "▸ main") < rowOfText(lines, "fix/beta"), "main is always the first row");
 
 	scopeView.handleInput("\x1b[B");
 	lines = frame();
-	assert.equal(detail(), "±1 file · feat: linked work · ↑1 main", "a worktree is compared with the local main, and its zero `behind` is silent");
+	assert.equal(detail(), "feat: linked work · ±1 file · ↑1 main", "the last commit subject leads; a worktree is compared with the local main, and its zero `behind` is silent");
 	assert.ok(calls.some((args) => args.join(" ") === "-C /repo rev-list --left-right --count origin/main...HEAD"), "main asks for its range against the remote main");
 	assert.ok(calls.some((args) => args.join(" ") === "-C /linked rev-list --left-right --count main...HEAD"), "a worktree asks for its range against the local main");
 	assert.ok(calls.some((args) => args.join(" ") === "-C /linked log -1 --format=%s"), "the last commit subject comes from Git, not the label");
@@ -5687,7 +5687,7 @@ test("a scope whose Git answers nothing paints no comparison field", async () =>
 	await until(() => ui.overlayView !== previous && ui.overlayView !== undefined);
 	const scopeView = ui.overlayView!;
 	const detail = () => stripAnsi(scopeView.render(120).at(-3)!).slice(2, -2).trim();
-	assert.equal(detail(), "±3 files · chore: seed the repo", "no remote means no comparison, and no fabricated zero");
+	assert.equal(detail(), "chore: seed the repo · ±3 files", "no remote means no comparison, and no fabricated zero");
 	scopeView.handleInput("\x1b");
 	await opened;
 	await fire(h.handlers, "session_shutdown", ctx);

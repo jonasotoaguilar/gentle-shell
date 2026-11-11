@@ -89,17 +89,17 @@ export function countCell(files: number): string {
 }
 
 /**
- * The detail line's text: the uncommitted files, the last modification's age,
- * the last commit subject, and the distance from the comparison ref. A field
- * that is zero or absent is not painted at all, and nothing here claims a
- * value Git did not answer.
+ * The detail line's text: the last commit subject first (S40), then the
+ * uncommitted files, the last modification's age and the distance from the
+ * comparison ref. A field that is zero or absent is not painted at all, and
+ * nothing here claims a value Git did not answer.
  */
 export function scopeDetailLine(detail: ScopeDetail, nowMs: number): string {
 	const fields: string[] = [];
+	if (detail.lastCommitSubject) fields.push(detail.lastCommitSubject);
 	const files = detail.changedFiles ?? 0;
 	if (files > 0) fields.push(countCell(files));
 	if (detail.lastModifiedMs !== undefined && detail.lastModifiedMs > 0) fields.push(formatAge(detail.lastModifiedMs, nowMs));
-	if (detail.lastCommitSubject) fields.push(detail.lastCommitSubject);
 	const comparison = detail.comparison;
 	if (comparison !== undefined && (detail.ahead ?? 0) > 0) fields.push(`${AHEAD_SYMBOL}${detail.ahead} ${comparison}`);
 	if (comparison !== undefined && (detail.behind ?? 0) > 0) fields.push(`${BEHIND_SYMBOL}${detail.behind} ${comparison}`);
