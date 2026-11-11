@@ -5454,6 +5454,43 @@ test("the picker title row shows the chosen scope's path", async () => {
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
+// S26 at the narrow floor: the overlay opens with `width: "70%", minWidth: 60`,
+// so 60 columns is the tightest card a terminal can give the picker. A long
+// worktree root has to elide from the left there — dropping the leading
+// segments while keeping the tail that says which scope the list belongs to —
+// instead of costing the title or pushing the esc hint off the row.
+test("the picker title row elides a long worktree path at the 60-column floor", async () => {
+	const root = "/home/dev/projects/gentle-shell-worktrees/a-very-long-worktree-name";
+	const h = fakePi();
+	filePickerGit(h.pi, { "/repo": ["AGENTS.md"], [root]: ["long-root-only.ts"] }, [root]);
+	gentleShell(h.pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	const frame = () => stripAnsi(ui.overlayView!.render(60).join("\n"));
+	const header = () => stripAnsi(ui.overlayView!.render(60)[1]!);
+
+	await h.tools.get("session_worktree_register")!.execute("r", { path: root }, undefined, undefined, ctx);
+	const previous = ui.overlayView;
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await until(() => ui.overlayView !== previous);
+	const scopeView = ui.overlayView!;
+	scopeView.handleInput("\x1b[B");
+	scopeView.handleInput("\r");
+	await until(() => ui.overlayView !== scopeView);
+	await until(() => frame().includes("long-root-only.ts"));
+
+	const row = header();
+	assert.equal(visibleWidth(row), 60, `the title row keeps the 60-column card's width: ${row}`);
+	assert.match(row, /^│ File picker /, `the title keeps its place at the left: ${row}`);
+	assert.match(row, /esc +│$/, `the esc hint stays at the right edge: ${row}`);
+	assert.match(row, /…/, `the long root is elided, not dropped: ${row}`);
+	assert.doesNotMatch(row, /\/home\/dev\/projects/, `the leading segments of the path are gone: ${row}`);
+	assert.match(row, /a-very-long-worktree-name/, `the identifying tail of the chosen root is still painted: ${row}`);
+	ui.overlayView!.handleInput("\x1b");
+	await opened;
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
 test("the scope step appears only with a listed worktree, closes first, and browses the chosen root", async () => {
 	const h = fakePi();
 	const calls = filePickerGit(h.pi, { "/repo": ["AGENTS.md"], "/linked": ["linked-only.ts"] }, ["/linked"]);
