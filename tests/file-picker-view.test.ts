@@ -11,9 +11,27 @@ import { stripAnsi } from "../lib/terminal-theme.ts";
 
 const CTRL_SHIFT_J = "\x1b[106;6u";
 const CTRL_SHIFT_K = "\x1b[107;6u";
+// ctrl+o cycles the listing order (S29).
+const CTRL_O = "\x0f";
 const PAGE_DOWN = "\x1b[6~";
 const PAGE_UP = "\x1b[5~";
 const TAB = "\t";
+
+// Home/End compatibility (S28): the encodings a terminal really sends for
+// those keys — the CSI letter form, the SS3 form, the tilde form and the rxvt
+// form — plus the ctrl spellings (xterm `1;5`, the `7;5`/`8;5` tilde keys and
+// the rxvt ctrl form). `ESC [ 1 ; 5 ~` / `ESC [ 4 ; 5 ~` are not accepted by
+// Pi's key helpers, so they cannot be covered here.
+const HOME_SEQUENCES = ["\x1b[H", "\x1bOH", "\x1b[1~", "\x1b[7~"];
+const END_SEQUENCES = ["\x1b[F", "\x1bOF", "\x1b[4~", "\x1b[8~"];
+const CTRL_HOME_SEQUENCES = ["\x1b[1;5H", "\x1b[7;5~", "\x1b[7^", "\x1b[57423;5u"];
+const CTRL_END_SEQUENCES = ["\x1b[1;5F", "\x1b[8;5~", "\x1b[8^", "\x1b[57424;5u"];
+
+// The Pi theme's key colour (accent) and the neutral label tone (muted), so a
+// painted cell can be asserted the way the terminal receives it.
+const KEY_ROLE = "\x1b[35m";
+const LABEL_ROLE = "\x1b[90m";
+const ROLE_END = "\x1b[39m";
 
 // Card rows: top border, header, search row, blank separator, count row, body.
 const SEARCH_ROW = 2;
@@ -21,7 +39,7 @@ const COUNT_ROW = 4;
 const BODY_TOP = 5;
 // A selected row's marker cell: the accent bar that joins across adjacent rows.
 const SELECTION_BAR = "▏";
-const FOOTER_TEXT = "↑/↓ move • ctrl+j/k scroll • tab select • ctrl+u clear • enter insert • ctrl+e editor • esc close";
+const FOOTER_TEXT = "↑/↓ move • ctrl+j/k scroll • tab select • ctrl+o order • ctrl+u clear • enter insert • ctrl+e editor • esc close";
 const ROOT = "/home/dev/projects/gentle-shell-worktrees/file-picker";
 
 // A fixed clock: the row ages are computed once when the panel opens, so a
@@ -171,6 +189,25 @@ function rawPreviewCell(lines: readonly string[], offset: number): string {
 	return cells[1] ?? "";
 }
 
+/** The count row's text: the file and selection counts, then the active order. */
+function countCell(lines: readonly string[]): string {
+	return stripAnsi(lines[COUNT_ROW] ?? "").replace(/^│ /, "").replace(/ +│$/, "");
+}
+
+/**
+ * The basenames the list pane paints, top to bottom. The list is a flat set of
+ * rows, so the painted rows are the whole order the user sees.
+ */
+function paintedList(lines: readonly string[], names: readonly string[]): string[] {
+	const painted: string[] = [];
+	for (let index = BODY_TOP; index <= lines.length - 3; index += 1) {
+		const cell = stripAnsi(lines[index] ?? "").split(" │ ")[0] ?? "";
+		const name = names.find((candidate) => cell.includes(candidate));
+		if (name !== undefined && !painted.includes(name)) painted.push(name);
+	}
+	return painted;
+}
+
 function footerText(lines: readonly string[]): string {
 	return stripAnsi(lines[lines.length - 2] ?? "").replace(/^│ /, "").replace(/ +│$/, "");
 }
@@ -269,25 +306,25 @@ test("a count row under the blank line reports the files listed and the Tab sele
 	const { view } = await openView({}, [entry("a.ts"), entry("b.ts"), entry("c.ts")]);
 	let lines = view.render(120);
 	assert.match(stripAnsi(lines[COUNT_ROW - 1]!), /^│ +│$/, "the blank row stays between the search row and the count");
-	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(0 selected\) +│$/, "the count row sits under the blank line");
+	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(0 selected\) · modified +│$/, "the count row sits under the blank line");
 	assert.ok(stripAnsi(lines[BODY_TOP]!).includes("a.ts"), "the list starts under the count row");
 	view.handleInput(TAB);
 	lines = view.render(120);
-	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(1 selected\) +│$/, "Tab updates the selection count immediately");
+	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(1 selected\) · modified +│$/, "Tab updates the selection count immediately");
 	view.handleInput("\x1b[B");
 	view.handleInput(TAB);
 	lines = view.render(120);
-	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(2 selected\) +│$/, "a second Tab counts too");
+	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(2 selected\) · modified +│$/, "a second Tab counts too");
 	for (const character of "b") view.handleInput(character);
 	lines = view.render(120);
-	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 1 file \(2 selected\) +│$/, "filtering updates the file count at once, and the selection count never lies about the whole selection");
+	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 1 file \(2 selected\) · modified +│$/, "filtering updates the file count at once, and the selection count never lies about the whole selection");
 });
 
 test("the count row keeps the card geometry at a narrow width and at the smallest height", async () => {
 	const { view } = await openView({}, [entry("a.ts")]);
 	const narrow = view.render(40);
 	assert.equal(visibleWidth(narrow[COUNT_ROW]!), 40);
-	assert.match(stripAnsi(narrow[COUNT_ROW]!), /^│ 1 file \(0 selected\) +│$/, "a single file reads as one file");
+	assert.match(stripAnsi(narrow[COUNT_ROW]!), /^│ 1 file \(0 selected\) · modified +│$/, "a single file reads as one file");
 	assert.equal(narrow.length, view.render(120).length, "the count row never adds a row");
 
 	const small = (await openView({ rows: 9 }, [entry("a.ts")])).view.render(120);
@@ -721,12 +758,12 @@ test("a changed row shows its state badge and the age computed once when the pan
 	const { view } = await openView({ now: () => clock }, list);
 	const first = view.render(120);
 	assert.match(listCell(first, "fresh.ts"), /^▸ {2}fresh\.ts +new 5s$/, "the age is right-aligned after the badge");
-	assert.match(listCell(first, "edited.ts"), /^ {3}edited\.ts +upt 3h$/);
-	assert.match(listCell(first, "stale.ts"), /^ {3}stale\.ts +upt 2d$/);
+	assert.match(listCell(first, "edited.ts"), /^ {3}edited\.ts +upd 3h$/);
+	assert.match(listCell(first, "stale.ts"), /^ {3}stale\.ts +upd 2d$/);
 	assert.match(listCell(first, "untouched.ts"), /^ {3}untouched\.ts *$/, "a clean row shows neither badge nor age");
 
 	clock = NOW + 30 * DAY;
-	assert.match(listCell(view.render(120), "edited.ts"), /^ {3}edited\.ts +upt 3h$/, "ages are never recomputed");
+	assert.match(listCell(view.render(120), "edited.ts"), /^ {3}edited\.ts +upd 3h$/, "ages are never recomputed");
 });
 
 test("a changed row without an mtime shows its badge and no age", async () => {
@@ -734,7 +771,7 @@ test("a changed row without an mtime shows its badge and no age", async () => {
 	const changed = listCell(view.render(120), "brand-new.ts");
 	assert.match(changed, /brand-new\.ts +new$/);
 	assert.doesNotMatch(changed, /\b\d+[smhd]\b/, "no age without an mtime");
-	assert.doesNotMatch(listCell(view.render(120), "plain.ts"), /\bnew\b|\bupt\b/);
+	assert.doesNotMatch(listCell(view.render(120), "plain.ts"), /\bnew\b|\bupd\b/, "a clean file paints neither badge");
 });
 
 test("an empty query keeps the order the listing returned and a query still ranks", async () => {
@@ -825,6 +862,165 @@ test("the preview shows the top visible line over the total at its top-right, ad
 	assert.doesNotMatch(previewCell(binary.view.render(120), 0), /\d+\/\d+/, "a binary preview has no line position to claim");
 });
 
+test("home and end jump the selection to the first and last file for every terminal encoding, and stay out of the footer", async () => {
+	const list = [entry("a.ts"), entry("b.ts"), entry("c.ts")];
+	const { view, calls } = await openView({}, list);
+	for (const sequence of END_SEQUENCES) {
+		view.handleInput("\x1b[A");
+		view.handleInput(sequence);
+		assert.match(selectedRow(view.render(120)), /c\.ts/, `end jumps to the last file for ${JSON.stringify(sequence)}`);
+	}
+	for (const sequence of HOME_SEQUENCES) {
+		view.handleInput("\x1b[B");
+		view.handleInput(sequence);
+		assert.match(selectedRow(view.render(120)), /a\.ts/, `home jumps to the first file for ${JSON.stringify(sequence)}`);
+	}
+	assert.deepEqual(calls.insert, [], "the compatibility bindings never insert");
+	assert.equal(calls.close, 0);
+	const footer = footerText(view.render(200));
+	assert.equal(footer, FOOTER_TEXT, "the footer text is unchanged");
+	assert.doesNotMatch(footer, /home|end/i, "home and end are compatibility bindings and are never named");
+});
+
+test("ctrl+home and ctrl+end jump the preview to its first line and its last page for every terminal encoding", async () => {
+	const long = Array.from({ length: 60 }, (_, index) => `line ${index}`);
+	const { view, calls } = await openView({ rows: 16, loadPreview: async () => preview(long) });
+	for (const sequence of CTRL_END_SEQUENCES) {
+		view.handleInput(sequence);
+		const lines = view.render(120);
+		assert.match(previewCell(lines, 0), /^ *56\/60$/, `ctrl+end shows the last page for ${JSON.stringify(sequence)}`);
+		assert.match(previewCell(lines, 5), /60 line 59/, "the end of the file is on screen");
+		view.handleInput(CTRL_HOME_SEQUENCES[0]!);
+	}
+	for (const sequence of CTRL_HOME_SEQUENCES) {
+		view.handleInput(CTRL_END_SEQUENCES[0]!);
+		view.handleInput(sequence);
+		const lines = view.render(120);
+		assert.match(previewCell(lines, 0), /^ *1\/60$/, `ctrl+home shows the first line for ${JSON.stringify(sequence)}`);
+		assert.match(previewCell(lines, 1), /1 line 0/, "the top of the file is on screen");
+	}
+	assert.match(selectedRow(view.render(120)), /README\.md/, "the preview jumps never move the selection");
+	assert.deepEqual(calls.insert, []);
+	assert.equal(calls.close, 0);
+});
+
+test("the esc hint and every footer key token paint in the theme key colour, with the labels in the neutral tone", async () => {
+	const roleTheme: FilePickerTheme = {
+		fg(color: string, text: string) {
+			if (color === "accent") return `${KEY_ROLE}${text}${ROLE_END}`;
+			if (color === "muted") return `${LABEL_ROLE}${text}${ROLE_END}`;
+			return text;
+		},
+	};
+	const keys = ["↑/↓", "ctrl+j/k", "tab", "ctrl+o", "ctrl+u", "enter", "ctrl+e", "esc"];
+	const labels = ["move", "scroll", "select", "order", "clear", "insert", "editor", "close"];
+	const { view } = await openView({ theme: roleTheme });
+	const lines = view.render(200);
+	assert.ok(lines[1]!.includes(`${KEY_ROLE}esc${ROLE_END}`), "the title row's esc hint uses the key role");
+	const footer = lines[lines.length - 2]!;
+	for (const key of keys) {
+		assert.ok(footer.includes(`${KEY_ROLE}${key}${ROLE_END}`), `the ${key} token is painted in the key role`);
+		assert.ok(!footer.includes(`${LABEL_ROLE}${key}`), `the ${key} token is not painted in the label role`);
+	}
+	for (const label of labels) {
+		assert.ok(footer.includes(`${LABEL_ROLE}${label}${ROLE_END}`), `the ${label} label keeps the neutral tone`);
+		assert.ok(!footer.includes(`${KEY_ROLE}${label}`), `the ${label} label is not painted in the key role`);
+	}
+	assert.equal(footerText(lines), FOOTER_TEXT, "the painted footer still reads as the same key list");
+	for (const line of lines) assert.equal(visibleWidth(line), 200);
+
+	const narrow = view.render(80);
+	assert.ok(footerText(narrow).endsWith("…"), "the painted footer still truncates on one row");
+	assert.equal(narrow.length, lines.length, "the role-split footer never adds a row");
+});
+
+test("a preview line wider than the pane wraps onto continuation rows under one gutter number, and the next line keeps its own", async () => {
+	const wide = "abcdefghij".repeat(18);
+	const { view } = await openView({ rows: 20, loadPreview: async () => preview(["first", wide, "second"]) });
+	const lines = view.render(120);
+	for (const line of lines) assert.equal(visibleWidth(line), 120, "a wrapped row is never ragged");
+	assert.match(previewCell(lines, 0), /^ *1\/3$/, "the position counts file lines, not painted rows");
+
+	const firstRow = previewCell(lines, 1)!;
+	const wrappedRows = [2, 3, 4].map((offset) => previewCell(lines, offset)!);
+	const nextRow = previewCell(lines, 5)!;
+	assert.match(firstRow, /^ *1 first *$/, "the first line keeps its own number");
+	assert.match(wrappedRows[0]!, /^ *2 abcdefghij/, "the wide line's number sits on its first row");
+	const textColumn = wrappedRows[0]!.indexOf("abcdefghij");
+	for (const row of wrappedRows.slice(1)) {
+		assert.equal(row.slice(0, textColumn).trim(), "", "a continuation row leaves the gutter blank");
+		assert.equal(row.search(/\S/), textColumn, "a continuation row aligns under the same text column");
+		assert.doesNotMatch(row, /…/, "a wrapped line is never truncated with an ellipsis");
+	}
+	const reassembled = wrappedRows.map((row) => row.slice(textColumn)).join("").trimEnd();
+	assert.equal(reassembled, wide, "the whole line is painted across the rows");
+	assert.match(nextRow, /^ *3 second/, "the following file line keeps its own number");
+
+	const small = await openView({ rows: 12, loadPreview: async () => preview(["first", wide, "second"]) });
+	for (let index = 0; index < 5; index += 1) small.view.handleInput(CTRL_SHIFT_J);
+	const scrolled = small.view.render(120);
+	assert.match(previewCell(scrolled, 0), /^ *2\/3$/, "a scroll into a wrapped line still reports the file line it belongs to");
+	assert.match(previewCell(scrolled, 2), /^ *3 second/, "scrolling to the last page reaches the end of the file");
+});
+
+/** The preview's text column in cells, measured from a painted row at `width`. */
+async function previewRoom(width = 120): Promise<number> {
+	const { view } = await openView({ rows: 20, loadPreview: async () => preview(["x".repeat(400)]) });
+	const painted = previewCell(view.render(width), 1) ?? "";
+	return painted.trimEnd().length - painted.indexOf("x");
+}
+
+test("a double-width grapheme that straddles a wrap boundary starts the next row instead of vanishing", async () => {
+	// A line fills the text column short of the two cells its last grapheme
+	// needs, so the wrap boundary falls inside that grapheme.
+	const room = await previewRoom();
+	const prefix = "a".repeat(room - 1);
+	const line = `${prefix}漢字`;
+	const { view } = await openView({ rows: 20, loadPreview: async () => preview(["first", line, "second"]) });
+	const lines = view.render(120);
+	for (const painted of lines) assert.equal(visibleWidth(painted), 120, "a wrapped frame of wide graphemes is still exact");
+	assert.match(previewCell(lines, 0), /^ *1\/3$/, "the position still counts file lines");
+
+	const wrapped = [2, 3].map((offset) => previewCell(lines, offset)!);
+	const column = wrapped[0]!.indexOf("a");
+	assert.equal(wrapped[0]!.slice(column).trimEnd(), prefix, "the first row stops before the grapheme it cannot fit");
+	assert.equal(wrapped[1]!.slice(column).trim(), "漢字", "both graphemes of the broken boundary are painted on the next row");
+	const reassembled = wrapped.map((row) => row.slice(column).trimEnd()).join("");
+	assert.equal(reassembled, line, "the whole line is painted, with no CJK grapheme dropped");
+	assert.equal(wrapped[1]!.slice(0, column).trim(), "", "the continuation row leaves the gutter blank");
+	assert.match(previewCell(lines, 4), /^ *3 second/, "the next file line keeps its own row");
+});
+
+test("an emoji that straddles a wrap boundary is painted whole on the next row, including a joined sequence", async () => {
+	const room = await previewRoom();
+	const prefix = "b".repeat(room - 1);
+	const family = "👨‍👩‍👧";
+	const line = `${prefix}${family}c`;
+	const { view } = await openView({ rows: 20, loadPreview: async () => preview([line]) });
+	const lines = view.render(120);
+	for (const painted of lines) assert.equal(visibleWidth(painted), 120, "the wrapped frame of emoji is still exact");
+	assert.match(previewCell(lines, 0), /^ *1\/1$/, "the position still counts the file's single line");
+
+	const wrapped = [1, 2].map((offset) => previewCell(lines, offset)!);
+	const column = wrapped[0]!.indexOf("b");
+	assert.equal(wrapped[0]!.slice(column).trimEnd(), prefix, "the first row stops before the emoji it cannot fit");
+	assert.equal(wrapped[1]!.slice(column).trim(), `${family}c`, "the joined emoji sequence is painted intact and is never split");
+	const reassembled = wrapped.map((row) => row.slice(column).trimEnd()).join("");
+	assert.equal(reassembled, line, "the whole line is painted, with the emoji present exactly once");
+});
+
+test("a preview pane narrower than a double-width grapheme paints it on its own row instead of dropping it", async () => {
+	// At 14 columns the preview pane is three cells wide: a gutter cell, the
+	// gap and a one-cell text column that can never hold a CJK grapheme.
+	const { view } = await openView({ rows: 20, loadPreview: async () => preview(["漢字"]) });
+	const lines = view.render(14);
+	for (const painted of lines) assert.equal(visibleWidth(painted), 14, "the narrow card is still exact");
+	assert.match(previewCell(lines, 0), /^1\/1$/, "the position still counts the file's single line");
+	assert.equal(previewCell(lines, 1), "1漢", "the first grapheme is painted beside its line number, one row for it");
+	assert.equal(previewCell(lines, 2), " 字", "the second grapheme gets its own row rather than being lost");
+	assert.equal(previewCell(lines, 3), "   ", "the row count matches what is painted, so no extra row is left over");
+});
+
 test("an error preview renders its message", async () => {
 	const { view } = await openView({ loadPreview: async () => ({ kind: "error", message: "Cannot read src/app.ts (EACCES)." }) });
 	assert.ok(bodyText(view.render(120)).includes("Cannot read src/app.ts (EACCES)."));
@@ -901,4 +1097,107 @@ test("the listing and each preview are loaded at most once and previews are cach
 	assert.equal(listCalls, 1);
 	assert.deepEqual(previewCalls, ["a.ts", "b.ts"]);
 	assert.match(bodyText(view.render(120)), /a\.ts body/);
+});
+
+// The listing order selector (S29): the exact orders and the exact rows they
+// paint, over a flat list.
+const TREE_BASENAMES = ["CODEOWNERS", "bug.md", "ci.yml", ".gitignore", "AGENTS.md", "cli.ts", "reference.md", "guide.md", "app.ts", "util.ts"];
+// Directory-major: every file of a folder and of its subfolders together, the
+// way an explorer paints the tree (.github/…, then .gitignore, then the rest).
+const PATH_ORDER = ["CODEOWNERS", "bug.md", "ci.yml", ".gitignore", "AGENTS.md", "cli.ts", "reference.md", "guide.md", "app.ts", "util.ts"];
+const TREE_FILES = [
+	entry("docs/guide.md"),
+	entry("src/app.ts", "new", NOW - MINUTE),
+	entry(".gitignore"),
+	entry(".github/workflows/ci.yml"),
+	entry(".github/CODEOWNERS"),
+	entry(".github/ISSUE_TEMPLATE/bug.md"),
+	entry("bin/cli.ts"),
+	entry("AGENTS.md"),
+	entry("src/lib/util.ts"),
+	entry("docs/api/reference.md"),
+];
+const EXT_BASENAMES = ["alpha.md", "gamma.md", "beta.ts", "zeta.ts", "LICENSE", "Makefile"];
+const EXT_FILES = [entry("zeta.ts"), entry("alpha.md"), entry("beta.ts"), entry("LICENSE"), entry("gamma.md"), entry("Makefile")];
+
+test("the info row names the active order and ctrl+o cycles modified, path, ext and back to modified", async () => {
+	const { view, calls } = await openView({}, [entry("b.ts"), entry("a.md")]);
+	assert.equal(countCell(view.render(120)), "2 files (0 selected) · modified", "modified is the default order");
+	view.handleInput(CTRL_O);
+	assert.equal(countCell(view.render(120)), "2 files (0 selected) · path");
+	view.handleInput(CTRL_O);
+	assert.equal(countCell(view.render(120)), "2 files (0 selected) · ext");
+	view.handleInput(CTRL_O);
+	assert.equal(countCell(view.render(120)), "2 files (0 selected) · modified", "the third press returns to modified");
+	assert.deepEqual(calls.insert, [], "cycling never inserts");
+	assert.deepEqual(calls.open, []);
+	assert.equal(calls.close, 0, "cycling never closes the panel");
+});
+
+test("the default modified order keeps the listing order, and only ctrl+o re-sorts it", async () => {
+	const list = [entry("z-newest.ts", "new", NOW - MINUTE), entry("m-older.ts", "updated", NOW - HOUR), entry("a-clean.ts")];
+	const { view } = await openView({}, list);
+	const lines = view.render(120);
+	assert.deepEqual(paintedList(lines, ["a-clean.ts", "m-older.ts", "z-newest.ts"]), ["z-newest.ts", "m-older.ts", "a-clean.ts"], "the listing's changed-first, newest-first order is painted");
+	assert.equal(countCell(lines), "3 files (0 selected) · modified");
+});
+
+test("the path order keeps every file of a folder and its subfolders together, like an IDE explorer, and still paints the badge", async () => {
+	const { view } = await openView({ rows: 40 }, TREE_FILES);
+	view.handleInput(CTRL_O);
+	const lines = view.render(120);
+	assert.equal(countCell(lines), "10 files (0 selected) · path");
+	const painted = paintedList(lines, TREE_BASENAMES);
+	assert.deepEqual(painted, PATH_ORDER, "the whole list is in directory-major alphabetical order");
+	assert.match(listCell(lines, "app.ts"), /app\.ts +src +new 1m/, "a changed row keeps its badge and age");
+	assert.match(listCell(lines, "util.ts"), /^ {3}util\.ts +src\/lib *$/, "an unchanged row still paints neither");
+	for (const line of lines) assert.equal(visibleWidth(line), 120);
+});
+
+test("the ext order groups every file by extension, alphabetical by extension and then by path, with no extension last", async () => {
+	const { view } = await openView({ rows: 20 }, EXT_FILES);
+	view.handleInput(CTRL_O);
+	view.handleInput(CTRL_O);
+	const lines = view.render(120);
+	assert.equal(countCell(lines), "6 files (0 selected) · ext");
+	assert.deepEqual(paintedList(lines, EXT_BASENAMES), ["alpha.md", "gamma.md", "beta.ts", "zeta.ts", "LICENSE", "Makefile"], "grouped by extension, then by path, with the extensionless files last");
+});
+
+test("cycling the order keeps the highlighted file highlighted, visible in the window, and its preview untouched", async () => {
+	const long = Array.from({ length: 60 }, (_, index) => `line ${index}`);
+	const list = [entry("z/last.ts", "new", NOW - MINUTE), entry("m/mid.ts"), entry("a/first.ts")];
+	const { view, calls } = await openView({ rows: 20, loadPreview: async () => preview(long) }, list);
+	assert.match(selectedRow(view.render(120)), /last\.ts/);
+	for (let index = 0; index < 3; index += 1) view.handleInput(CTRL_SHIFT_J);
+	assert.match(previewTop(view.render(120)), /line 3/);
+	view.handleInput(CTRL_O);
+	let lines = view.render(120);
+	assert.match(selectedRow(lines), /last\.ts/, "the same file stays highlighted when it moves in the new order");
+	assert.equal(rowOf(lines, "last.ts"), BODY_TOP + 2, "the highlight moved with the file, not the index");
+	assert.match(previewTop(lines), /line 3/, "the preview keeps its scroll while the highlighted file is unchanged");
+	view.handleInput(CTRL_O);
+	lines = view.render(120);
+	assert.match(selectedRow(lines), /last\.ts/);
+	assert.match(previewTop(lines), /line 3/, "a second cycle keeps it too");
+	assert.deepEqual(calls.insert, []);
+	assert.equal(calls.close, 0);
+
+	const many = Array.from({ length: 30 }, (_, index) => entry(`file-${String(29 - index).padStart(2, "0")}.ts`));
+	const windowed = await openView({ rows: 20 }, many);
+	for (let index = 0; index < 25; index += 1) windowed.view.handleInput("\x1b[B");
+	windowed.view.handleInput(CTRL_O);
+	const scrolled = windowed.view.render(120);
+	assert.match(selectedRow(scrolled), /file-04\.ts/, "the file that moved to the end of the new order stays visible");
+	assert.match(bodyText(scrolled), /file-04\.ts/);
+});
+
+test("a query filter applies to a non-default order and the info row names that order", async () => {
+	const { view } = await openView({ rows: 40 }, TREE_FILES);
+	view.handleInput(CTRL_O);
+	view.handleInput(CTRL_O);
+	for (const character of "util") view.handleInput(character);
+	const lines = view.render(120);
+	assert.equal(countCell(lines), "1 file (0 selected) · ext");
+	assert.match(selectedRow(lines), /util\.ts/, "the filter still chooses the row, in the active order");
+	assert.deepEqual(paintedList(lines, TREE_BASENAMES), ["util.ts"], "the query hides every other row in this order too");
 });

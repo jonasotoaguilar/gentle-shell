@@ -65,11 +65,36 @@ const LOADING_FILES = "Loading files …";
 const LOADING_PREVIEW = "Loading preview …";
 const NO_FILES = "No files in this repository.";
 const TRUNCATED_NOTICE = "… preview truncated.";
-// One option per action (S19): ctrl+c and ctrl+shift+j/k keep working but are
-// not advertised.
-const FOOTER = "↑/↓ move • ctrl+j/k scroll • tab select • ctrl+u clear • enter insert • ctrl+e editor • esc close";
+// One option per action (S19): ctrl+c, ctrl+shift+j/k and home/end keep working
+// but are not advertised. Keys paint in the theme's key colour and the labels
+// in the neutral tone, one painted cell per role (S31).
+const FOOTER_HINTS: readonly (readonly [string, string])[] = [
+	["↑/↓", "move"],
+	["ctrl+j/k", "scroll"],
+	["tab", "select"],
+	["ctrl+o", "order"],
+	["ctrl+u", "clear"],
+	["enter", "insert"],
+	["ctrl+e", "editor"],
+	["esc", "close"],
+];
+const FOOTER_SEPARATOR = " • ";
+// The theme role the hints paint a key with (the /agents panel's convention).
+const KEY_TONE = "accent";
+const LABEL_TONE = "muted";
 const NEW_BADGE = "new";
-const UPDATED_BADGE = "upt";
+const UPDATED_BADGE = "upd";
+
+/**
+ * The listing orders ctrl+o cycles through (S29): the listing's own
+ * changed-first recency order, directory-major path order and extension
+ * groups.
+ */
+export type FilePickerOrder = "modified" | "path" | "ext";
+const ORDER_CYCLE: readonly FilePickerOrder[] = ["modified", "path", "ext"];
+const DEFAULT_ORDER: FilePickerOrder = "modified";
+// Separates the counts from the active order in the info row (S29).
+const INFO_SEPARATOR = " · ";
 
 type Tone = "border" | "accent" | "muted" | "dim" | "text" | "error";
 
@@ -85,6 +110,21 @@ interface PreviewLine {
 	tone: Tone;
 	/** Real file line number; absent on a notice row. */
 	number?: number;
+}
+
+/**
+ * The preview's lines flattened into the rows they paint at one pane width. A
+ * line wider than the pane continues on the following rows under the same text
+ * column, so `rowStarts` maps a painted row back to the line that owns it and
+ * `rows` holds the text each row paints, whole graphemes only (S30).
+ */
+interface PreviewWindow {
+	lines: PreviewLine[];
+	gutterWidth: number;
+	textWidth: number;
+	rows: string[];
+	rowStarts: number[];
+	totalRows: number;
 }
 
 /** What the preview can honestly claim about the file's line numbering. */
@@ -134,10 +174,80 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/**
+ * The rows one line wraps into at `width` text cells, cut on grapheme
+ * boundaries only: a grapheme that does not fit in the cells left on a row
+ * starts the next row instead of being split across two rows or dropped from
+ * both (S30). A grapheme wider than a whole row still gets a row of its own, so
+ * the row count always matches what the rows paint. A non-positive width never
+ * wraps.
+ */
+function wrapByCells(text: string, width: number): string[] {
+	if (width <= 0) return [text];
+	const rows: string[] = [];
+	let row = "";
+	let used = 0;
+	for (const { segment } of graphemes.segment(text)) {
+		const cells = visibleWidth(segment);
+		if (used > 0 && used + cells > width) {
+			rows.push(row);
+			row = "";
+			used = 0;
+		}
+		row += segment;
+		used += cells;
+	}
+	rows.push(row);
+	return rows;
+}
+
 function fit(text: string, width: number): string {
 	if (width <= 0) return "";
 	const clipped = truncateToWidth(text, width, "…");
 	return clipped + " ".repeat(Math.max(0, width - visibleWidth(stripAnsi(clipped))));
+}
+
+/** Byte order, not locale order, so an order is the same on every machine. */
+function byCodePoint(left: string, right: string): number {
+	return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * Directory-major alphabetical (S29): paths compare segment by segment, so
+ * every file of a folder and of its subfolders stays together and the flat list
+ * reads like an explorer's tree without folder header rows. A segment that
+ * another merely extends keeps the folder ahead of the file sharing its name
+ * (`src/…` before `src.ts`).
+ */
+function byDirectoryMajor(left: FileEntry, right: FileEntry): number {
+	const leftSegments = left.path.split("/");
+	const rightSegments = right.path.split("/");
+	const shared = Math.min(leftSegments.length, rightSegments.length);
+	for (let index = 0; index < shared; index += 1) {
+		const compared = byCodePoint(leftSegments[index]!, rightSegments[index]!);
+		if (compared !== 0) return compared;
+	}
+	return leftSegments.length - rightSegments.length;
+}
+
+/** A dotfile such as `.gitignore` has no extension; `a.tar.gz` groups under `gz`. */
+function extensionOf(path: string): string {
+	const extension = posix.extname(posix.basename(path));
+	return extension.startsWith(".") ? extension.slice(1) : extension;
+}
+
+/** Extension groups, alphabetical by extension and then by path; no extension sorts last. */
+function byExtension(left: FileEntry, right: FileEntry): number {
+	const leftExtension = extensionOf(left.path);
+	const rightExtension = extensionOf(right.path);
+	if (leftExtension !== rightExtension) {
+		if (leftExtension === "") return 1;
+		if (rightExtension === "") return -1;
+		return byCodePoint(leftExtension, rightExtension);
+	}
+	return byCodePoint(left.path, right.path);
 }
 
 /** Keep the tail of a path, which is what identifies the directory. */
@@ -158,6 +268,8 @@ function elideLeft(text: string, width: number): string {
 
 export class FilePickerView {
 	private query = "";
+	/** The active listing order; the info row names it and ctrl+o cycles it (S29). */
+	private order: FilePickerOrder = DEFAULT_ORDER;
 	private selected = 0;
 	private previewScroll = 0;
 	private hovered: number | undefined;
@@ -169,6 +281,8 @@ export class FilePickerView {
 	private readonly selection = new Set<string>();
 	private readonly openedAt: number;
 	private readonly previews = new Map<string, PreviewEntry>();
+	/** The preview pane width of the last painted frame, so a scroll clamps against what is on screen. */
+	private previewPaneWidth = 0;
 	private completed = false;
 	private disposed = false;
 	private readonly deps: FilePickerDeps;
@@ -205,7 +319,7 @@ export class FilePickerView {
 				lines.push(`${fit(left[index] ?? "", layout.listWidth)}${this.renderText(SEPARATOR, "border")}${fit(right[index] ?? "", layout.previewWidth)}`);
 			}
 		}
-		lines.push(fit(this.renderText(FOOTER, "muted"), layout.contentWidth));
+		lines.push(this.footerRow(layout.contentWidth));
 		const frame = renderPaletteCard(lines, width, this.deps.theme);
 		this.pointerFrame = this.completed || this.disposed ? undefined : {
 			width,
@@ -248,6 +362,24 @@ export class FilePickerView {
 			this.scrollPreview(-this.previewRows());
 			return;
 		}
+		// home/end and ctrl+home/ctrl+end are compatibility bindings, so the
+		// footer never names them (S28).
+		if (matchesKey(data, Key.ctrl("home"))) {
+			this.scrollPreviewTo("start");
+			return;
+		}
+		if (matchesKey(data, Key.ctrl("end"))) {
+			this.scrollPreviewTo("end");
+			return;
+		}
+		if (matchesKey(data, Key.home)) {
+			this.select(0);
+			return;
+		}
+		if (matchesKey(data, Key.end)) {
+			this.select(this.matches().length - 1);
+			return;
+		}
 		if (matchesKey(data, Key.down)) {
 			this.moveSelection(1);
 			return;
@@ -258,6 +390,10 @@ export class FilePickerView {
 		}
 		if (matchesKey(data, Key.tab)) {
 			this.toggleSelection();
+			return;
+		}
+		if (matchesKey(data, Key.ctrl("o"))) {
+			this.cycleOrder();
 			return;
 		}
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
@@ -372,19 +508,31 @@ export class FilePickerView {
 		}
 	}
 
+	/**
+	 * The rows in the active order (S29). `modified` is the listing's own order —
+	 * changed first, newest first (S12) — and is never re-sorted here.
+	 */
+	private orderedEntries(): FileEntry[] {
+		if (this.order === "modified") return this.entries;
+		const ordered = [...this.entries];
+		ordered.sort(this.order === "path" ? byDirectoryMajor : byExtension);
+		return ordered;
+	}
+
 	private matches(): FileEntry[] {
-		if (!this.loaded || this.entries.length === 0) return [];
+		const ordered = this.orderedEntries();
+		if (!this.loaded || ordered.length === 0) return [];
 		// rankPaletteGroups already ranks basename starts-with, then basename
 		// contains, then subsequence, then full-path contains (the directory).
-		// It keeps the input order for an empty query, so the listing's own
-		// order (changed first, newest first, S12) is what those rows paint.
+		// It keeps the input order for an empty query, so the active listing
+		// order is what those rows paint.
 		const group: CommandPaletteGroup = {
 			title: "Files",
-			items: this.entries.map((entry) => ({ command: entry.path, label: posix.basename(entry.path) })),
+			items: ordered.map((entry) => ({ command: entry.path, label: posix.basename(entry.path) })),
 		};
 		const ranked = rankPaletteGroups([group], this.query)[0];
 		if (!ranked) return [];
-		const byPath = new Map(this.entries.map((entry) => [entry.path, entry]));
+		const byPath = new Map(ordered.map((entry) => [entry.path, entry]));
 		const matched: FileEntry[] = [];
 		for (const item of ranked.items) {
 			const entry = byPath.get(item.command);
@@ -432,6 +580,23 @@ export class FilePickerView {
 	}
 
 	/**
+	 * ctrl+o: the next order, with the highlight following the same file rather
+	 * than the same index. The preview keeps its scroll unless the highlighted
+	 * file actually changed (S29).
+	 */
+	private cycleOrder(): boolean {
+		const previous = this.selectedPath();
+		const position = ORDER_CYCLE.indexOf(this.order);
+		this.order = ORDER_CYCLE[(position + 1) % ORDER_CYCLE.length]!;
+		const total = this.matches().length;
+		const moved = previous === undefined ? -1 : this.matches().findIndex((entry) => entry.path === previous);
+		this.selected = moved >= 0 ? moved : Math.max(0, Math.min(total - 1, this.selected));
+		if (this.selectedPath() !== previous) this.previewScroll = 0;
+		this.ensurePreviewLoaded();
+		return true;
+	}
+
+	/**
 	 * Enter's payload (S14): the visible selections in list order, then the ones
 	 * a query hid in their marking order, and the highlighted file last when Tab
 	 * never selected it. A file is never emitted twice.
@@ -451,13 +616,24 @@ export class FilePickerView {
 
 	private scrollPreview(delta: number): boolean {
 		if (delta === 0) return false;
+		return this.setPreviewScroll(this.previewScroll + Math.trunc(delta));
+	}
+
+	/** ctrl+home and ctrl+end: the first line and the last page of the file (S28). */
+	private scrollPreviewTo(edge: "start" | "end"): boolean {
 		const path = this.selectedPath();
 		if (!path) return false;
-		const total = this.previewLines(path).length;
-		const visible = this.previewRows();
-		const next = Math.max(0, Math.min(Math.max(0, total - visible), this.previewScroll + Math.trunc(delta)));
-		if (next === this.previewScroll) return false;
-		this.previewScroll = next;
+		const window = this.previewWindow(path, this.previewPaneWidth);
+		return this.setPreviewScroll(edge === "start" ? 0 : this.maxPreviewScroll(window));
+	}
+
+	private setPreviewScroll(next: number): boolean {
+		const path = this.selectedPath();
+		if (!path) return false;
+		const window = this.previewWindow(path, this.previewPaneWidth);
+		const clamped = Math.max(0, Math.min(this.maxPreviewScroll(window), Math.trunc(next)));
+		if (clamped === this.previewScroll) return false;
+		this.previewScroll = clamped;
 		return true;
 	}
 
@@ -539,7 +715,7 @@ export class FilePickerView {
 
 	private headerRow(width: number): string {
 		const title = this.renderText("File picker", "accent");
-		const close = this.renderText("esc", "muted");
+		const close = this.renderText("esc", KEY_TONE);
 		const titleWidth = visibleWidth(stripAnsi(title));
 		const closeWidth = visibleWidth(stripAnsi(close));
 		const root = this.rootCell(width - titleWidth - closeWidth - 2);
@@ -566,16 +742,19 @@ export class FilePickerView {
 	}
 
 	/**
-	 * The count row under the blank line. The file count is what the query
-	 * currently lists; the parenthesised count is the whole Tab selection, which
-	 * can include files the query hides. A pending or failed listing counts
-	 * nothing, so the row stays blank instead of claiming zero files.
+	 * The info row under the blank line: the counts and the active listing order,
+	 * so the order is always visible without being a key hint (S29). The file
+	 * count is what the query currently lists; the parenthesised count is the
+	 * whole Tab selection, which can include files the query hides. A pending or
+	 * failed listing counts nothing, so the row stays blank instead of claiming
+	 * zero files.
 	 */
 	private countRow(width: number): string {
 		if (!this.loaded || this.listingError !== undefined) return "".padEnd(width, " ");
 		const files = this.matches().length;
 		const selected = this.selection.size;
-		return fit(this.renderText(`${files} ${files === 1 ? "file" : "files"} (${selected} selected)`, "muted"), width);
+		const counts = `${files} ${files === 1 ? "file" : "files"} (${selected} selected)`;
+		return fit(this.renderText(`${counts}${INFO_SEPARATOR}${this.order}`, "muted"), width);
 	}
 
 	private listColumn(layout: PaneLayout, bodyRows: number, hits: PointerHit[]): string[] {
@@ -640,17 +819,53 @@ export class FilePickerView {
 	private previewColumn(layout: PaneLayout, bodyRows: number): string[] {
 		const path = this.selectedPath();
 		if (!path || bodyRows <= 0) return [];
-		const entries = this.previewLines(path);
 		const contentRows = this.previewRows();
-		this.previewScroll = Math.max(0, Math.min(this.previewScroll, Math.max(0, entries.length - contentRows)));
-		const gutterWidth = this.previewGutterWidth(path);
+		const window = this.previewWindow(path, layout.previewWidth);
+		this.previewPaneWidth = layout.previewWidth;
+		// The painted window is what a scroll is clamped against, so the last
+		// page is always full and the position indicator never lies.
+		this.previewScroll = Math.max(0, Math.min(this.previewScroll, this.maxPreviewScroll(window)));
 		// The position indicator owns the preview's first row (S21).
-		const lines: string[] = [this.previewPositionRow(path, layout.previewWidth)];
-		for (let index = 0; index < contentRows; index += 1) {
-			const entry = entries[this.previewScroll + index];
-			lines.push(entry ? this.previewRow(entry, gutterWidth, layout.previewWidth) : "");
+		const lines: string[] = [this.previewPositionRow(window, path, layout.previewWidth)];
+		for (let offset = 0; offset < contentRows; offset += 1) {
+			const row = this.previewScroll + offset;
+			lines.push(row < window.totalRows ? this.previewRow(window, row, layout.previewWidth) : "");
 		}
 		return lines;
+	}
+
+	/**
+	 * The preview flattened into painted rows at `width` pane cells. A line wider
+	 * than the pane wraps instead of being truncated, so the scroll and page math
+	 * counts rows while the gutter and the position count file lines (S30).
+	 */
+	private previewWindow(path: string, width: number): PreviewWindow {
+		const lines = this.previewLines(path);
+		const gutterWidth = this.previewGutterWidth(path);
+		const textWidth = width - gutterWidth - PREVIEW_GUTTER_GAP;
+		const rows: string[] = [];
+		const rowStarts: number[] = [];
+		for (const line of lines) {
+			rowStarts.push(rows.length);
+			rows.push(...wrapByCells(line.text, textWidth));
+		}
+		return { lines, gutterWidth, textWidth, rows, rowStarts, totalRows: rows.length };
+	}
+
+	private maxPreviewScroll(window: PreviewWindow): number {
+		return Math.max(0, window.totalRows - this.previewRows());
+	}
+
+	/** The line that owns a painted row; the last line starting at or before it. */
+	private lineAtRow(window: PreviewWindow, row: number): number {
+		let low = 0;
+		let high = Math.max(0, window.rowStarts.length - 1);
+		while (low < high) {
+			const middle = Math.ceil((low + high) / 2);
+			if (window.rowStarts[middle]! <= row) low = middle;
+			else high = middle - 1;
+		}
+		return low;
 	}
 
 	/** File line numbers are only known for a text preview. */
@@ -667,22 +882,49 @@ export class FilePickerView {
 	}
 
 	/** `top/total` at the preview's top-right; `+` when the total is not known (S21). */
-	private previewPositionRow(path: string, width: number): string {
+	private previewPositionRow(window: PreviewWindow, path: string, width: number): string {
 		const meta = this.previewMeta(path);
 		if (!meta) return "";
-		const top = Math.min(meta.total, this.previewScroll + 1);
-		const indicator = this.renderText(`${top}/${meta.total}${meta.truncated ? "+" : ""}`, "muted");
+		const top = this.topLineNumber(window) ?? meta.total;
+		const indicator = this.renderText(`${Math.min(meta.total, top)}/${meta.total}${meta.truncated ? "+" : ""}`, "muted");
 		const used = visibleWidth(stripAnsi(indicator));
 		if (used >= width) return truncateToWidth(indicator, width, "…");
 		return `${" ".repeat(width - used)}${indicator}`;
 	}
 
-	private previewRow(entry: PreviewLine, gutterWidth: number, width: number): string {
-		const number = entry.number === undefined ? "" : String(entry.number).padStart(gutterWidth);
-		const gutter = number.length > 0 ? this.renderText(number, "dim") : " ".repeat(gutterWidth);
-		const room = Math.max(0, width - gutterWidth - PREVIEW_GUTTER_GAP);
-		const text = this.renderText(truncateToWidth(entry.text, room, "…"), entry.tone);
-		return fit(`${gutter}${" ".repeat(PREVIEW_GUTTER_GAP)}${text}`, width);
+	/**
+	 * The file line the top painted row belongs to, so a scroll that stops inside
+	 * a wrapped line still reports that line rather than a painted row.
+	 */
+	private topLineNumber(window: PreviewWindow): number | undefined {
+		if (window.lines.length === 0) return undefined;
+		let index = this.lineAtRow(window, this.previewScroll);
+		while (index > 0 && window.lines[index]!.number === undefined) index -= 1;
+		return window.lines[index]!.number;
+	}
+
+	private previewRow(window: PreviewWindow, row: number, width: number): string {
+		const index = this.lineAtRow(window, row);
+		const entry = window.lines[index]!;
+		const offset = row - window.rowStarts[index]!;
+		// Only the first row of a line carries its number; a continuation row
+		// leaves the gutter blank and starts its text in the same column.
+		const gutter = offset === 0 && entry.number !== undefined
+			? this.renderText(String(entry.number).padStart(window.gutterWidth), "dim")
+			: " ".repeat(window.gutterWidth);
+		const room = Math.max(0, window.textWidth);
+		const text = room > 0 ? window.rows[row] ?? "" : "";
+		const cells = visibleWidth(text);
+		// A wrapped row is a run of whole graphemes, so it is painted as it is and
+		// never truncated with an ellipsis. The one row wider than the text column
+		// is a grapheme that fits in no row of its own: it borrows the single gap
+		// cell so the pane can still show it. A grapheme wider than the whole pane
+		// fits in no column at all, so that row paints its gutter alone rather than
+		// a glyph that would break the frame.
+		const borrowsGap = cells > room;
+		const showsText = cells > 0 && (!borrowsGap || window.gutterWidth + cells <= width);
+		const gap = borrowsGap ? "" : " ".repeat(PREVIEW_GUTTER_GAP);
+		return fit(`${gutter}${gap}${showsText ? this.renderText(text, entry.tone) : ""}`, width);
 	}
 
 	private previewLines(path: string): PreviewLine[] {
@@ -698,5 +940,11 @@ export class FilePickerView {
 
 	private renderText(text: string, tone: Tone): string {
 		return this.deps.theme.fg(tone, text);
+	}
+
+	/** The key list, painted one cell per role so a key never carries the label tone (S31). */
+	private footerRow(width: number): string {
+		const hints = FOOTER_HINTS.map(([key, label]) => `${this.renderText(key, KEY_TONE)} ${this.renderText(label, LABEL_TONE)}`);
+		return fit(hints.join(this.renderText(FOOTER_SEPARATOR, LABEL_TONE)), width);
 	}
 }
