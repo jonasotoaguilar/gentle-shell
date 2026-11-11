@@ -3110,29 +3110,47 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			: scopes[0];
 		if (!scope) return;
 		let host: ExternalEditorHost | undefined;
-		let editorPath: string | undefined;
-		await ctx.ui.custom<null>(
+		const editorFile = await ctx.ui.custom<string | null>(
 			(tui, theme, _keybindings, done) => {
-				const close = withOverlayRepaint(tui, done);
+				const repaintAndClose = withOverlayRepaint(tui, done);
 				host = tui;
+				// The view always closes through `onClose`, after `onOpen` on the
+				// editor path, so exactly one of them settles the overlay. Enter and
+				// Esc need the forced full repaint (the paste lands behind the card),
+				// ctrl+e does not: openInExternalEditor repaints once the editor exits,
+				// and painting every cell right before the terminal is stopped for the
+				// spawn is the jolt /changes does not have.
+				let closed = false;
+				const closeOnce = (file: string | null, repaint: boolean): void => {
+					if (closed) return;
+					closed = true;
+					if (repaint) repaintAndClose(file);
+					else done(file);
+				};
 				return new FilePickerView({
 					theme,
+					// The title row names the path this picker lists (S26).
+					root: scope.root,
 					rows: () => Math.max(0, tui.terminal.rows),
 					listEntries: () => listRepositoryEntries(deps.gitRunner(scope.root)),
 					loadPreview: async (relative) => readFilePreview(scope.root, relative),
 					// Enter formats and pastes, then the picker closes with focus back in
 					// the prompt: the message is never sent from here.
 					onInsert: (paths) => ctx.ui.pasteToEditor(formatFileInsertion(paths, { root: scope.root, kind: scope.kind, cwd: ctx.cwd })),
-					onOpen: (relative) => { editorPath = join(scope.root, relative); },
-					onClose: () => close(null),
+					onOpen: (relative) => closeOnce(join(scope.root, relative), false),
+					onClose: () => closeOnce(null, true),
 					requestRender: () => tui.requestRender(),
 				});
 			},
-			{ overlay: true, overlayOptions: { anchor: "center", width: "85%", minWidth: 76, maxHeight: "90%" } },
+			// Narrow like the Commands palette and the Customization panel (70%,
+			// 60-column floor) instead of the first cut's wide card, and the whole
+			// terminal as the height budget: Pi truncates an overlay's rows from the
+			// bottom, so a smaller percentage would drop the card's footer line.
+			{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "100%" } },
 		);
-		if (editorPath === undefined || !host) return;
+		if (editorFile === null || !host) return;
 		try {
-			if (!openInExternalEditor(host, editorPath, process.env, spawnSync, scope.root)) ctx.ui.notify(NO_EDITOR_NOTICE, "warning");
+			if (!openInExternalEditor(host, editorFile, process.env, spawnSync, scope.root)) ctx.ui.notify(NO_EDITOR_NOTICE, "warning");
 		} catch (error) {
 			ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
 		}

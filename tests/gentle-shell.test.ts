@@ -975,7 +975,7 @@ test("gentleShell stays out of the way without a UI or when disabled", () => {
 	assert.equal(ui.footerFactory, undefined);
 });
 
-const fakeTui = { terminal: { rows: 40, columns: 120 }, requestRender() {} };
+const fakeTui = { terminal: { rows: 40, columns: 120 }, requestRender() {}, stop() {}, start() {} };
 const editorTheme = { borderColor: (text: string) => text, selectList: {} };
 const fakeKeybindings = { matches: () => false };
 
@@ -5420,6 +5420,40 @@ test("/gentle:files and alt+p register, and Enter pastes before the picker close
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
+// S26: the title row names the path the list belongs to, so the user can see
+// which scope — the session repository or a registered worktree — was chosen,
+// next to the title and the esc hint.
+test("the picker title row shows the chosen scope's path", async () => {
+	const h = fakePi();
+	filePickerGit(h.pi, { "/repo": ["AGENTS.md"], "/linked": ["linked-only.ts"] }, ["/linked"]);
+	gentleShell(h.pi, {});
+	const { ctx, ui, overlayReady } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	const frame = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
+	const header = () => stripAnsi(ui.overlayView!.render(120)[1]!);
+
+	const direct = h.commands.get("gentle:files")!.handler("", ctx);
+	await overlayReady;
+	await until(() => frame().includes("AGENTS.md"));
+	assert.match(header(), /^│ File picker +\/repo esc +│$/, `the session root is painted in the title row: ${header()}`);
+	ui.overlayView!.handleInput("\x1b");
+	await direct;
+
+	await h.tools.get("session_worktree_register")!.execute("r", { path: "/linked" }, undefined, undefined, ctx);
+	const previous = ui.overlayView;
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await until(() => ui.overlayView !== previous);
+	const scopeView = ui.overlayView!;
+	scopeView.handleInput("\x1b[B");
+	scopeView.handleInput("\r");
+	await until(() => ui.overlayView !== scopeView);
+	await until(() => frame().includes("linked-only.ts"));
+	assert.match(header(), /^│ File picker +\/linked esc +│$/, `the chosen worktree root replaces the session root: ${header()}`);
+	ui.overlayView!.handleInput("\x1b");
+	await opened;
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
 test("the scope step appears only with a listed worktree, closes first, and browses the chosen root", async () => {
 	const h = fakePi();
 	const calls = filePickerGit(h.pi, { "/repo": ["AGENTS.md"], "/linked": ["linked-only.ts"] }, ["/linked"]);
@@ -5500,6 +5534,86 @@ test("ctrl+e closes the picker before the editor handoff and reports the missing
 	ui.overlayView!.handleInput("\x05");
 	await opened;
 	assert.deepEqual(handoffs, ["No editor configured. Set $VISUAL or $EDITOR.:closed"], "the overlay closes before the editor handoff reports");
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
+// S22: the picker sits in the Commands/Customization family — 70% wide with a
+// 60-column floor instead of the first cut's 85%/76 — so the card is narrower,
+// and its height budget is the whole terminal: Pi truncates an overlay's rows
+// from the bottom, which at 90% would eat the footer line of the 24-row card
+// the view draws in any terminal short enough.
+test("the picker opens with the Commands-family width and the full vertical budget", async (t) => {
+	const savedRows = fakeTui.terminal.rows;
+	t.after(() => { fakeTui.terminal.rows = savedRows; });
+	const h = fakePi();
+	filePickerGit(h.pi);
+	gentleShell(h.pi, {});
+	const { ctx, ui, overlayReady } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await overlayReady;
+	const options = (ui.customOptions?.at(-1) as { overlayOptions: { width?: number | string; minWidth?: number; maxHeight?: number | string } }).overlayOptions;
+	assert.deepEqual(options, { anchor: "center", width: "70%", minWidth: 60, maxHeight: "100%" });
+	const percent = (value: number | string | undefined, fallback: number): number => {
+		const parsed = Number(String(value).replace("%", ""));
+		return Number.isFinite(parsed) ? parsed : fallback;
+	};
+	// The same resolution Pi applies: a percentage of the terminal, floored, and
+	// never below minWidth (or above the terminal).
+	const resolvedWidth = (columns: number): number => Math.min(columns, Math.max(Math.floor((columns * percent(options.width, 100)) / 100), options.minWidth ?? 0));
+	assert.equal(resolvedWidth(120), 84, "84 columns at 120, against the first cut's 102");
+	assert.equal(resolvedWidth(80), 60, "a narrow terminal still gets the 60-column floor the two panes need");
+	for (const rows of [40, 30, 24, 18]) {
+		fakeTui.terminal.rows = rows;
+		const drawn = ui.overlayView!.render(resolvedWidth(120)).length;
+		const cap = Math.max(1, Math.min(rows, Math.floor((rows * percent(options.maxHeight, 100)) / 100)));
+		assert.ok(drawn <= cap, `the ${drawn}-row card keeps the footer inside the ${cap}-row budget at ${rows} terminal rows`);
+	}
+	fakeTui.terminal.rows = savedRows;
+	ui.overlayView!.handleInput("\x1b");
+	await opened;
+	const palette = h.commands.get("gentle:commands")!.handler("", ctx);
+	await until(() => ui.customOptions?.length === 2);
+	const paletteOptions = (ui.customOptions?.at(-1) as { overlayOptions: { width?: unknown; minWidth?: unknown } }).overlayOptions;
+	assert.deepEqual({ width: options.width, minWidth: options.minWidth }, { width: paletteOptions.width, minWidth: paletteOptions.minWidth }, "the picker takes the Commands palette's width proportions");
+	ui.closeOverlay?.();
+	await palette;
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
+// S23: /changes returns the chosen file from the overlay and opens the editor
+// after teardown, with stop()/start() around the spawn. openInExternalEditor
+// already forces one repaint once the editor exits, so a forced full repaint
+// scheduled between the ctrl+e decision and stop() is pure jolt: Pi rewrites
+// every cell and then the terminal is stopped for the editor.
+test("ctrl+e hands the editor off after teardown with no full repaint before the terminal stops", async (t) => {
+	const saved = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR };
+	delete process.env.VISUAL;
+	process.env.EDITOR = "/nonexistent-editor-for-the-picker-test";
+	t.after(() => {
+		if (saved.VISUAL === undefined) delete process.env.VISUAL; else process.env.VISUAL = saved.VISUAL;
+		if (saved.EDITOR === undefined) delete process.env.EDITOR; else process.env.EDITOR = saved.EDITOR;
+	});
+	const h = fakePi();
+	filePickerGit(h.pi);
+	gentleShell(h.pi, {});
+	const { ctx, ui, overlayReady } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	const trace: string[] = [];
+	t.mock.method(fakeTui, "requestRender", (force?: boolean) => { trace.push(force === true ? "repaint-all" : "render"); });
+	t.mock.method(fakeTui, "stop", () => { trace.push(`stop:${ui.overlayCompletions}`); });
+	t.mock.method(fakeTui, "start", () => { trace.push("start"); });
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await overlayReady;
+	const frame = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
+	await until(() => frame().includes("AGENTS.md"));
+	ui.overlayView!.handleInput("\x05");
+	await opened;
+	const stoppedAt = trace.indexOf("stop:1");
+	assert.notEqual(stoppedAt, -1, "the picker is torn down before the terminal stops for the editor");
+	assert.deepEqual(trace.slice(0, stoppedAt).filter((entry) => entry === "repaint-all"), [], "no full repaint is requested between the ctrl+e decision and the stop");
+	assert.deepEqual(trace.slice(stoppedAt, stoppedAt + 3), ["stop:1", "start", "repaint-all"], "the terminal restarts and repaints once, after the editor exits");
+	assert.match(ui.notices.join("\n"), /Could not open editor/, "the handoff ran the configured editor and reported its failure");
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
