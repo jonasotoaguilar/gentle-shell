@@ -85,6 +85,13 @@ function selectedRow(lines: readonly string[]): string {
 	return row;
 }
 
+// The card frame is `│ ` + content + ` │`, so the hint text is the trimmed
+// middle of the footer row.
+function footerText(lines: readonly string[]): string {
+	const footer = lines[lines.length - 2]!;
+	return stripAnsi(footer).slice(2, -2).trim();
+}
+
 function rowOf(lines: readonly string[], text: string): number {
 	const y = lines.findIndex((line) => stripAnsi(line).includes(text));
 	assert.ok(y >= 0, `missing ${JSON.stringify(text)} in rendered frame`);
@@ -129,10 +136,7 @@ test("the card frame is exact at two widths, with the title, esc hint, step subt
 	const wide = view.render(100).map((line) => stripAnsi(line));
 	assert.match(wide[1]!, /^│ File picker +esc +│$/, "the header carries the title on the left and esc on the right");
 	assert.match(wide[2]!, /Choose a scope/, "a muted subtitle line names the step");
-	const footer = wide[wide.length - 2]!;
-	for (const key of ["↑/↓", "ctrl+j/k", "enter", "esc/ctrl+c close"]) {
-		assert.ok(footer.includes(key), `footer must list ${JSON.stringify(key)}: ${footer}`);
-	}
+	assert.equal(footerText(wide), "↑/↓ move • enter choose scope • esc close", "the footer names one option per action");
 });
 
 test("every scope renders its label, in recency order, and no recency value leaks into the output", () => {
@@ -193,6 +197,28 @@ test("esc and ctrl+c close exactly once", () => {
 	assert.equal(ctrlC.calls.close, 1);
 	ctrlC.view.handleInput("\x03");
 	assert.equal(ctrlC.calls.close, 1);
+});
+
+// S19: the hint names a single binding per action even when several are
+// functional, so the arrows are the only move option and esc the only close
+// option shown while ctrl+j/k and ctrl+c keep working.
+test("the scope footer names one option per action while every binding stays functional", () => {
+	const { view, calls } = createView();
+	const footer = footerText(view.render(100));
+	assert.equal(footer, "↑/↓ move • enter choose scope • esc close");
+	assert.doesNotMatch(footer, /esc\/ctrl\+c/, "esc is the only close option the footer names");
+	assert.doesNotMatch(footer, /ctrl\+j/, "the arrows are the only move option the footer names");
+	assert.doesNotMatch(footer, /\bor\b/, "no action is offered twice");
+
+	view.handleInput("\x1b[B");
+	assert.match(selectedRow(view.render(100)), /fix\/beta · beta/, "down still moves");
+	view.handleInput("\x0b");
+	assert.match(selectedRow(view.render(100)), /feat\/alpha · alpha/, "the unhinted ctrl+k still moves up");
+	view.handleInput("\x0a");
+	assert.match(selectedRow(view.render(100)), /fix\/beta · beta/, "the unhinted ctrl+j still moves down");
+	view.handleInput("\x03");
+	assert.equal(calls.close, 1, "the unhinted ctrl+c still closes");
+	assert.deepEqual(calls.select, []);
 });
 
 test("a throwing scope callback still closes the step exactly once", () => {
@@ -273,7 +299,7 @@ test("an empty scope list renders its message instead of a blank card and never 
 	const body = bodyText(lines);
 	assert.match(body, /No worktrees/);
 	assert.match(body, /File picker/);
-	assert.match(body, /esc\/ctrl\+c close/);
+	assert.match(body, /↑\/↓ move • enter choose scope • esc close/);
 	assert.equal(visibleWidth(lines[0]!), 100);
 	view.handleInput("\r");
 	view.handleInput("\x1b[B");

@@ -541,6 +541,43 @@ test("ChangesView renders a framed two-pane layout at the requested size", async
 	assert.match(plain[10], /j\/k file .* o open in editor .* esc close/);
 });
 
+// S19: every hint line names one option per action. `j/k` and `ctrl+j/k` are
+// two matched pairs (walk files, scroll the preview), not a choice between
+// bindings, so they stay; enter still both expands a group and opens a file.
+test("every /changes footer names one option per action while both enter actions stay live", async () => {
+	const opened: string[] = [];
+	const component = new WorktreeChangesView(
+		[{ root: "/main", branch: "main", model: changesModel([file("a.ts", 1, 0), file("b.ts", 2, 0)]) }],
+		{
+			theme: plainTheme, rows: 10, loadDiff: async () => "+preview",
+			onOpen: (_root, target) => { opened.push(target.path); }, onClose() {}, onRefresh() {}, requestRender() {},
+		},
+	);
+	const footerOf = () => {
+		const lines = component.render(120);
+		return stripAnsi(lines[lines.length - 2]!).slice(2, -2).trim();
+	};
+	const slashPairs = (text: string) => [...text.matchAll(/\S*\/\S*/g)].map((match) => match[0]);
+
+	const listFooter = footerOf();
+	assert.equal(listFooter, "j/k select   enter open   ← fold   ctrl+j/k scroll   r refresh   F diff only   esc close");
+	assert.deepEqual(slashPairs(listFooter), ["j/k", "ctrl+j/k"], "the remaining slash pairs are matched key pairs");
+	assert.doesNotMatch(listFooter, /\bor\b/, "no action is offered twice");
+
+	component.handleInput("\r");
+	assert.match(stripAnsi(component.render(120)[1]!), /▾ main · main/, "the unhinted enter still expands a group");
+	component.handleInput("j");
+	await settle();
+	component.handleInput("\r");
+	assert.deepEqual(opened, ["a.ts"], "enter still opens the selected file");
+
+	component.handleInput("F");
+	const diffFooter = footerOf();
+	assert.equal(diffFooter, "j/k file   ctrl+j/k scroll   o open   r refresh   F files   esc files");
+	assert.deepEqual(slashPairs(diffFooter), ["j/k", "ctrl+j/k"]);
+	assert.doesNotMatch(diffFooter, /\bor\b/);
+});
+
 test("ChangesView renders tabbed CRLF modified diffs with aligned frame columns", async () => {
 	const tabbedDiff = [
 		"diff --git a/lib/a.ts b/lib/a.ts\r",

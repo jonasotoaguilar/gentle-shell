@@ -44,7 +44,7 @@ export interface FileScopeDeps {
 const TITLE = "File picker";
 const SUBTITLE = "Choose a scope";
 const NO_SCOPES = "No worktrees registered.";
-const FOOTER = "↑/↓ or ctrl+j/k move • enter choose scope • esc/ctrl+c close";
+const FOOTER = "↑/↓ move • enter choose scope • esc close";
 const MAX_CARD_HEIGHT = 24;
 // Header, step subtitle and footer, plus the two card borders.
 const CHROME_ROWS = 5;

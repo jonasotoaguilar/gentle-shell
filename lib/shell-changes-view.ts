@@ -357,7 +357,7 @@ export class WorktreeChangesView {
 		};
 		const keys = theme.fg(ROLE.KEY_TEXT, this.diffOnly
 			? "j/k file   ctrl+j/k scroll   o open   r refresh   F files   esc files"
-			: "j/k select   enter toggle/open   ← fold   ctrl+j/k scroll   r refresh   F diff only   esc close");
+			: "j/k select   enter open   ← fold   ctrl+j/k scroll   r refresh   F diff only   esc close");
 		this.pointerLayout = pointerLayout(width, height, this.diffOnly);
 		return renderPanes(width, height, theme, `✎ Changes · ${this.trees.length} worktrees`, leftLine, preview, keys, selected?.file, this.diffOnly);
 	}
