@@ -16,6 +16,8 @@ const CTRL_O = "\x0f";
 const PAGE_DOWN = "\x1b[6~";
 const PAGE_UP = "\x1b[5~";
 const TAB = "\t";
+// space folds the focused group row and never reaches the query (S5, S35).
+const SPACE = " ";
 
 // Home/End compatibility (S28): the encodings a terminal really sends for
 // those keys — the CSI letter form, the SS3 form, the tilde form and the rxvt
@@ -39,7 +41,11 @@ const COUNT_ROW = 4;
 const BODY_TOP = 5;
 // A selected row's marker cell: the accent bar that joins across adjacent rows.
 const SELECTION_BAR = "▏";
-const FOOTER_TEXT = "↑/↓ move • ctrl+j/k scroll • tab select • ctrl+o order • ctrl+u clear • enter insert • ctrl+e editor • esc close";
+const FOOTER_TEXT = "↑/↓ move • ctrl+j/k scroll • tab select • space fold • ctrl+o order • ctrl+u clear • enter insert • ctrl+e editor • esc close";
+// The marker column every list row spends before its label, and the indent one
+// level of the `path`/`ext` tree costs (S20, S35).
+const MARKER_COLUMN = 3;
+const GROUP_INDENT = 2;
 const ROOT = "/home/dev/projects/gentle-shell-worktrees/file-picker";
 
 // A fixed clock: the row ages are computed once when the panel opens, so a
@@ -247,8 +253,8 @@ function countCell(lines: readonly string[]): string {
 }
 
 /**
- * The basenames the list pane paints, top to bottom. The list is a flat set of
- * rows, so the painted rows are the whole order the user sees.
+ * The basenames the list pane paints, top to bottom. Group rows carry no
+ * basename, so the painted rows are the whole file order the user sees.
  */
 function paintedList(lines: readonly string[], names: readonly string[]): string[] {
 	const painted: string[] = [];
@@ -258,6 +264,35 @@ function paintedList(lines: readonly string[], names: readonly string[]): string
 		if (name !== undefined && !painted.includes(name)) painted.push(name);
 	}
 	return painted;
+}
+
+/**
+ * The frame row whose list pane paints `text`, so a search never matches the
+ * preview's own copy of a path.
+ */
+function listRowOf(lines: readonly string[], text: string): number {
+	for (let index = BODY_TOP; index <= lines.length - 3; index += 1) {
+		const cell = stripAnsi(lines[index] ?? "").split(" │ ")[0] ?? "";
+		if (cell.includes(text)) return index;
+	}
+	assert.fail(`missing ${JSON.stringify(text)} in the list pane`);
+}
+
+/**
+ * The list pane as the tree it paints (S35): each row's indent level and the
+ * label it starts with, the marker column and the trailing badge and age left
+ * out. Padding rows are skipped.
+ */
+function listTree(lines: readonly string[]): { depth: number; label: string }[] {
+	const rows: { depth: number; label: string }[] = [];
+	for (let index = BODY_TOP; index <= lines.length - 3; index += 1) {
+		const cell = (stripAnsi(lines[index] ?? "").split(" │ ")[0] ?? "").replace(/^│ /, "");
+		const text = cell.slice(MARKER_COLUMN);
+		if (text.trim().length === 0) continue;
+		const indent = text.length - text.trimStart().length;
+		rows.push({ depth: indent / GROUP_INDENT, label: (text.trimStart().split("  ")[0] ?? "").trimEnd() });
+	}
+	return rows;
 }
 
 function footerText(lines: readonly string[]): string {
@@ -1545,11 +1580,11 @@ test("the listing and each preview are loaded at most once and previews are cach
 });
 
 // The listing order selector (S29): the exact orders and the exact rows they
-// paint, over a flat list.
+// paint. `path` and `ext` paint a foldable tree (S35); `modified` stays flat.
 const TREE_BASENAMES = ["CODEOWNERS", "bug.md", "ci.yml", ".gitignore", "AGENTS.md", "cli.ts", "reference.md", "guide.md", "app.ts", "util.ts"];
-// Directory-major: every file of a folder and of its subfolders together, the
-// way an explorer paints the tree (.github/…, then .gitignore, then the rest).
-const PATH_ORDER = ["CODEOWNERS", "bug.md", "ci.yml", ".gitignore", "AGENTS.md", "cli.ts", "reference.md", "guide.md", "app.ts", "util.ts"];
+// The `path` tree: inside every folder its subfolders paint first and then its
+// own files, each alphabetical, so the repository's own files paint last.
+const PATH_ORDER = ["bug.md", "ci.yml", "CODEOWNERS", "cli.ts", "reference.md", "guide.md", "util.ts", "app.ts", ".gitignore", "AGENTS.md"];
 const TREE_FILES = [
 	entry("docs/guide.md"),
 	entry("src/app.ts", "new", NOW - MINUTE),
@@ -1593,9 +1628,9 @@ test("the path order keeps every file of a folder and its subfolders together, l
 	const lines = view.render(120);
 	assert.equal(countCell(lines), "10 files (0 selected) · path");
 	const painted = paintedList(lines, TREE_BASENAMES);
-	assert.deepEqual(painted, PATH_ORDER, "the whole list is in directory-major alphabetical order");
-	assert.match(listCell(lines, "app.ts"), /app\.ts +src +U 1m/, "a changed row keeps its letter and age");
-	assert.match(listCell(lines, "util.ts"), /^ {3}util\.ts +src\/lib *$/, "an unchanged row still paints neither");
+	assert.deepEqual(painted, PATH_ORDER, "every file of a folder and of its subfolders paints together, and the root's own files paint last");
+	assert.match(listCell(lines, "app.ts"), /app\.ts +U 1m/, "a changed row keeps its letter and age");
+	assert.match(listCell(lines, "util.ts"), /^ {3} {2} {2}util\.ts *$/, "a clean nested row paints neither letter nor age, and no directory");
 	for (const line of lines) assert.equal(visibleWidth(line), 120);
 });
 
@@ -1606,6 +1641,11 @@ test("the ext order groups every file by extension, alphabetical by extension an
 	const lines = view.render(120);
 	assert.equal(countCell(lines), "6 files (0 selected) · ext");
 	assert.deepEqual(paintedList(lines, EXT_BASENAMES), ["alpha.md", "gamma.md", "beta.ts", "zeta.ts", "LICENSE", "Makefile"], "grouped by extension, then by path, with the extensionless files last");
+	assert.deepEqual(listTree(lines).filter((row) => row.depth === 0), [
+		{ depth: 0, label: ".md" },
+		{ depth: 0, label: ".ts" },
+		{ depth: 0, label: "(none)" },
+	], "one group per extension, named with its dot, and the extensionless group last");
 });
 
 test("cycling the order keeps the highlighted file highlighted, visible in the window, and its preview untouched", async () => {
@@ -1618,7 +1658,7 @@ test("cycling the order keeps the highlighted file highlighted, visible in the w
 	view.handleInput(CTRL_O);
 	let lines = view.render(120);
 	assert.match(selectedRow(lines), /last\.ts/, "the same file stays highlighted when it moves in the new order");
-	assert.equal(rowOf(lines, "last.ts"), BODY_TOP + 2, "the highlight moved with the file, not the index");
+	assert.equal(rowOf(lines, "last.ts"), BODY_TOP + 5, "the highlight moved with the file, not the index: it sits under its own folder group in the path tree");
 	assert.match(previewTop(lines), /line 3/, "the preview keeps its scroll while the highlighted file is unchanged");
 	view.handleInput(CTRL_O);
 	lines = view.render(120);
@@ -1645,4 +1685,237 @@ test("a query filter applies to a non-default order and the info row names that 
 	assert.equal(countCell(lines), "1 file (0 selected) · ext");
 	assert.match(selectedRow(lines), /util\.ts/, "the filter still chooses the row, in the active order");
 	assert.deepEqual(paintedList(lines, TREE_BASENAMES), ["util.ts"], "the query hides every other row in this order too");
+});
+
+// The foldable trees (S35): `path` nests folder groups, `ext` paints one level
+// of extension groups, every group starts open, `space` and `enter` fold the
+// focused group, and a query forces every group open. `modified` stays a flat
+// file list, exactly as it painted before.
+
+test("the path order paints the tree: each folder's subfolders before its own files, the repository's own files last", async () => {
+	const { view } = await openView({ rows: 40 }, TREE_FILES);
+	view.handleInput(CTRL_O);
+	const lines = view.render(120);
+	assert.deepEqual(listTree(lines), [
+		{ depth: 0, label: ".github" },
+		{ depth: 1, label: "ISSUE_TEMPLATE" },
+		{ depth: 2, label: "bug.md" },
+		{ depth: 1, label: "workflows" },
+		{ depth: 2, label: "ci.yml" },
+		{ depth: 1, label: "CODEOWNERS" },
+		{ depth: 0, label: "bin" },
+		{ depth: 1, label: "cli.ts" },
+		{ depth: 0, label: "docs" },
+		{ depth: 1, label: "api" },
+		{ depth: 2, label: "reference.md" },
+		{ depth: 1, label: "guide.md" },
+		{ depth: 0, label: "src" },
+		{ depth: 1, label: "lib" },
+		{ depth: 2, label: "util.ts" },
+		{ depth: 1, label: "app.ts" },
+		{ depth: 0, label: ".gitignore" },
+		{ depth: 0, label: "AGENTS.md" },
+	], "inside every folder its subfolders come first and then its own files, so the root's own files paint last");
+	assert.equal(countCell(lines), "10 files (0 selected) · path", "the info row counts files, never the group rows");
+	for (const line of lines) assert.equal(visibleWidth(line), 120);
+});
+
+test("every group starts expanded, and space folds the focused group in place, keeping the highlight on its row", async () => {
+	const { view, calls } = await openView({ rows: 40 }, TREE_FILES);
+	view.handleInput(CTRL_O);
+	let lines = view.render(120);
+	assert.equal(listTree(lines).length, 18, "choosing an order never hides a file: every group starts expanded");
+	assert.match(footerText(lines), /space fold/, "the footer names the fold key");
+	view.handleInput(HOME_SEQUENCES[0]!);
+	lines = view.render(120);
+	assert.deepEqual(listTree(lines)[0], { depth: 0, label: ".github" }, "home lands on the first painted row, a group");
+	view.handleInput(SPACE);
+	lines = view.render(120);
+	assert.deepEqual(listTree(lines), [
+		{ depth: 0, label: ".github" },
+		{ depth: 0, label: "bin" },
+		{ depth: 1, label: "cli.ts" },
+		{ depth: 0, label: "docs" },
+		{ depth: 1, label: "api" },
+		{ depth: 2, label: "reference.md" },
+		{ depth: 1, label: "guide.md" },
+		{ depth: 0, label: "src" },
+		{ depth: 1, label: "lib" },
+		{ depth: 2, label: "util.ts" },
+		{ depth: 1, label: "app.ts" },
+		{ depth: 0, label: ".gitignore" },
+		{ depth: 0, label: "AGENTS.md" },
+	], "the folded group's files disappear and its own row stays");
+	assert.match(selectedRow(lines), /\.github/, "toggling a group keeps the highlight on that group row");
+	assert.equal(countCell(lines), "10 files (0 selected) · path", "a fold hides rows but never recounts the files");
+	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › Search +│$/, "space never becomes query text");
+	assert.deepEqual(calls.insert, [], "space never inserts");
+	assert.equal(calls.close, 0, "space never closes the panel");
+	view.handleInput(SPACE);
+	assert.equal(listTree(view.render(120)).length, 18, "space again unfolds the group");
+	view.handleInput("\r");
+	lines = view.render(120);
+	assert.equal(listTree(lines).length, 13, "enter on a group row folds it too, matching /changes");
+	assert.match(selectedRow(lines), /\.github/, "and keeps the highlight there");
+	assert.deepEqual(calls.insert, [], "a group row never inserts");
+	assert.equal(calls.close, 0, "a group row never closes the panel");
+
+	// The fold state is kept per order: another order starts expanded, and coming
+	// back to this one restores the fold the user set here.
+	view.handleInput(CTRL_O);
+	assert.equal(listTree(view.render(120)).filter((row) => row.depth === 1).length, 10, "the ext order starts with every group expanded");
+	view.handleInput(CTRL_O);
+	view.handleInput(CTRL_O);
+	assert.equal(listTree(view.render(120)).length, 13, "coming back to path keeps the fold this order had");
+});
+
+test("space is never query text, so it no longer throws the highlight back to the first row", async () => {
+	const { view, calls } = await openView({}, [entry("a.ts"), entry("b.ts"), entry("c.ts")]);
+	view.handleInput("\x1b[B");
+	assert.match(selectedRow(view.render(120)), /b\.ts/);
+	view.handleInput(SPACE);
+	let lines = view.render(120);
+	assert.match(selectedRow(lines), /b\.ts/, "space leaves the highlight where it is on a flat list");
+	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › Search +│$/, "space never reaches the search row");
+	assert.equal(countCell(lines), "3 files (0 selected) · modified");
+	for (const character of "sp") view.handleInput(character);
+	assert.match(stripAnsi(view.render(120)[SEARCH_ROW]!), /^│ › sp +│$/, "typing still reaches the query");
+	view.handleInput(SPACE);
+	lines = view.render(120);
+	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › sp +│$/, "space is appended to no query, ever");
+	assert.ok(bodyText(lines).includes('No files match "sp"'), "the query is still exactly what was typed");
+	assert.deepEqual(calls.insert, [], "space never inserts");
+	assert.equal(calls.close, 0);
+});
+
+test("a non-empty query forces every group open, and the fold keys do nothing until it is cleared", async () => {
+	const { view, calls } = await openView({ rows: 40 }, TREE_FILES);
+	view.handleInput(CTRL_O);
+	view.handleInput(HOME_SEQUENCES[0]!);
+	view.handleInput(SPACE);
+	assert.equal(listTree(view.render(120)).length, 13, "the group is folded before the query");
+	for (const character of "bug") view.handleInput(character);
+	let lines = view.render(120);
+	assert.deepEqual(listTree(lines), [
+		{ depth: 0, label: ".github" },
+		{ depth: 1, label: "ISSUE_TEMPLATE" },
+		{ depth: 2, label: "bug.md" },
+	], "a query forces the folded group open, so its match is never hidden");
+	assert.match(selectedRow(lines), /bug\.md/, "the highlight lands on the first match, never on a group row");
+	view.handleInput(HOME_SEQUENCES[0]!);
+	assert.match(selectedRow(view.render(120)), /\.github/);
+	view.handleInput(SPACE);
+	lines = view.render(120);
+	assert.equal(listTree(lines).length, 3, "the fold keys do nothing while a query holds the groups open");
+	assert.match(selectedRow(lines), /\.github/, "and nothing moves either");
+	view.handleInput("\x15");
+	lines = view.render(120);
+	assert.equal(listTree(lines).length, 13, "clearing the query restores the fold the user set");
+	assert.deepEqual(calls.insert, []);
+	assert.equal(calls.close, 0);
+});
+
+test("enter on a file row still inserts and closes, while tab and ctrl+e do nothing on a group row", async () => {
+	const { view, calls } = await openView({ rows: 40 }, TREE_FILES);
+	view.handleInput(CTRL_O);
+	view.handleInput(HOME_SEQUENCES[0]!);
+	view.handleInput(TAB);
+	let lines = view.render(120);
+	assert.equal(countCell(lines), "10 files (0 selected) · path", "tab marks no group row");
+	view.handleInput("\x05");
+	lines = view.render(120);
+	assert.deepEqual(calls.open, [], "ctrl+e opens nothing on a group row");
+	assert.equal(calls.close, 0, "ctrl+e on a group row never closes the panel");
+	assert.match(selectedRow(lines), /\.github/, "and the highlight stays on the group");
+	view.handleInput("\x1b[B");
+	view.handleInput("\x1b[B");
+	lines = view.render(120);
+	assert.match(selectedRow(lines), /bug\.md/, "the arrows step onto a file row of the tree");
+	view.handleInput("\r");
+	assert.deepEqual(calls.insert, [[".github/ISSUE_TEMPLATE/bug.md"]], "enter on a file row inserts that file");
+	assert.equal(calls.close, 1, "and closes the panel once");
+});
+
+test("a group row paints only its name, and the path order paints no trailing directory", async () => {
+	const { view } = await openView({ rows: 40 }, TREE_FILES);
+	view.handleInput(CTRL_O);
+	// The highlight sits on a group row, so no preview mentions a file name here.
+	view.handleInput(HOME_SEQUENCES[0]!);
+	const pathLines = view.render(120);
+	const group = (stripAnsi(pathLines[rowOf(pathLines, ".github")]!).split(" │ ")[0] ?? "").replace(/^│ /, "");
+	assert.equal(group.slice(MARKER_COLUMN).trimEnd(), ".github", "a group row paints its name at its depth and nothing else");
+	assert.doesNotMatch(group, /\b[UM]\b/, "a group row never paints a badge");
+	assert.doesNotMatch(group, /\d+[smhd]\b/, "a group row never paints an age");
+	assert.match(listCell(pathLines, "app.ts"), new RegExp(`^ {${MARKER_COLUMN + GROUP_INDENT}}app\\.ts +U 1m$`), "a file row in path order keeps the badge and the age");
+	assert.doesNotMatch(listCell(pathLines, "app.ts"), /src/, "in path the tree already places the file in its folder, so no directory suffix");
+	assert.equal(listCell(pathLines, "guide.md").trimEnd(), " ".repeat(MARKER_COLUMN + GROUP_INDENT) + "guide.md", "a clean nested file paints its name alone");
+
+	const modified = await openView({ rows: 40 }, TREE_FILES);
+	assert.match(listCell(modified.view.render(120), "app.ts"), /^ {3}app\.ts +src +U 1m$/, "modified keeps the trailing directory");
+	const ext = await openView({ rows: 40 }, [entry("src/zeta.ts"), entry("src/app.ts", "new", NOW - MINUTE)]);
+	ext.view.handleInput(CTRL_O);
+	ext.view.handleInput(CTRL_O);
+	assert.match(listCell(ext.view.render(120), "app.ts"), new RegExp(`^ {${MARKER_COLUMN + GROUP_INDENT}}app\\.ts +src +U 1m$`), "ext keeps the trailing directory");
+});
+
+test("the modified order stays a flat file list: changed files first, badge and age, and no group rows", async () => {
+	const { view } = await openView({ rows: 40 }, TREE_FILES);
+	const lines = view.render(120);
+	assert.deepEqual(listTree(lines), [
+		{ depth: 0, label: "guide.md" },
+		{ depth: 0, label: "app.ts" },
+		{ depth: 0, label: ".gitignore" },
+		{ depth: 0, label: "ci.yml" },
+		{ depth: 0, label: "CODEOWNERS" },
+		{ depth: 0, label: "bug.md" },
+		{ depth: 0, label: "cli.ts" },
+		{ depth: 0, label: "AGENTS.md" },
+		{ depth: 0, label: "util.ts" },
+		{ depth: 0, label: "reference.md" },
+	], "the default order paints its flat listing untouched: every row is a depth-zero file row");
+	assert.equal(countCell(lines), "10 files (0 selected) · modified");
+	assert.match(listCell(lines, "app.ts"), /app\.ts +src +U 1m$/, "the changed row keeps its badge, its age and its directory");
+});
+
+test("a click, the wheel and hover land on the row actually painted, group rows included", async () => {
+	// Only the hover role is tagged, so every painted cell keeps its width and
+	// the pointer geometry is the one the plain theme paints.
+	const hoverTheme: FilePickerTheme = {
+		fg(color, text) {
+			return color === "warning" ? `<warning>${text}</warning>` : text;
+		},
+	};
+	const { view, calls } = await openView({ theme: hoverTheme, rows: 40 }, TREE_FILES);
+	view.handleInput(CTRL_O);
+	// A group row is the highlight, so the preview carries no file name and the
+	// list rows are the only place the searched label can appear.
+	view.handleInput(HOME_SEQUENCES[0]!);
+	let lines = view.render(120);
+	const groupRow = listRowOf(lines, "docs");
+	assert.deepEqual(view.handleMouse(mouse(lines, 4, groupRow)), { handled: true, render: true }, "a click on a group row is a list click");
+	lines = view.render(120);
+	assert.equal(rowOf(lines, "▸"), groupRow, "the selection lands on the group row under the pointer");
+	assert.match(selectedRow(lines), /docs/);
+	assert.deepEqual(calls.insert, [], "a group click never inserts");
+	assert.equal(calls.close, 0, "a group click never closes the panel");
+
+	const issueRow = listRowOf(lines, "ISSUE_TEMPLATE");
+	assert.equal(view.handleMouse(mouse(lines, 4, issueRow, "move", "none"))?.render, true);
+	lines = view.render(120);
+	assert.match(lines[issueRow]!, /<warning>/, "a group row takes the shared hover role");
+
+	view.handleInput(HOME_SEQUENCES[0]!);
+	assert.match(selectedRow(view.render(120)), /\.github/);
+	lines = view.render(120);
+	assert.deepEqual(view.handleMouse(mouse(lines, 4, listRowOf(lines, "bin"), "wheel", "none", 1)), { handled: true, render: true });
+	assert.match(selectedRow(view.render(120)), /ISSUE_TEMPLATE/, "the list wheel steps onto the group row painted below");
+
+	const fileRow = listRowOf(lines, "guide.md");
+	assert.deepEqual(view.handleMouse(mouse(lines, 4, fileRow)), { handled: true, render: true }, "a click on a file row of the tree selects that file");
+	lines = view.render(120);
+	assert.equal(rowOf(lines, "▸"), fileRow, "the file row is the one the pointer was over");
+	assert.match(selectedRow(lines), /guide\.md/);
+	await settle();
+	lines = view.render(120);
+	assert.match(bodyText(lines), /preview of docs\/guide\.md/, "the preview follows the file row the pointer landed on");
 });

@@ -100,6 +100,7 @@ const FOOTER_HINTS: readonly (readonly [string, string])[] = [
 	["↑/↓", "move"],
 	["ctrl+j/k", "scroll"],
 	["tab", "select"],
+	["space", "fold"],
 	["ctrl+o", "order"],
 	["ctrl+u", "clear"],
 	["enter", "insert"],
@@ -121,17 +122,31 @@ const MODIFIED_BADGE = "M";
 const DIRECTORY_TONE = "dim";
 
 /**
- * The listing orders ctrl+o cycles through (S29): the listing's own
- * changed-first recency order, directory-major path order and extension
- * groups.
+ * The listing orders ctrl+o cycles through (S29): `modified` is the listing's own
+ * changed-first recency order, painted flat, while `path` and `ext` paint a
+ * foldable tree — `path` a folder tree with group rows nested by path segment,
+ * `ext` one level of extension groups (S35).
  */
 export type FilePickerOrder = "modified" | "path" | "ext";
 const ORDER_CYCLE: readonly FilePickerOrder[] = ["modified", "path", "ext"];
 const DEFAULT_ORDER: FilePickerOrder = "modified";
 // Separates the counts from the active order in the info row (S29).
 const INFO_SEPARATOR = " · ";
+// The tree `path` and `ext` paint (S35): the indent one nesting level costs, and
+// the name of the extensionless group, which always paints last.
+const GROUP_INDENT = 2;
+const EXTENSIONLESS_GROUP = "(none)";
 
 type Tone = "border" | "accent" | "muted" | "dim" | "text" | "error";
+
+/**
+ * One row the list paints (S35): a foldable group of the `path` or `ext` tree, or
+ * a file. `depth` is the nesting level the row is indented at, and a group's
+ * `key` is what the fold state remembers for the order painting it.
+ */
+type ListRow =
+	| { kind: "group"; key: string; label: string; depth: number }
+	| { kind: "file"; entry: FileEntry; depth: number };
 
 interface PaneLayout {
 	contentWidth: number;
@@ -281,40 +296,16 @@ function byCodePoint(left: string, right: string): number {
 	return left < right ? -1 : left > right ? 1 : 0;
 }
 
-/**
- * Directory-major alphabetical (S29): paths compare segment by segment, so
- * every file of a folder and of its subfolders stays together and the flat list
- * reads like an explorer's tree without folder header rows. A segment that
- * another merely extends keeps the folder ahead of the file sharing its name
- * (`src/…` before `src.ts`).
- */
-function byDirectoryMajor(left: FileEntry, right: FileEntry): number {
-	const leftSegments = left.path.split("/");
-	const rightSegments = right.path.split("/");
-	const shared = Math.min(leftSegments.length, rightSegments.length);
-	for (let index = 0; index < shared; index += 1) {
-		const compared = byCodePoint(leftSegments[index]!, rightSegments[index]!);
-		if (compared !== 0) return compared;
-	}
-	return leftSegments.length - rightSegments.length;
+/** The last segment of a folder path, which is the name its group row paints. */
+function lastSegment(path: string): string {
+	const slash = path.lastIndexOf("/");
+	return slash < 0 ? path : path.slice(slash + 1);
 }
 
 /** A dotfile such as `.gitignore` has no extension; `a.tar.gz` groups under `gz`. */
 function extensionOf(path: string): string {
 	const extension = posix.extname(posix.basename(path));
 	return extension.startsWith(".") ? extension.slice(1) : extension;
-}
-
-/** Extension groups, alphabetical by extension and then by path; no extension sorts last. */
-function byExtension(left: FileEntry, right: FileEntry): number {
-	const leftExtension = extensionOf(left.path);
-	const rightExtension = extensionOf(right.path);
-	if (leftExtension !== rightExtension) {
-		if (leftExtension === "") return 1;
-		if (rightExtension === "") return -1;
-		return byCodePoint(leftExtension, rightExtension);
-	}
-	return byCodePoint(left.path, right.path);
 }
 
 /** Keep the tail of a path, which is what identifies the directory. */
@@ -344,6 +335,11 @@ export class FilePickerView {
 	private entries: FileEntry[] = [];
 	private loaded = false;
 	private listingError: string | undefined;
+	/**
+	 * The group keys folded per order (S35): every group starts expanded when an
+	 * order is chosen, and the fold state lives as long as the panel does.
+	 */
+	private readonly foldedByOrder = new Map<FilePickerOrder, Set<string>>();
 	/** Tab multi-select (S14), in the order each file was marked. */
 	private readonly selection = new Set<string>();
 	private readonly openedAt: number;
@@ -447,7 +443,7 @@ export class FilePickerView {
 			return;
 		}
 		if (matchesKey(data, Key.end)) {
-			this.select(this.matches().length - 1);
+			this.select(this.rows().length - 1);
 			return;
 		}
 		if (matchesKey(data, Key.down)) {
@@ -462,6 +458,13 @@ export class FilePickerView {
 			this.toggleSelection();
 			return;
 		}
+		// space folds the focused group row and is the one printable that never
+		// reaches the query, which is what used to reset the highlight to the
+		// first row (S5, S35).
+		if (matchesKey(data, Key.space)) {
+			this.toggleFold();
+			return;
+		}
 		if (matchesKey(data, Key.ctrl("o"))) {
 			this.cycleOrder();
 			return;
@@ -471,7 +474,10 @@ export class FilePickerView {
 			return;
 		}
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-			this.finish("insert");
+			// Enter on a group row folds it, matching /changes; on a file row it
+			// still inserts and closes (S35).
+			if (this.selectedRow()?.kind === "group") this.toggleFold();
+			else this.finish("insert");
 			return;
 		}
 		if (matchesKey(data, Key.ctrl("e"))) {
@@ -592,30 +598,23 @@ export class FilePickerView {
 	}
 
 	/**
-	 * The rows in the active order (S29). `modified` is the listing's own order —
-	 * changed first, newest first (S12) — and is never re-sorted here.
+	 * The files the query matches, in the listing's own order (S29): changed
+	 * first, newest first (S12). A non-empty query ranks them instead, and the
+	 * `path` and `ext` trees re-sort their own rows below.
 	 */
-	private orderedEntries(): FileEntry[] {
-		if (this.order === "modified") return this.entries;
-		const ordered = [...this.entries];
-		ordered.sort(this.order === "path" ? byDirectoryMajor : byExtension);
-		return ordered;
-	}
-
 	private matches(): FileEntry[] {
-		const ordered = this.orderedEntries();
-		if (!this.loaded || ordered.length === 0) return [];
+		if (!this.loaded || this.entries.length === 0) return [];
 		// rankPaletteGroups already ranks basename starts-with, then basename
 		// contains, then subsequence, then full-path contains (the directory).
 		// It keeps the input order for an empty query, so the active listing
 		// order is what those rows paint.
 		const group: CommandPaletteGroup = {
 			title: "Files",
-			items: ordered.map((entry) => ({ command: entry.path, label: posix.basename(entry.path) })),
+			items: this.entries.map((entry) => ({ command: entry.path, label: posix.basename(entry.path) })),
 		};
 		const ranked = rankPaletteGroups([group], this.query)[0];
 		if (!ranked) return [];
-		const byPath = new Map(ordered.map((entry) => [entry.path, entry]));
+		const byPath = new Map(this.entries.map((entry) => [entry.path, entry]));
 		const matched: FileEntry[] = [];
 		for (const item of ranked.items) {
 			const entry = byPath.get(item.command);
@@ -624,27 +623,130 @@ export class FilePickerView {
 		return matched;
 	}
 
+	/**
+	 * The rows the list paints in the active order (S29, S35). `modified` is a flat
+	 * file list in the listing's own order and is never re-sorted or grouped here;
+	 * `path` and `ext` paint a tree of group rows and file rows.
+	 */
+	private rows(): ListRow[] {
+		const matched = this.matches();
+		if (this.order === "modified" || matched.length === 0) return matched.map((entry) => ({ kind: "file", entry, depth: 0 }));
+		return this.order === "path" ? this.pathRows(matched) : this.extensionRows(matched);
+	}
+
+	/**
+	 * The `path` tree: inside every folder its subfolders come first and then its
+	 * own files, each alphabetical by name, so at the top level every folder group
+	 * paints before the files living at the repository root (S35). Every folder on
+	 * the way down gets a group row, even one holding no file of its own.
+	 */
+	private pathRows(entries: FileEntry[]): ListRow[] {
+		const ownFiles = new Map<string, FileEntry[]>();
+		const subfolders = new Map<string, Set<string>>();
+		for (const entry of entries) {
+			const directory = posix.dirname(entry.path);
+			const folder = directory === "." ? "" : directory;
+			const files = ownFiles.get(folder);
+			if (files) files.push(entry);
+			else ownFiles.set(folder, [entry]);
+			let current = folder;
+			while (current !== "") {
+				const slash = current.lastIndexOf("/");
+				const parent = slash < 0 ? "" : current.slice(0, slash);
+				const children = subfolders.get(parent);
+				if (children) children.add(current);
+				else subfolders.set(parent, new Set([current]));
+				current = parent;
+			}
+		}
+		const rows: ListRow[] = [];
+		const paint = (folder: string, depth: number): void => {
+			const children = [...(subfolders.get(folder) ?? [])].sort((left, right) => byCodePoint(lastSegment(left), lastSegment(right)));
+			for (const child of children) {
+				rows.push({ kind: "group", key: child, label: lastSegment(child), depth });
+				if (this.groupExpanded(child)) paint(child, depth + 1);
+			}
+			const files = [...(ownFiles.get(folder) ?? [])].sort((left, right) => byCodePoint(posix.basename(left.path), posix.basename(right.path)));
+			for (const entry of files) rows.push({ kind: "file", entry, depth });
+		};
+		paint("", 0);
+		return rows;
+	}
+
+	/**
+	 * The `ext` tree, one level deep (S35): one group per extension named with its
+	 * dot, the files inside alphabetical by path, and the extensionless group last.
+	 */
+	private extensionRows(entries: FileEntry[]): ListRow[] {
+		const groups = new Map<string, FileEntry[]>();
+		for (const entry of entries) {
+			const extension = extensionOf(entry.path);
+			const files = groups.get(extension);
+			if (files) files.push(entry);
+			else groups.set(extension, [entry]);
+		}
+		const extensions = [...groups.keys()].sort((left, right) => (left === "" ? 1 : right === "" ? -1 : byCodePoint(left, right)));
+		const rows: ListRow[] = [];
+		for (const extension of extensions) {
+			rows.push({ kind: "group", key: extension, label: extension === "" ? EXTENSIONLESS_GROUP : `.${extension}`, depth: 0 });
+			if (!this.groupExpanded(extension)) continue;
+			const files = [...(groups.get(extension) ?? [])].sort((left, right) => byCodePoint(left.path, right.path));
+			for (const entry of files) rows.push({ kind: "file", entry, depth: 1 });
+		}
+		return rows;
+	}
+
+	/** The group keys the active order has folded (S35); a group is open until it is folded. */
+	private foldedGroups(order: FilePickerOrder): Set<string> {
+		let folded = this.foldedByOrder.get(order);
+		if (!folded) {
+			folded = new Set<string>();
+			this.foldedByOrder.set(order, folded);
+		}
+		return folded;
+	}
+
+	/** A non-empty query forces every group open, so a match is never hidden behind a fold (S35). */
+	private groupExpanded(key: string): boolean {
+		if (this.query.length > 0) return true;
+		return !this.foldedGroups(this.order).has(key);
+	}
+
+	private selectedRow(): ListRow | undefined {
+		const rows = this.rows();
+		if (rows.length === 0) return undefined;
+		return rows[Math.max(0, Math.min(rows.length - 1, this.selected))];
+	}
+
 	private selectedPath(): string | undefined {
-		const matches = this.matches();
-		if (matches.length === 0) return undefined;
-		return matches[Math.max(0, Math.min(matches.length - 1, this.selected))]?.path;
+		const row = this.selectedRow();
+		return row?.kind === "file" ? row.entry.path : undefined;
+	}
+
+	/**
+	 * The first file row, so typing moves the highlight to a match and never to a
+	 * group row, which has no file to preview (S5, S35).
+	 */
+	private firstFileRow(): number {
+		const index = this.rows().findIndex((row) => row.kind === "file");
+		return index < 0 ? 0 : index;
 	}
 
 	private setQuery(query: string): void {
 		this.query = query;
-		this.selected = 0;
+		this.selected = this.firstFileRow();
 		this.previewScroll = 0;
 		this.ensurePreviewLoaded();
 	}
 
 	private moveSelection(delta: number): boolean {
-		const total = this.matches().length;
+		const total = this.rows().length;
 		if (total === 0) return false;
 		return this.select(Math.max(0, Math.min(total - 1, this.selected + delta)));
 	}
 
 	private select(index: number): boolean {
-		const total = this.matches().length;
+		const total = this.rows().length;
 		if (total === 0) return false;
 		const next = Math.max(0, Math.min(total - 1, index));
 		if (next === this.selected) return false;
@@ -663,6 +765,22 @@ export class FilePickerView {
 	}
 
 	/**
+	 * space and Enter on a group row (S35): the group folds or unfolds and the
+	 * highlight stays on that group row. A file row, and a query that holds every
+	 * group open, has nothing to toggle.
+	 */
+	private toggleFold(): boolean {
+		const row = this.selectedRow();
+		if (!row || row.kind !== "group" || this.query.length > 0) return false;
+		const folded = this.foldedGroups(this.order);
+		if (folded.has(row.key)) folded.delete(row.key);
+		else folded.add(row.key);
+		const index = this.rows().findIndex((candidate) => candidate.kind === "group" && candidate.key === row.key);
+		if (index >= 0) this.selected = index;
+		return true;
+	}
+
+	/**
 	 * ctrl+o: the next order, with the highlight following the same file rather
 	 * than the same index. The preview keeps its scroll unless the highlighted
 	 * file actually changed (S29).
@@ -671,9 +789,9 @@ export class FilePickerView {
 		const previous = this.selectedPath();
 		const position = ORDER_CYCLE.indexOf(this.order);
 		this.order = ORDER_CYCLE[(position + 1) % ORDER_CYCLE.length]!;
-		const total = this.matches().length;
-		const moved = previous === undefined ? -1 : this.matches().findIndex((entry) => entry.path === previous);
-		this.selected = moved >= 0 ? moved : Math.max(0, Math.min(total - 1, this.selected));
+		const rows = this.rows();
+		const moved = previous === undefined ? -1 : rows.findIndex((row) => row.kind === "file" && row.entry.path === previous);
+		this.selected = moved >= 0 ? moved : Math.max(0, Math.min(rows.length - 1, this.selected));
 		if (this.selectedPath() !== previous) this.previewScroll = 0;
 		this.ensurePreviewLoaded();
 		return true;
@@ -687,9 +805,10 @@ export class FilePickerView {
 	private insertionPaths(): string[] {
 		const paths: string[] = [];
 		const visible = new Set<string>();
-		for (const entry of this.matches()) {
-			visible.add(entry.path);
-			if (this.selection.has(entry.path)) paths.push(entry.path);
+		for (const row of this.rows()) {
+			if (row.kind !== "file") continue;
+			visible.add(row.entry.path);
+			if (this.selection.has(row.entry.path)) paths.push(row.entry.path);
 		}
 		for (const path of this.selection) if (!visible.has(path)) paths.push(path);
 		const highlighted = this.selectedPath();
@@ -852,10 +971,10 @@ export class FilePickerView {
 	/**
 	 * The info row under the blank line: the counts and the active listing order,
 	 * so the order is always visible without being a key hint (S29). The file
-	 * count is what the query currently lists; the parenthesised count is the
-	 * whole Tab selection, which can include files the query hides. A pending or
-	 * failed listing counts nothing, so the row stays blank instead of claiming
-	 * zero files.
+	 * count is what the query currently lists — files only, never the group rows
+	 * the trees paint; the parenthesised count is the whole Tab selection, which
+	 * can include files the query hides. A pending or failed listing counts
+	 * nothing, so the row stays blank instead of claiming zero files.
 	 */
 	private countRow(width: number): string {
 		if (!this.loaded || this.listingError !== undefined) return "".padEnd(width, " ");
@@ -865,29 +984,39 @@ export class FilePickerView {
 		return fit(this.renderText(`${counts}${INFO_SEPARATOR}${this.order}`, "muted"), width);
 	}
 
+	/**
+	 * The list pane over the rows actually painted (S35), so the window, the
+	 * pointer rows and the highlight all follow the tree, group rows included.
+	 */
 	private listColumn(layout: PaneLayout, bodyRows: number, hits: PointerHit[]): string[] {
-		const matches = this.matches();
-		if (bodyRows <= 0 || matches.length === 0) return [];
+		const rows = this.rows();
+		if (bodyRows <= 0 || rows.length === 0) return [];
 		const lines: string[] = [];
-		const selected = Math.max(0, Math.min(matches.length - 1, this.selected));
-		const showIndicators = matches.length > bodyRows && bodyRows >= 4;
+		const selected = Math.max(0, Math.min(rows.length - 1, this.selected));
+		const showIndicators = rows.length > bodyRows && bodyRows >= 4;
 		const windowSize = showIndicators ? Math.max(1, bodyRows - 2) : bodyRows;
-		const start = Math.max(0, Math.min(selected - Math.floor(windowSize / 2), Math.max(0, matches.length - windowSize)));
-		const end = Math.min(matches.length, start + windowSize);
+		const start = Math.max(0, Math.min(selected - Math.floor(windowSize / 2), Math.max(0, rows.length - windowSize)));
+		const end = Math.min(rows.length, start + windowSize);
 		if (showIndicators && start > 0) lines.push(fit(this.renderText(`  ↑ ${start} more`, "muted"), layout.listWidth));
 		for (let index = start; index < end; index += 1) {
 			hits.push({ y: BODY_TOP + lines.length, index });
-			lines.push(this.renderListRow(matches[index]!, index, selected, layout.listWidth));
+			lines.push(this.renderListRow(rows[index]!, index, selected, layout.listWidth));
 		}
-		if (showIndicators && end < matches.length) lines.push(fit(this.renderText(`  ↓ ${matches.length - end} more`, "muted"), layout.listWidth));
+		if (showIndicators && end < rows.length) lines.push(fit(this.renderText(`  ↓ ${rows.length - end} more`, "muted"), layout.listWidth));
 		while (lines.length < bodyRows) lines.push("");
 		return lines.slice(0, bodyRows);
 	}
 
+	/**
+	 * The label a file row paints: its name, and — in `modified` and `ext` only —
+	 * the trailing parent directory. In `path` the tree already places the file
+	 * under its folder, so that suffix would echo the row above it (S35).
+	 */
 	private rowLabel(entry: FileEntry): { text: string; nameLength: number } {
 		const name = displayText(posix.basename(entry.path));
-		const directory = posix.dirname(entry.path);
-		return directory === "." ? { text: name, nameLength: name.length } : { text: `${name}  ${displayText(directory)}`, nameLength: name.length };
+		const directory = this.order === "path" ? undefined : posix.dirname(entry.path);
+		if (directory === undefined || directory === ".") return { text: name, nameLength: name.length };
+		return { text: `${name}  ${displayText(directory)}`, nameLength: name.length };
 	}
 
 	/** The trailing badge and age of a changed row; a clean row has neither (S12). */
@@ -905,15 +1034,32 @@ export class FilePickerView {
 	// paints for the same information (S37); the label is composed and truncated
 	// whole and only then split, so the tone split moves no cell and never
 	// changes which part truncates first.
-	private renderListRow(entry: FileEntry, index: number, selectedIndex: number, listWidth: number): string {
+	private renderListRow(row: ListRow, index: number, selectedIndex: number, listWidth: number): string {
 		const theme = this.deps.theme;
 		const cursor = index === selectedIndex;
+		const indent = " ".repeat(row.depth * GROUP_INDENT);
+		const indentWidth = row.depth * GROUP_INDENT;
+		if (row.kind === "group") {
+			// A group row paints only its name at its depth: no badge, no age and no
+			// trailing directory, which the tree already expresses (S35). Space owns
+			// no selection bar, so its middle cell stays blank like an unmarked row.
+			const room = Math.max(0, listWidth - MARKER_WIDTH - indentWidth);
+			const label = truncateToWidth(displayText(row.label), room, "…");
+			const marker = `${cursor && !theme.bg ? theme.fg("accent", "▸") : " "}  `;
+			if (cursor && theme.bg) {
+				const inner = `${marker}${indent}${label}`;
+				return theme.bg("selectedBg", inner + " ".repeat(Math.max(0, listWidth - visibleWidth(stripAnsi(inner)))));
+			}
+			const painted = cursor ? theme.fg("text", label) : paintHoverable(theme, label, !cursor && index === this.hovered, "muted");
+			return fit(`${marker}${indent}${painted}`, listWidth);
+		}
+		const entry = row.entry;
 		const marked = this.selection.has(entry.path);
 		const hovered = !cursor && !marked && index === this.hovered;
 		const suffix = this.rowSuffix(entry);
 		const suffixWidth = visibleWidth(stripAnsi(suffix));
-		const showsSuffix = suffixWidth > 0 && suffixWidth + MARKER_WIDTH <= listWidth;
-		const labelRoom = Math.max(0, listWidth - MARKER_WIDTH - (showsSuffix ? suffixWidth + 1 : 0));
+		const showsSuffix = suffixWidth > 0 && suffixWidth + MARKER_WIDTH + indentWidth <= listWidth;
+		const labelRoom = Math.max(0, listWidth - MARKER_WIDTH - indentWidth - (showsSuffix ? suffixWidth + 1 : 0));
 		const parts = this.rowLabel(entry);
 		const label = truncateToWidth(parts.text, labelRoom, "…");
 		// A file at the repository root has no directory, so the whole label is
@@ -924,18 +1070,18 @@ export class FilePickerView {
 		const gapEnd = tail.slice(0, 2) === "  " ? 2 : tail.search(/[^ ]/);
 		const nameGap = gapEnd === -1 ? tail : tail.slice(0, gapEnd);
 		const directory = tail.slice(nameGap.length);
-		const gap = " ".repeat(Math.max(0, listWidth - MARKER_WIDTH - visibleWidth(label) - (showsSuffix ? suffixWidth : 0)));
+		const gap = " ".repeat(Math.max(0, listWidth - MARKER_WIDTH - indentWidth - visibleWidth(label) - (showsSuffix ? suffixWidth : 0)));
 		// The marker column is three cells wide in every state: cursor cell,
 		// selection cell, then the space before the name. A highlighted bar owns
 		// the cursor, so that cell stays blank there.
 		const marker = `${cursor && !theme.bg ? theme.fg("accent", "▸") : " "}${marked ? theme.fg("accent", SELECTION_BAR) : " "} `;
 		if (cursor && theme.bg) {
-			const inner = `${marker}${label}${showsSuffix ? `${gap}${stripAnsi(suffix)}` : ""}`;
+			const inner = `${marker}${indent}${label}${showsSuffix ? `${gap}${stripAnsi(suffix)}` : ""}`;
 			return theme.bg("selectedBg", inner + " ".repeat(Math.max(0, listWidth - visibleWidth(stripAnsi(inner)))));
 		}
 		const paintedName = marked ? theme.fg("accent", name) : cursor ? theme.fg("text", name) : paintHoverable(theme, name, hovered, "muted");
 		const paintedLabel = directory.length === 0 ? paintedName : `${paintedName}${nameGap}${theme.fg(DIRECTORY_TONE, directory)}`;
-		return fit(`${marker}${paintedLabel}${gap}${showsSuffix ? suffix : ""}`, listWidth);
+		return fit(`${marker}${indent}${paintedLabel}${gap}${showsSuffix ? suffix : ""}`, listWidth);
 	}
 
 	private previewColumn(layout: PaneLayout, bodyRows: number): string[] {
