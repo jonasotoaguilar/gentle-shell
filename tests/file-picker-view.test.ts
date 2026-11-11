@@ -15,6 +15,15 @@ const PAGE_DOWN = "\x1b[6~";
 const PAGE_UP = "\x1b[5~";
 const TAB = "\t";
 
+// Card rows: top border, header, search row, blank separator, count row, body.
+const SEARCH_ROW = 2;
+const COUNT_ROW = 4;
+const BODY_TOP = 5;
+// A selected row's marker cell: the accent bar that joins across adjacent rows.
+const SELECTION_BAR = "▏";
+const FOOTER_TEXT = "↑/↓ move • ctrl+j/k scroll • tab select • ctrl+u clear • enter insert • ctrl+e editor • esc close";
+const ROOT = "/home/dev/projects/gentle-shell-worktrees/file-picker";
+
 // A fixed clock: the row ages are computed once when the panel opens, so a
 // test can advance the clock and prove the painted ages never move.
 const NOW = 1_700_000_000_000;
@@ -143,8 +152,32 @@ function mouse(lines: readonly string[], x: number, y: number, type: MouseEvent[
 	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false, wheelDelta };
 }
 
+/** The right pane cell at `offset` rows into the body; 0 is the position row. */
+function previewCell(lines: readonly string[], offset: number): string {
+	const row = stripAnsi(lines[BODY_TOP + offset] ?? "");
+	const cells = row.replace(/^│ /, "").replace(/ │$/, "").split(" │ ");
+	return cells[1] ?? "";
+}
+
+/** The first preview content row, under the position indicator. */
 function previewTop(lines: readonly string[]): string {
-	return stripAnsi(lines[2] ?? "");
+	return previewCell(lines, 1);
+}
+
+/** The same cell with its escape sequences intact, for role assertions. */
+function rawPreviewCell(lines: readonly string[], offset: number): string {
+	const row = lines[BODY_TOP + offset] ?? "";
+	const cells = row.replace(/^│ /, "").replace(/ │$/, "").split(" │ ");
+	return cells[1] ?? "";
+}
+
+function footerText(lines: readonly string[]): string {
+	return stripAnsi(lines[lines.length - 2] ?? "").replace(/^│ /, "").replace(/ +│$/, "");
+}
+
+/** The column where a list row's name starts, i.e. the marker column width. */
+function labelColumn(lines: readonly string[], text: string): number {
+	return listCell(lines, text).indexOf(text);
 }
 
 test("the card frame is exact at two widths, with the title, esc hint and key footer", async () => {
@@ -159,18 +192,130 @@ test("the card frame is exact at two widths, with the title, esc hint and key fo
 	assert.match(wide[1]!, /^│ File picker +esc +│$/, "the header carries the title on the left and esc on the right");
 });
 
-test("the footer carries the whole key list when the width allows it and truncates to one line when it does not", async () => {
+test("the footer is exactly one option per action and never advertises the functional alternates", async () => {
 	const { view } = await openView();
-	const roomy = stripAnsi(view.render(200)[view.render(200).length - 2]!);
-	for (const key of ["type to search", "tab select", "ctrl+u clear", "ctrl+j/k move", "ctrl+shift+j/k scroll", "enter insert", "ctrl+e editor", "esc/ctrl+c close"]) {
-		assert.ok(roomy.includes(key), `footer must list ${JSON.stringify(key)}: ${roomy}`);
-	}
+	const roomy = footerText(view.render(200));
+	assert.equal(roomy, FOOTER_TEXT, "the footer is the whole key list, one option per action");
+	assert.doesNotMatch(roomy, /ctrl\+shift/, "the Linux fallback scrolls but is not advertised");
+	assert.doesNotMatch(roomy, /esc\/ctrl\+c/, "ctrl+c closes but is not advertised");
+	assert.doesNotMatch(roomy, /type to search/, "the search row replaced the old hint");
+
 	const narrow = view.render(80);
-	const footer = stripAnsi(narrow[narrow.length - 2]!);
-	assert.ok(footer.includes("type to search"));
-	assert.match(footer, /… +│$/, "a narrow footer is truncated instead of wrapping");
-	assert.equal(narrow.length, 20, "the truncated footer never adds a row");
+	const footer = footerText(narrow);
+	assert.ok(footer.endsWith("…"), `a narrow footer is truncated instead of wrapping: ${footer}`);
+	assert.ok(FOOTER_TEXT.startsWith(footer.slice(0, -1)), "the truncated footer is a prefix of the same line");
+	assert.equal(narrow.length, view.render(120).length, "the truncated footer never adds a row");
 	for (const line of narrow) assert.equal(visibleWidth(line), 80);
+});
+
+test("the card grows with the terminal, never exceeds the rows it is given, and keeps the footer at the smallest height", async () => {
+	let previous = 0;
+	for (const rows of [20, 40, 60]) {
+		const { view } = await openView({ rows });
+		const lines = view.render(120);
+		for (const line of lines) assert.equal(visibleWidth(line), 120, `no line is ragged at ${rows} rows`);
+		assert.ok(lines.length > previous, `the card grows with ${rows} rows`);
+		assert.ok(lines.length <= rows, `the card never exceeds the ${rows} rows it is given`);
+		assert.match(stripAnsi(lines[1]!), /^│ File picker .*esc +│$/, "the header is painted");
+		assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › Search +│$/);
+		assert.ok(stripAnsi(lines[BODY_TOP]!).includes("README.md"), "the list is painted");
+		assert.ok(footerText(lines).startsWith("↑/↓ move"), "the footer is painted");
+		previous = lines.length;
+	}
+
+	const { view } = await openView({ rows: 9 });
+	const smallest = view.render(120);
+	assert.equal(smallest.length, 9, "the smallest supported card fills the rows it is given");
+	for (const line of smallest) assert.equal(visibleWidth(line), 120);
+	assert.match(stripAnsi(smallest[1]!), /File picker/);
+	assert.match(stripAnsi(smallest[SEARCH_ROW]!), /› Search/);
+	assert.ok(footerText(smallest).startsWith("↑/↓ move"), "the footer survives the smallest card");
+});
+
+test("the title row shows the path being listed at its top-right, next to the esc hint", async () => {
+	const { view } = await openView({ root: ROOT });
+	const line = view.render(120)[1]!;
+	assert.equal(visibleWidth(line), 120);
+	const header = stripAnsi(line);
+	assert.ok(header.includes(ROOT), `the whole path is painted when it fits: ${header}`);
+	assert.match(header, /^│ File picker +.*file-picker esc +│$/, "the path sits between the title and the close hint");
+
+	const plain = await openView();
+	assert.match(stripAnsi(plain.view.render(120)[1]!), /^│ File picker +esc +│$/, "no path leaves the header unchanged");
+});
+
+test("a narrow title row elides the path from the left and keeps the title and esc legible", async () => {
+	const { view } = await openView({ root: ROOT });
+	const roomy = stripAnsi(view.render(80)[1]!);
+	assert.ok(roomy.includes(ROOT), "the whole path still fits at 80 columns");
+	assert.ok(roomy.trimEnd().endsWith("esc │"), "the close hint stays at the right edge");
+	for (const width of [60, 40]) {
+		const line = view.render(width)[1]!;
+		assert.equal(visibleWidth(line), width, `the header is exactly ${width} columns`);
+		const header = stripAnsi(line);
+		assert.ok(header.startsWith("│ File picker "), "the title keeps its place");
+		assert.ok(header.includes("…"), "the path is elided instead of overflowing");
+		assert.ok(!header.includes("/home/dev"), "only the identifying tail of the path is kept");
+		assert.ok(header.includes(ROOT.slice(-10)), "the tail — the part that identifies the scope — survives");
+		assert.ok(header.trimEnd().endsWith("esc │"), "the close hint stays at the right edge");
+	}
+
+	const tiny = view.render(24);
+	assert.equal(visibleWidth(tiny[1]!), 24);
+	assert.match(stripAnsi(tiny[1]!), /^│ File picker +esc +│$/, "too narrow a card drops the path, never the title or esc");
+});
+
+test("a count row under the blank line reports the files listed and the Tab selection, and updates at once", async () => {
+	const { view } = await openView({}, [entry("a.ts"), entry("b.ts"), entry("c.ts")]);
+	let lines = view.render(120);
+	assert.match(stripAnsi(lines[COUNT_ROW - 1]!), /^│ +│$/, "the blank row stays between the search row and the count");
+	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(0 selected\) +│$/, "the count row sits under the blank line");
+	assert.ok(stripAnsi(lines[BODY_TOP]!).includes("a.ts"), "the list starts under the count row");
+	view.handleInput(TAB);
+	lines = view.render(120);
+	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(1 selected\) +│$/, "Tab updates the selection count immediately");
+	view.handleInput("\x1b[B");
+	view.handleInput(TAB);
+	lines = view.render(120);
+	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(2 selected\) +│$/, "a second Tab counts too");
+	for (const character of "b") view.handleInput(character);
+	lines = view.render(120);
+	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 1 file \(2 selected\) +│$/, "filtering updates the file count at once, and the selection count never lies about the whole selection");
+});
+
+test("the count row keeps the card geometry at a narrow width and at the smallest height", async () => {
+	const { view } = await openView({}, [entry("a.ts")]);
+	const narrow = view.render(40);
+	assert.equal(visibleWidth(narrow[COUNT_ROW]!), 40);
+	assert.match(stripAnsi(narrow[COUNT_ROW]!), /^│ 1 file \(0 selected\) +│$/, "a single file reads as one file");
+	assert.equal(narrow.length, view.render(120).length, "the count row never adds a row");
+
+	const small = (await openView({ rows: 9 }, [entry("a.ts")])).view.render(120);
+	assert.equal(small.length, 9);
+	assert.match(stripAnsi(small[COUNT_ROW]!), /1 file \(0 selected\)/, "the count row survives the smallest card");
+	assert.ok(footerText(small).startsWith("↑/↓ move"));
+	for (const line of small) assert.equal(visibleWidth(line), 120);
+});
+
+test("the search row sits directly under the title and shows the placeholder or the typed query, then a blank row and the list", async () => {
+	const { view } = await openView({}, [entry("app.ts"), entry("src/app-store.ts")]);
+	let lines = view.render(120);
+	assert.match(stripAnsi(lines[1]!), /^│ File picker +esc +│$/, "the title row stays on top");
+	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › Search +│$/, "the empty search row shows the placeholder");
+	assert.match(stripAnsi(lines[SEARCH_ROW + 1]!), /^│ +│$/, "a blank row follows the search row");
+	assert.ok(stripAnsi(lines[BODY_TOP]!).includes("app.ts"), "the list starts under the count row");
+	for (const character of "app") view.handleInput(character);
+	lines = view.render(120);
+	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › app +│$/, "the search row shows exactly what was typed");
+	assert.doesNotMatch(stripAnsi(lines[SEARCH_ROW]!), /Search/, "the placeholder gives way to the query");
+});
+
+test("the search row paints its prompt and placeholder from the theme roles", async () => {
+	const empty = await openView({ theme: taggedTheme });
+	assert.match(stripAnsi(empty.view.render(120)[SEARCH_ROW]!), /<muted>› Search<\/muted>/);
+	const typed = await openView({ theme: taggedTheme }, [entry("app.ts")]);
+	typed.view.handleInput("a");
+	assert.match(stripAnsi(typed.view.render(120)[SEARCH_ROW]!), /<muted>›<\/muted> a/);
 });
 
 test("the body is two panes split by one vertical rule, with the list and preview content", async () => {
@@ -178,8 +323,9 @@ test("the body is two panes split by one vertical rule, with the list and previe
 	const lines = view.render(120).map((line) => stripAnsi(line));
 	const row = lines.find((line) => line.includes("README.md"));
 	assert.ok(row, "the list shows the repository-relative path");
-	assert.match(row!, /^│ .*README\.md.* │ .*preview of README\.md.* │$/, "the separator sits between the list and its preview");
+	assert.match(row!, /^│ .*README\.md.* │ .*│$/, "the separator sits between the list and its preview");
 	assert.equal((row!.match(/│/g) ?? []).length, 3, "the body row has the two card borders plus one pane separator");
+	assert.match(previewTop(lines), /^1 preview of README\.md/, "the preview paints its first line, numbered, beside the list");
 });
 
 test("typing narrows the list without navigating or firing an action, and resets the selection to the first match", async () => {
@@ -226,13 +372,13 @@ test("backspace edits the query, ctrl+u clears it, and a multi-character paste n
 test("ctrl+u restores the whole listing and keeps the Tab selection", async () => {
 	const { view } = await openView({}, [entry("app.ts"), entry("README.md")]);
 	view.handleInput(TAB);
-	assert.match(selectedRow(view.render(120)), /✓/, "the highlighted row is now selected");
+	assert.match(selectedRow(view.render(120)), new RegExp(SELECTION_BAR), "the highlighted row is now selected");
 	for (const character of "app") view.handleInput(character);
 	assert.ok(!bodyText(view.render(120)).includes("README.md"), "the query filters the list");
 	view.handleInput("\x15");
 	const lines = view.render(120);
 	assert.ok(bodyText(lines).includes("README.md"), "ctrl+u clears the query");
-	assert.match(stripAnsi(lines[rowOf(lines, "app.ts")]!), /✓/, "clearing the query keeps the selection");
+	assert.match(stripAnsi(lines[rowOf(lines, "app.ts")]!), new RegExp(SELECTION_BAR), "clearing the query keeps the selection");
 });
 
 test("a failed listing shows its message and an empty repository shows an explicit line", async () => {
@@ -246,16 +392,11 @@ test("a failed listing shows its message and an empty repository shows an explic
 	assert.ok(emptyBody.includes("No files in this repository."));
 });
 
-test("ctrl+j/ctrl+k and the arrows move the selection and clamp at both ends; a line feed moves rather than inserts", async () => {
+test("the arrows move the selection and clamp at both ends", async () => {
 	const { view, calls } = await openView({}, [entry("a.ts"), entry("b.ts"), entry("c.ts")]);
 	const selected = () => selectedRow(view.render(120));
 	assert.match(selected(), /a\.ts/);
 	view.handleInput("\x1b[B");
-	assert.match(selected(), /b\.ts/);
-	view.handleInput("\n");
-	assert.match(selected(), /c\.ts/, "a bare line feed is ctrl+j, not Enter");
-	assert.deepEqual(calls.insert, []);
-	view.handleInput("\x0b");
 	assert.match(selected(), /b\.ts/);
 	view.handleInput("\x1b[A");
 	assert.match(selected(), /a\.ts/);
@@ -267,9 +408,31 @@ test("ctrl+j/ctrl+k and the arrows move the selection and clamp at both ends; a 
 	assert.equal(calls.close, 0);
 });
 
+test("ctrl+j/k and ctrl+shift+j/k all scroll the preview without moving the selection; a line feed scrolls instead of inserting", async () => {
+	const long = Array.from({ length: 60 }, (_, index) => `line ${index}`);
+	const { view, calls } = await openView({ rows: 16, loadPreview: async () => preview(long) }, [entry("a.ts"), entry("b.ts")]);
+	assert.match(selectedRow(view.render(120)), /a\.ts/);
+	assert.match(previewTop(view.render(120)), /line 0/);
+	view.handleInput("\n");
+	assert.match(previewTop(view.render(120)), /line 1/, "a bare line feed is ctrl+j and scrolls the preview");
+	assert.match(selectedRow(view.render(120)), /a\.ts/, "a line feed never moves the selection");
+	view.handleInput("\x0b");
+	assert.match(previewTop(view.render(120)), /line 0/, "ctrl+k scrolls back up");
+	view.handleInput(CTRL_SHIFT_J);
+	assert.match(previewTop(view.render(120)), /line 1/, "ctrl+shift+j is the same scroll action");
+	view.handleInput(CTRL_SHIFT_K);
+	assert.match(previewTop(view.render(120)), /line 0/, "ctrl+shift+k is the same scroll action");
+	view.handleInput("\x1b[B");
+	assert.match(selectedRow(view.render(120)), /b\.ts/, "the arrows still move the selection");
+	await settle();
+	assert.match(previewTop(view.render(120)), /line 0/, "moving the selection resets the preview");
+	assert.deepEqual(calls.insert, [], "no scroll key inserts");
+	assert.equal(calls.close, 0);
+});
+
 test("a long selection window keeps the selected row visible with the more indicators", async () => {
 	const files = Array.from({ length: 30 }, (_, index) => entry(`file-${String(index).padStart(2, "0")}.ts`));
-	const { view } = await openView({ rows: 10 }, files);
+	const { view } = await openView({ rows: 20 }, files);
 	for (let index = 0; index < 20; index += 1) view.handleInput("\x1b[B");
 	const lines = view.render(120);
 	const body = bodyText(lines);
@@ -281,21 +444,21 @@ test("a long selection window keeps the selected row visible with the more indic
 
 test("ctrl+shift+j/k and pageUp/pageDown scroll the preview and clamp to its content", async () => {
 	const long = Array.from({ length: 60 }, (_, index) => `line ${index}`);
-	const { view } = await openView({ rows: 12, loadPreview: async () => preview(long) });
+	const { view } = await openView({ rows: 16, loadPreview: async () => preview(long) });
 	assert.match(previewTop(view.render(120)), /line 0/);
 	for (let index = 0; index < 3; index += 1) view.handleInput(CTRL_SHIFT_J);
 	assert.match(previewTop(view.render(120)), /line 3/);
 	view.handleInput(CTRL_SHIFT_K);
 	assert.match(previewTop(view.render(120)), /line 2/);
 	view.handleInput(PAGE_DOWN);
-	assert.match(previewTop(view.render(120)), /line 10/, "a page moves one body height");
+	assert.match(previewTop(view.render(120)), /line 7/, "a page moves one preview height");
 	view.handleInput(PAGE_UP);
 	assert.match(previewTop(view.render(120)), /line 2/);
 	for (let index = 0; index < 100; index += 1) view.handleInput(CTRL_SHIFT_K);
 	assert.match(previewTop(view.render(120)), /line 0/, "scrolling clamps at the top");
 	for (let index = 0; index < 100; index += 1) view.handleInput(CTRL_SHIFT_J);
 	const clamped = view.render(120);
-	assert.match(previewTop(clamped), /line 52/, "scrolling clamps at the last full page");
+	assert.match(previewTop(clamped), /line 55/, "scrolling clamps at the last full page");
 	assert.ok(bodyText(clamped).includes("line 59"));
 	const settled = view.render(120).join("\n");
 	view.handleInput(CTRL_SHIFT_J);
@@ -304,7 +467,7 @@ test("ctrl+shift+j/k and pageUp/pageDown scroll the preview and clamp to its con
 
 test("the wheel over the list moves the selection and the wheel over the preview scrolls it; the list wheel never scrolls the preview", async () => {
 	const long = Array.from({ length: 60 }, (_, index) => `line ${index}`);
-	const { view } = await openView({ rows: 12, loadPreview: async () => preview(long) });
+	const { view } = await openView({ rows: 16, loadPreview: async () => preview(long) });
 	let lines = view.render(120);
 	assert.match(previewTop(lines), /line 0/);
 	for (let index = 0; index < 5; index += 1) view.handleInput(CTRL_SHIFT_J);
@@ -319,16 +482,16 @@ test("the wheel over the list moves the selection and the wheel over the preview
 	assert.match(previewTop(lines), /line 0/, "the list wheel never scrolls the preview");
 
 	const previewX = visibleWidth(lines[0]!) - 4;
-	const previewWheel = view.handleMouse(mouse(lines, previewX, 2, "wheel", "none", 1));
+	const previewWheel = view.handleMouse(mouse(lines, previewX, BODY_TOP, "wheel", "none", 1));
 	assert.deepEqual(previewWheel, { handled: true, render: true });
 	lines = view.render(120);
 	assert.match(previewTop(lines), /line 1/, "the preview wheel scrolls the preview");
 	assert.match(selectedRow(lines), /app\.ts/, "the preview wheel never moves the selection");
 
-	for (let index = 0; index < 100; index += 1) view.handleMouse(mouse(lines, previewX, 2, "wheel", "none", 1));
+	for (let index = 0; index < 100; index += 1) view.handleMouse(mouse(lines, previewX, BODY_TOP, "wheel", "none", 1));
 	lines = view.render(120);
-	assert.match(previewTop(lines), /line 52/);
-	assert.deepEqual(view.handleMouse(mouse(lines, previewX, 2, "wheel", "none", 1)), { handled: true, render: false }, "the preview wheel clamps at the end");
+	assert.match(previewTop(lines), /line 55/);
+	assert.deepEqual(view.handleMouse(mouse(lines, previewX, BODY_TOP, "wheel", "none", 1)), { handled: true, render: false }, "the preview wheel clamps at the end");
 });
 
 test("hover paints the shared hover role over an unselected row and clears when the pointer leaves", async () => {
@@ -354,7 +517,7 @@ test("a click on a row selects it without inserting or closing", async () => {
 	assert.deepEqual(calls.insert, []);
 	assert.deepEqual(calls.open, []);
 	assert.equal(calls.close, 0);
-	assert.deepEqual(view.handleMouse(mouse(lines, visibleWidth(lines[0]!) - 4, 2)), { handled: true, render: false }, "a preview click is absorbed");
+	assert.deepEqual(view.handleMouse(mouse(lines, visibleWidth(lines[0]!) - 4, BODY_TOP)), { handled: true, render: false }, "a preview click is absorbed");
 });
 
 test("Enter inserts the selected path then closes exactly once", async () => {
@@ -380,21 +543,71 @@ const accentTheme: FilePickerTheme = {
 	},
 };
 
-test("Tab marks the highlighted row with its own accent marker, distinct from the plain highlight", async () => {
+test("Tab marks the highlighted row with an accent bar, distinct from the plain highlight", async () => {
 	const list = [entry("a.ts"), entry("b.ts"), entry("c.ts")];
 	const { view } = await openView({ theme: accentTheme }, list);
 	view.handleInput("\x1b[B");
 	let lines = view.render(120);
 	assert.match(lines[rowOf(lines, "b.ts")]!, /▸/, "the highlight alone keeps the cursor marker");
-	assert.doesNotMatch(bodyText(lines), /\x1b\[35m✓/, "nothing is selected before Tab");
+	assert.doesNotMatch(bodyText(lines), /\x1b\[35m▏/, "nothing is selected before Tab");
 	view.handleInput(TAB);
 	lines = view.render(120);
-	assert.match(lines[rowOf(lines, "b.ts")]!, /\x1b\[35m✓\x1b\[39m/, "Tab marks the highlighted row in the accent role");
-	assert.doesNotMatch(lines[rowOf(lines, "a.ts")]!, /✓/, "other rows stay unmarked");
+	assert.match(lines[rowOf(lines, "b.ts")]!, /\x1b\[35m▏\x1b\[39m/, "Tab draws the selection bar in the accent role");
+	assert.doesNotMatch(lines[rowOf(lines, "a.ts")]!, /▏/, "other rows stay unmarked");
 	view.handleInput(TAB);
 	lines = view.render(120);
-	assert.doesNotMatch(bodyText(lines), /✓/, "Tab twice clears the selection");
+	assert.doesNotMatch(bodyText(lines), /▏/, "Tab twice clears the selection");
 	assert.match(lines[rowOf(lines, "b.ts")]!, /▸/, "the highlight survives the toggle");
+});
+
+test("adjacent selected rows paint the bar in one column, so the bars join into a single line", async () => {
+	const list = [entry("a.ts"), entry("b.ts"), entry("c.ts")];
+	const { view } = await openView({ theme: accentTheme }, list);
+	view.handleInput(TAB);
+	view.handleInput("\x1b[B");
+	view.handleInput(TAB);
+	const lines = view.render(120);
+	const first = stripAnsi(lines[rowOf(lines, "a.ts")]!);
+	const second = stripAnsi(lines[rowOf(lines, "b.ts")]!);
+	const third = stripAnsi(lines[rowOf(lines, "c.ts")]!);
+	assert.ok(first.includes(SELECTION_BAR), "the first selected row shows the bar");
+	assert.ok(second.includes(SELECTION_BAR), "the adjacent selected row shows the bar");
+	assert.doesNotMatch(third, /▏/, "an unselected row shows no bar");
+	assert.equal(first.indexOf(SELECTION_BAR), second.indexOf(SELECTION_BAR), "both bars start in the same column");
+	assert.equal(rowOf(lines, "b.ts"), rowOf(lines, "a.ts") + 1, "selected rows are painted on adjacent lines, so the bars touch");
+	assert.match(second, /▸/, "the focused row keeps its own highlight next to the bar");
+});
+
+test("the marker column has one width, so Tab repaints the marked row in place in every state", async () => {
+	const list = [entry("a.ts"), entry("b.ts"), entry("c.ts")];
+	const bgTheme: FilePickerTheme = {
+		fg(_color, text) {
+			return text;
+		},
+		bg(_color, text) {
+			return `\x1b[44m${text}\x1b[49m`;
+		},
+	};
+	for (const theme of [plainTheme, bgTheme]) {
+		const { view } = await openView({ theme }, list);
+		let lines = view.render(120);
+		assert.equal(labelColumn(lines, "a.ts"), 3, "the highlighted row starts its name after the marker column");
+		view.handleInput("\x1b[B");
+		lines = view.render(120);
+		assert.equal(labelColumn(lines, "a.ts"), 3, "a plain row aligns with the highlighted one");
+		assert.equal(labelColumn(lines, "b.ts"), 3);
+		const before = listCell(lines, "b.ts");
+		view.handleInput(TAB);
+		lines = view.render(120);
+		const marked = listCell(lines, "b.ts");
+		assert.equal(labelColumn(lines, "b.ts"), 3, "marking never moves the row");
+		assert.equal(marked.length, before.length, "the marked row keeps its width");
+		assert.match(marked, new RegExp(`▸${SELECTION_BAR} b\\.ts| ${SELECTION_BAR} b\\.ts`), "the bar lands in its own column");
+		assert.equal(listCell(view.render(120), "b.ts"), marked, "the next render without a key does not move it either");
+		view.handleInput("\x1b[B");
+		lines = view.render(120);
+		assert.equal(labelColumn(lines, "b.ts"), 3, "a marked row without the cursor keeps the marker column");
+	}
 });
 
 test("Tab does not type into the query and moves to a second row without losing the first mark", async () => {
@@ -405,8 +618,8 @@ test("Tab does not type into the query and moves to a second row without losing 
 	view.handleInput("\x1b[B");
 	view.handleInput(TAB);
 	const lines = view.render(120);
-	assert.match(stripAnsi(lines[rowOf(lines, "a.ts")]!), /✓/, "the first mark stays");
-	assert.match(stripAnsi(lines[rowOf(lines, "b.ts")]!), /✓/, "the second mark lands on the moved-to row");
+	assert.match(stripAnsi(lines[rowOf(lines, "a.ts")]!), new RegExp(SELECTION_BAR), "the first mark stays");
+	assert.match(stripAnsi(lines[rowOf(lines, "b.ts")]!), new RegExp(SELECTION_BAR), "the second mark lands on the moved-to row");
 	view.handleInput("b");
 	const filtered = view.render(120);
 	assert.match(bodyText(filtered), /b\.ts/, "the query is still the only thing typing changes");
@@ -563,6 +776,55 @@ test("a truncated preview appends an explicit truncation notice; a whole file do
 	assert.doesNotMatch(bodyText(whole.view.render(120)), /truncated/i);
 });
 
+test("the preview gutter numbers every visible row with its real file line number, also after scrolling", async () => {
+	const long = Array.from({ length: 60 }, (_, index) => `entry ${index}`);
+	const { view } = await openView({ rows: 16, loadPreview: async () => preview(long) });
+	let lines = view.render(120);
+	assert.match(previewTop(lines), /^ 1 entry 0 +$/, "the first content row is file line 1");
+	for (let index = 1; index < 5; index += 1) {
+		assert.match(previewCell(lines, 1 + index), new RegExp(`^ ${index + 1} entry ${index} `), "every visible row carries its own line number");
+	}
+	for (let index = 0; index < 10; index += 1) view.handleInput(CTRL_SHIFT_J);
+	lines = view.render(120);
+	for (let index = 0; index < 5; index += 1) {
+		assert.match(previewCell(lines, 1 + index), new RegExp(`^${11 + index} entry ${10 + index} `), "the gutter keeps the real line number after scrolling");
+	}
+});
+
+test("the preview gutter and position indicator use the theme roles", async () => {
+	const roleTheme: FilePickerTheme = {
+		fg(color: string, text: string) {
+			if (color === "dim") return `\x1b[2m${text}\x1b[0m`;
+			if (color === "muted") return `\x1b[90m${text}\x1b[0m`;
+			return text;
+		},
+	};
+	const { view } = await openView({ theme: roleTheme, loadPreview: async () => preview(["alpha", "beta"]) });
+	const lines = view.render(120);
+	assert.match(rawPreviewCell(lines, 0), /\x1b\[90m1\/2\x1b\[0m/, "the position uses the muted role");
+	assert.match(rawPreviewCell(lines, 1), /\x1b\[2m1\x1b\[0m alpha/, "the gutter number uses the dim role");
+	assert.match(rawPreviewCell(lines, 2), /\x1b\[2m2\x1b\[0m beta/);
+});
+
+test("the preview shows the top visible line over the total at its top-right, adding + only when the reader truncated", async () => {
+	const long = Array.from({ length: 60 }, (_, index) => `line ${index}`);
+	const whole = await openView({ rows: 12, loadPreview: async () => preview(long) });
+	let lines = whole.view.render(120);
+	assert.match(previewCell(lines, 0), /^ *1\/60$/, "the indicator starts at line 1 of the 60 known lines");
+	for (let index = 0; index < 10; index += 1) whole.view.handleInput(CTRL_SHIFT_J);
+	lines = whole.view.render(120);
+	assert.match(previewCell(lines, 0), /^ *11\/60$/, "the indicator follows the top visible line");
+
+	const truncated = await openView({ rows: 12, loadPreview: async () => preview(long, true) });
+	lines = truncated.view.render(120);
+	assert.match(previewCell(lines, 0), /^ *1\/60\+$/, "a truncated preview never claims the real total");
+	for (let index = 0; index < 5; index += 1) truncated.view.handleInput(CTRL_SHIFT_J);
+	assert.match(previewCell(truncated.view.render(120), 0), /^ *6\/60\+$/, "the + survives scrolling");
+
+	const binary = await openView({ loadPreview: async () => ({ kind: "binary", message: "unused" }) });
+	assert.doesNotMatch(previewCell(binary.view.render(120), 0), /\d+\/\d+/, "a binary preview has no line position to claim");
+});
+
 test("an error preview renders its message", async () => {
 	const { view } = await openView({ loadPreview: async () => ({ kind: "error", message: "Cannot read src/app.ts (EACCES)." }) });
 	assert.ok(bodyText(view.render(120)).includes("Cannot read src/app.ts (EACCES)."));
@@ -583,7 +845,7 @@ test("a theme with a background paints the selected row as a full-width bar", as
 	assert.match(row, /\x1b\[44m/, "the selected row uses the selected background");
 	assert.doesNotMatch(row, /▸/, "a full-width bar replaces the marker");
 	view.handleInput(TAB);
-	assert.match(view.render(120)[rowOf(lines, "README.md")]!, /✓/, "a marked row keeps its check mark inside the bar");
+	assert.match(view.render(120)[rowOf(lines, "README.md")]!, new RegExp(SELECTION_BAR), "a marked row keeps its bar inside the highlight");
 	for (const line of lines) assert.equal(visibleWidth(line), 120);
 });
 

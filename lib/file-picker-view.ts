@@ -28,28 +28,50 @@ export interface FilePickerDeps {
 	requestRender(): void;
 	/** Clock for the row ages, read once when the panel opens (S12). Defaults to Date.now. */
 	now?(): number;
+	/** The path this picker is listing, painted in the title's top-right corner. */
+	root?: string;
 }
 
-const MAX_CARD_HEIGHT = 24;
-// Two card borders plus the header and the footer.
-const CHROME_ROWS = 4;
-const MIN_CARD_HEIGHT = 4;
+// The card fills the terminal like the Commands palette instead of a fixed
+// height (S22).
+const HEIGHT_RATIO = 0.85;
+// Two card borders plus the header, the search row, its blank separator row,
+// the count row and the footer.
+const CHROME_ROWS = 7;
+// The smallest card that still paints the frame, header, search row, blank
+// row, count row, one body row and the footer.
+const MIN_CARD_HEIGHT = CHROME_ROWS + 2;
+// The first painted row of the body: top border, header, search, blank, count.
+const BODY_TOP = 5;
 const MIN_WIDTH = CARD_PADDING + 4;
+// Below this the title row drops the listing path rather than eliding it to
+// nothing useful, so the title and the close hint stay legible.
+const MIN_ROOT_WIDTH = 8;
 const LIST_RATIO = 0.4;
 const LIST_MAX_WIDTH = 48;
-// Cursor cell, selection cell and the space before the name.
+// Cursor cell, selection cell and the space before the name. Constant in
+// every row state, so Tab repaints a row in place (S20).
 const MARKER_WIDTH = 3;
+// A selected row shows this accent bar in the selection cell; on adjacent rows
+// the bars join into one continuous line.
+const SELECTION_BAR = "▏";
 const SEPARATOR = " │ ";
+const SEARCH_PROMPT = "›";
+const SEARCH_PLACEHOLDER = "Search";
+// One space between the preview's line-number gutter and its text.
+const PREVIEW_GUTTER_GAP = 1;
 const SEPARATOR_WIDTH = SEPARATOR.length;
 const LOADING_FILES = "Loading files …";
 const LOADING_PREVIEW = "Loading preview …";
 const NO_FILES = "No files in this repository.";
 const TRUNCATED_NOTICE = "… preview truncated.";
-const FOOTER = "type to search • tab select • ctrl+u clear • ctrl+j/k move • ctrl+shift+j/k scroll • enter insert • ctrl+e editor • esc/ctrl+c close";
+// One option per action (S19): ctrl+c and ctrl+shift+j/k keep working but are
+// not advertised.
+const FOOTER = "↑/↓ move • ctrl+j/k scroll • tab select • ctrl+u clear • enter insert • ctrl+e editor • esc close";
 const NEW_BADGE = "new";
 const UPDATED_BADGE = "upt";
 
-type Tone = "border" | "accent" | "muted" | "text" | "error";
+type Tone = "border" | "accent" | "muted" | "dim" | "text" | "error";
 
 interface PaneLayout {
 	contentWidth: number;
@@ -61,6 +83,14 @@ interface PaneLayout {
 interface PreviewLine {
 	text: string;
 	tone: Tone;
+	/** Real file line number; absent on a notice row. */
+	number?: number;
+}
+
+/** What the preview can honestly claim about the file's line numbering. */
+interface PreviewMeta {
+	total: number;
+	truncated: boolean;
 }
 
 type PreviewEntry = { status: "loading" } | { status: "ready"; preview: FilePreview };
@@ -110,6 +140,22 @@ function fit(text: string, width: number): string {
 	return clipped + " ".repeat(Math.max(0, width - visibleWidth(stripAnsi(clipped))));
 }
 
+/** Keep the tail of a path, which is what identifies the directory. */
+function elideLeft(text: string, width: number): string {
+	if (width <= 0) return "";
+	if (visibleWidth(text) <= width) return text;
+	const room = width - visibleWidth("…");
+	if (room <= 0) return truncateToWidth("…", width, "");
+	const characters = Array.from(text);
+	let tail = "";
+	for (let index = characters.length - 1; index >= 0; index -= 1) {
+		const candidate = `${characters[index]}${tail}`;
+		if (visibleWidth(candidate) > room) break;
+		tail = candidate;
+	}
+	return `…${tail}`;
+}
+
 export class FilePickerView {
 	private query = "";
 	private selected = 0;
@@ -144,8 +190,9 @@ export class FilePickerView {
 			return [fit(this.renderText("File picker", "accent"), width)];
 		}
 		const layout = paneLayout(width);
-		const bodyRows = Math.max(0, height - CHROME_ROWS);
-		const lines: string[] = [this.headerRow(layout.contentWidth)];
+		const bodyRows = this.bodyRowCount();
+		// Title, search row, a blank row, the count row and then the list (S18).
+		const lines: string[] = [this.headerRow(layout.contentWidth), this.searchRow(layout.contentWidth), "", this.countRow(layout.contentWidth)];
 		const hits: PointerHit[] = [];
 		const state = this.emptyState();
 		if (state) {
@@ -163,7 +210,7 @@ export class FilePickerView {
 		this.pointerFrame = this.completed || this.disposed ? undefined : {
 			width,
 			height: frame.length,
-			bodyTop: 2,
+			bodyTop: BODY_TOP,
 			bodyRows,
 			listStart: 2,
 			listEnd: 2 + layout.listWidth,
@@ -178,31 +225,34 @@ export class FilePickerView {
 		if (this.completed || this.disposed || isKeyRelease(data)) return;
 		this.pointerFrame = undefined;
 		this.hovered = undefined;
-		// A bare line feed ("\n") is both ctrl+j and, on non-Kitty terminals,
-		// a synonym for Enter: the scroll and selection keys are checked before
-		// Enter so ctrl+j moves instead of inserting (same ordering as
-		// CommandPalette.handleInput and lib/shell-changes-view.ts).
-		if (matchesKey(data, Key.ctrlShift("j"))) {
+		// ctrl+j/k scroll the preview and the arrows move the selection; the
+		// ctrl+shift forms are the same scroll action for terminals where they
+		// are the only deliverable shape (S24). A bare line feed ("\n") is both
+		// ctrl+j and, on non-Kitty terminals, a synonym for Enter: the scroll
+		// keys are checked before Enter so a line feed scrolls and never inserts
+		// (same ordering as CommandPalette.handleInput and
+		// lib/shell-changes-view.ts).
+		if (matchesKey(data, Key.ctrlShift("j")) || matchesKey(data, Key.ctrl("j"))) {
 			this.scrollPreview(1);
 			return;
 		}
-		if (matchesKey(data, Key.ctrlShift("k"))) {
+		if (matchesKey(data, Key.ctrlShift("k")) || matchesKey(data, Key.ctrl("k"))) {
 			this.scrollPreview(-1);
 			return;
 		}
 		if (matchesKey(data, Key.pageDown)) {
-			this.scrollPreview(this.bodyRows());
+			this.scrollPreview(this.previewRows());
 			return;
 		}
 		if (matchesKey(data, Key.pageUp)) {
-			this.scrollPreview(-this.bodyRows());
+			this.scrollPreview(-this.previewRows());
 			return;
 		}
-		if (matchesKey(data, Key.down) || matchesKey(data, Key.ctrl("j"))) {
+		if (matchesKey(data, Key.down)) {
 			this.moveSelection(1);
 			return;
 		}
-		if (matchesKey(data, Key.up) || matchesKey(data, Key.ctrl("k"))) {
+		if (matchesKey(data, Key.up)) {
 			this.moveSelection(-1);
 			return;
 		}
@@ -282,11 +332,19 @@ export class FilePickerView {
 	private cardHeight(): number {
 		const available = typeof this.deps.rows === "function" ? this.deps.rows() : this.deps.rows;
 		if (!Number.isFinite(available)) return 0;
-		return Math.max(0, Math.min(MAX_CARD_HEIGHT, Math.floor(available)));
+		const rows = Math.max(0, Math.floor(available));
+		// The overlay gives the picker the whole terminal height, so the card
+		// takes the palette's share of it and never more than it was given.
+		return Math.min(rows, Math.max(MIN_CARD_HEIGHT, Math.floor(rows * HEIGHT_RATIO)));
 	}
 
-	private bodyRows(): number {
+	private bodyRowCount(): number {
 		return Math.max(0, this.cardHeight() - CHROME_ROWS);
+	}
+
+	/** Rows of preview text: the body minus the position indicator row. */
+	private previewRows(): number {
+		return Math.max(0, this.bodyRowCount() - 1);
 	}
 
 	private async loadListing(): Promise<void> {
@@ -396,7 +454,7 @@ export class FilePickerView {
 		const path = this.selectedPath();
 		if (!path) return false;
 		const total = this.previewLines(path).length;
-		const visible = this.bodyRows();
+		const visible = this.previewRows();
 		const next = Math.max(0, Math.min(Math.max(0, total - visible), this.previewScroll + Math.trunc(delta)));
 		if (next === this.previewScroll) return false;
 		this.previewScroll = next;
@@ -480,12 +538,44 @@ export class FilePickerView {
 	}
 
 	private headerRow(width: number): string {
-		const left = this.renderText("File picker", "accent");
-		const right = this.renderText("esc", "muted");
-		const leftWidth = visibleWidth(stripAnsi(left));
-		const rightWidth = visibleWidth(stripAnsi(right));
-		const gap = Math.max(1, width - leftWidth - rightWidth);
-		return fit(`${left}${" ".repeat(gap)}${right}`, width);
+		const title = this.renderText("File picker", "accent");
+		const close = this.renderText("esc", "muted");
+		const titleWidth = visibleWidth(stripAnsi(title));
+		const closeWidth = visibleWidth(stripAnsi(close));
+		const root = this.rootCell(width - titleWidth - closeWidth - 2);
+		if (root === undefined) {
+			const gap = Math.max(1, width - titleWidth - closeWidth);
+			return fit(`${title}${" ".repeat(gap)}${close}`, width);
+		}
+		const gap = Math.max(1, width - titleWidth - visibleWidth(stripAnsi(root)) - closeWidth - 1);
+		return fit(`${title}${" ".repeat(gap)}${root} ${close}`, width);
+	}
+
+	/** The listing path in the title's top-right; the title and `esc` win over it. */
+	private rootCell(room: number): string | undefined {
+		if (this.deps.root === undefined || room < MIN_ROOT_WIDTH) return undefined;
+		const root = displayText(this.deps.root);
+		if (root.length === 0) return undefined;
+		return this.renderText(elideLeft(root, room), "dim");
+	}
+
+	/** Always-active search, painted exactly like the Commands palette (S18). */
+	private searchRow(width: number): string {
+		if (this.query.length === 0) return fit(this.renderText(`${SEARCH_PROMPT} ${SEARCH_PLACEHOLDER}`, "muted"), width);
+		return fit(`${this.renderText(SEARCH_PROMPT, "muted")} ${displayText(this.query)}`, width);
+	}
+
+	/**
+	 * The count row under the blank line. The file count is what the query
+	 * currently lists; the parenthesised count is the whole Tab selection, which
+	 * can include files the query hides. A pending or failed listing counts
+	 * nothing, so the row stays blank instead of claiming zero files.
+	 */
+	private countRow(width: number): string {
+		if (!this.loaded || this.listingError !== undefined) return "".padEnd(width, " ");
+		const files = this.matches().length;
+		const selected = this.selection.size;
+		return fit(this.renderText(`${files} ${files === 1 ? "file" : "files"} (${selected} selected)`, "muted"), width);
 	}
 
 	private listColumn(layout: PaneLayout, bodyRows: number, hits: PointerHit[]): string[] {
@@ -499,7 +589,7 @@ export class FilePickerView {
 		const end = Math.min(matches.length, start + windowSize);
 		if (showIndicators && start > 0) lines.push(fit(this.renderText(`  ↑ ${start} more`, "muted"), layout.listWidth));
 		for (let index = start; index < end; index += 1) {
-			hits.push({ y: 2 + lines.length, index });
+			hits.push({ y: BODY_TOP + lines.length, index });
 			lines.push(this.renderListRow(matches[index]!, index, selected, layout.listWidth));
 		}
 		if (showIndicators && end < matches.length) lines.push(fit(this.renderText(`  ↓ ${matches.length - end} more`, "muted"), layout.listWidth));
@@ -535,11 +625,14 @@ export class FilePickerView {
 		const labelRoom = Math.max(0, listWidth - MARKER_WIDTH - (showsSuffix ? suffixWidth + 1 : 0));
 		const label = truncateToWidth(this.rowLabel(entry), labelRoom, "…");
 		const gap = " ".repeat(Math.max(0, listWidth - MARKER_WIDTH - visibleWidth(label) - (showsSuffix ? suffixWidth : 0)));
+		// The marker column is three cells wide in every state: cursor cell,
+		// selection cell, then the space before the name. A highlighted bar owns
+		// the cursor, so that cell stays blank there.
+		const marker = `${cursor && !theme.bg ? theme.fg("accent", "▸") : " "}${marked ? theme.fg("accent", SELECTION_BAR) : " "} `;
 		if (cursor && theme.bg) {
-			const inner = `${marked ? "✓ " : "  "}${label}${showsSuffix ? `${gap}${stripAnsi(suffix)}` : ""}`;
+			const inner = `${marker}${label}${showsSuffix ? `${gap}${stripAnsi(suffix)}` : ""}`;
 			return theme.bg("selectedBg", inner + " ".repeat(Math.max(0, listWidth - visibleWidth(stripAnsi(inner)))));
 		}
-		const marker = `${cursor ? theme.fg("accent", "▸") : " "}${marked ? theme.fg("accent", "✓") : " "} `;
 		const painted = marked ? theme.fg("accent", label) : cursor ? theme.fg("text", label) : paintHoverable(theme, label, hovered, "muted");
 		return fit(`${marker}${painted}${gap}${showsSuffix ? suffix : ""}`, listWidth);
 	}
@@ -548,13 +641,48 @@ export class FilePickerView {
 		const path = this.selectedPath();
 		if (!path || bodyRows <= 0) return [];
 		const entries = this.previewLines(path);
-		this.previewScroll = Math.max(0, Math.min(this.previewScroll, Math.max(0, entries.length - bodyRows)));
-		const lines: string[] = [];
-		for (let index = 0; index < bodyRows; index += 1) {
+		const contentRows = this.previewRows();
+		this.previewScroll = Math.max(0, Math.min(this.previewScroll, Math.max(0, entries.length - contentRows)));
+		const gutterWidth = this.previewGutterWidth(path);
+		// The position indicator owns the preview's first row (S21).
+		const lines: string[] = [this.previewPositionRow(path, layout.previewWidth)];
+		for (let index = 0; index < contentRows; index += 1) {
 			const entry = entries[this.previewScroll + index];
-			lines.push(entry ? fit(this.renderText(entry.text, entry.tone), layout.previewWidth) : "");
+			lines.push(entry ? this.previewRow(entry, gutterWidth, layout.previewWidth) : "");
 		}
 		return lines;
+	}
+
+	/** File line numbers are only known for a text preview. */
+	private previewMeta(path: string): PreviewMeta | undefined {
+		const entry = this.previews.get(path);
+		if (!entry || entry.status === "loading") return undefined;
+		const preview = entry.preview;
+		if (preview.kind !== "text") return undefined;
+		return { total: preview.lines.length, truncated: preview.truncated };
+	}
+
+	private previewGutterWidth(path: string): number {
+		return Math.max(1, String(this.previewMeta(path)?.total ?? 0).length);
+	}
+
+	/** `top/total` at the preview's top-right; `+` when the total is not known (S21). */
+	private previewPositionRow(path: string, width: number): string {
+		const meta = this.previewMeta(path);
+		if (!meta) return "";
+		const top = Math.min(meta.total, this.previewScroll + 1);
+		const indicator = this.renderText(`${top}/${meta.total}${meta.truncated ? "+" : ""}`, "muted");
+		const used = visibleWidth(stripAnsi(indicator));
+		if (used >= width) return truncateToWidth(indicator, width, "…");
+		return `${" ".repeat(width - used)}${indicator}`;
+	}
+
+	private previewRow(entry: PreviewLine, gutterWidth: number, width: number): string {
+		const number = entry.number === undefined ? "" : String(entry.number).padStart(gutterWidth);
+		const gutter = number.length > 0 ? this.renderText(number, "dim") : " ".repeat(gutterWidth);
+		const room = Math.max(0, width - gutterWidth - PREVIEW_GUTTER_GAP);
+		const text = this.renderText(truncateToWidth(entry.text, room, "…"), entry.tone);
+		return fit(`${gutter}${" ".repeat(PREVIEW_GUTTER_GAP)}${text}`, width);
 	}
 
 	private previewLines(path: string): PreviewLine[] {
@@ -563,7 +691,7 @@ export class FilePickerView {
 		const preview = entry.preview;
 		if (preview.kind === "binary") return [{ text: FILE_PREVIEW_BINARY_NOTICE, tone: "muted" }];
 		if (preview.kind === "error") return [{ text: preview.message, tone: "error" }];
-		const lines: PreviewLine[] = preview.lines.map((line) => ({ text: displayPreviewText(line), tone: "text" }));
+		const lines: PreviewLine[] = preview.lines.map((line, index) => ({ text: displayPreviewText(line), tone: "text", number: index + 1 }));
 		if (preview.truncated) lines.push({ text: TRUNCATED_NOTICE, tone: "muted" });
 		return lines;
 	}
