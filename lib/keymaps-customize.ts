@@ -1,6 +1,6 @@
 import { matchesKey } from "@earendil-works/pi-tui";
 import {
-	assignKeymap, commandKeymapId, effectiveKey, KEYMAP_ACTIONS, keymapEnvLock, keymapSavedNotice, keymapSource,
+	assignKeymap, commandKeymapId, effectiveKey, allKeymapActions, keymapEnvLock, keymapSavedNotice, keymapSource,
 	keymapsUnwritable, prepareKeymapChange, readKeymaps, resetKeymap, writeKeymaps, type KeymapBindings, type PiKeybindings,
 } from "./keymaps.ts";
 import type { CustomizeInline, CustomizeRow } from "./visual-customize-view.ts";
@@ -71,7 +71,7 @@ export function buildKeymapRows(options: KeymapRowsOptions): CustomizeRow[] {
 			return true;
 		},
 	});
-	const rows = KEYMAP_ACTIONS.map((action) => row(action.id, action.label, action.env));
+	const rows = allKeymapActions().map((action) => row(action.id, action.label, action.env === "" ? undefined : action.env));
 	for (const { command, label } of options.commands) {
 		const id = commandKeymapId(command);
 		if (id.startsWith("command:")) rows.push(row(id, `/${command} · ${label}`));
