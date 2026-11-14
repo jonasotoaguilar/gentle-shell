@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "
 import { join } from "node:path";
 import { parseKey } from "@earendil-works/pi-tui";
 import { gentlePiConfigHome } from "./agent-home.ts";
+import { bridgeKeymapActions } from "./plugin-surface.ts";
 
 // User keymaps: the single registry every Gentle shortcut reads. Each action
 // keeps its historical environment variable (which still wins, so existing
@@ -76,8 +77,24 @@ export type KeymapCheck =
 const ACTIONS_BY_ID = new Map(KEYMAP_ACTIONS.map((action) => [action.id, action]));
 const MODIFIER_ORDER = ["ctrl", "shift", "alt", "super"];
 
+/**
+ * The actions the bridge's plugins registered, read live and refused where they
+ * would take an id this shell already owns: a built-in action or a
+ * `command:<name>` binding stays exactly what it was.
+ */
+function contributedActions(): KeymapAction[] {
+	return bridgeKeymapActions()
+		.filter((action) => !ACTIONS_BY_ID.has(action.id) && keymapCommand(action.id) === undefined)
+		.map((action) => ({ id: action.id, label: action.label, env: action.env ?? "", defaultKey: action.defaultKey, command: action.command }));
+}
+
+/** Every action the Keymaps page knows: this shell's own, then the plugins'. */
+export function allKeymapActions(): readonly KeymapAction[] {
+	return [...KEYMAP_ACTIONS, ...contributedActions()];
+}
+
 export function keymapAction(id: string): KeymapAction | undefined {
-	return ACTIONS_BY_ID.get(id);
+	return ACTIONS_BY_ID.get(id) ?? contributedActions().find((action) => action.id === id);
 }
 
 /** The keymap id of a slash command: its built-in action when it has one, else `command:<name>`. */
@@ -160,7 +177,7 @@ function keysOf(value: unknown): string[] {
 
 /** The id of the action already on `key`, excluding `ownId`. */
 export function keymapOwner(key: string, env: NodeJS.ProcessEnv, bindings: KeymapBindings, ownId?: string): string | undefined {
-	const ids = [...KEYMAP_ACTIONS.map((action) => action.id), ...commandKeymapIds(bindings)];
+	const ids = [...allKeymapActions().map((action) => action.id), ...commandKeymapIds(bindings)];
 	return ids.find((id) => id !== ownId && sameKey(effectiveKey(id, env, bindings), key));
 }
 
@@ -275,6 +292,24 @@ export function readKeymaps(configHome: string): KeymapFile {
 export function loadKeymaps(env: NodeJS.ProcessEnv = process.env): KeymapFile {
 	return readKeymaps(gentlePiConfigHome(env));
 }
+
+/**
+ * The bridge's plugins bind their own shortcut, and the key they must bind is
+ * this shell's answer — environment variable, then saved binding, then default.
+ * Published so that precedence lives in one place instead of being copied into
+ * every plugin. The answer is computed per call, so a change made in the
+ * Keymaps page is visible on the next read.
+ */
+export const KEYMAP_RESOLVER_KEY = Symbol.for("gentle-pi/keymaps/v1");
+
+function publishKeymapResolver(): void {
+	(globalThis as Record<symbol, unknown>)[KEYMAP_RESOLVER_KEY] = {
+		schema: 1,
+		effectiveKey: (id: string): string | undefined => effectiveKey(id, process.env, loadKeymaps(process.env).bindings),
+	};
+}
+
+publishKeymapResolver();
 
 /** Same-directory rename, so a reader never sees a partially written file. */
 export function writeKeymaps(configHome: string, bindings: KeymapBindings): string {

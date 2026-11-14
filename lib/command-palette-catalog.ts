@@ -1,4 +1,5 @@
 import type { CommandPaletteGroup, CommandPaletteItem } from "./command-palette.ts";
+import { bridgeCommandContributions, type PluginCommandContribution } from "./plugin-surface.ts";
 
 // The curated command set for the command palette: an OpenCode-style
 // grouped menu, not a raw listing of every registered extension command.
@@ -59,24 +60,50 @@ export const COMMAND_PALETTE_CATALOG: readonly CommandPaletteCatalogGroup[] = [
 	},
 ];
 
+/** Where a contribution that names no section lands: one shared page for plugins, after the catalog. */
+export const CONTRIBUTED_SECTION = "Plugins";
+
 /**
  * Build the palette's groups for one session: keep only catalog entries
  * whose command is actually registered (so a missing extension never shows
  * a dead row), attach that registration's live description and an optional
  * shortcut hint, and drop any group left with no items. Catalog order is
  * preserved throughout.
+ *
+ * A bridge contribution joins the section it names — after that section's own
+ * entries — or opens a section of its own after the catalog. It is filtered by
+ * the same rule: a contribution whose command is not registered is not shown.
  */
-export function buildCommandPaletteGroups(registered: readonly { name: string; description?: string }[], shortcuts: Readonly<Record<string, string | undefined>>): CommandPaletteGroup[] {
+export function buildCommandPaletteGroups(
+	registered: readonly { name: string; description?: string }[],
+	shortcuts: Readonly<Record<string, string | undefined>>,
+	contributions: readonly PluginCommandContribution[] = bridgeCommandContributions(),
+): CommandPaletteGroup[] {
 	const byName = new Map(registered.map((command) => [command.name, command]));
+	const sectionOf = (contribution: PluginCommandContribution): string => contribution.section ?? CONTRIBUTED_SECTION;
+	const append = (items: CommandPaletteItem[], item: { command: string; label: string }): void => {
+		const found = byName.get(item.command);
+		if (!found) return;
+		items.push({ command: item.command, label: item.label, description: found.description, shortcut: shortcuts[item.command] });
+	};
 	const groups: CommandPaletteGroup[] = [];
 	for (const group of COMMAND_PALETTE_CATALOG) {
 		const items: CommandPaletteItem[] = [];
-		for (const entry of group.items) {
-			const found = byName.get(entry.command);
-			if (!found) continue;
-			items.push({ command: entry.command, label: entry.label, description: found.description, shortcut: shortcuts[entry.command] });
-		}
+		for (const entry of group.items) append(items, entry);
+		for (const contribution of contributions) if (sectionOf(contribution) === group.title) append(items, contribution);
 		if (items.length > 0) groups.push({ title: group.title, items });
 	}
+	// A section this shell does not own comes after the catalog, in the order the
+	// plugins named it, and only when something survived in it.
+	const adopted = new Set(COMMAND_PALETTE_CATALOG.map((group) => group.title));
+	const owned = new Map<string, CommandPaletteItem[]>();
+	for (const contribution of contributions) {
+		const title = sectionOf(contribution);
+		if (adopted.has(title)) continue;
+		const items = owned.get(title) ?? [];
+		owned.set(title, items);
+		append(items, contribution);
+	}
+	for (const [title, items] of owned) if (items.length > 0) groups.push({ title, items });
 	return groups;
 }
