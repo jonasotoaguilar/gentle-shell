@@ -101,6 +101,8 @@ S47. **The preview pane uses the body's whole height.** The search row narrows t
 
 S48. **`ctrl+e` returns to a responsive session.** Opening the highlighted file in the editor closes the picker and hands the terminal to the editor, and when the editor exits Pi repaints and takes input again without a long freeze. The handoff follows the `/changes` panel's route instead of inventing another one. "Otro bug es que con ctrl+e lo abre en editor, pero al cerra edit se bugea, pi queda congelado para siempre, es un claro bug. /home/jona/dev/upstream/gentle-shell changes panel tiene algo similar para abrir en editor, podrias revisarlo para ver que diferencia hay que causa que pi se congele al retornar. (no se congela para siempre, pero si queda pegado un buen rato que con changes u otros no pasa)"
 
+S49. **The default shortcut is `alt+f`.** `/gentle:files` is bound to `alt+f` by default, not `alt+p`, and the picker's action lists in `/gentle:customize` → **Keymaps** as `File picker: alt+f`, rebindable like every other action through `GENTLE_PI_FILES_KEY` or that page. `alt+p` was the first default and stays assignable, but Pi claims it for `app.model.cycleBackward` on Windows and WSL, where Pi skips an extension shortcut on a reserved binding. "alt+f mejor"
+
 ## Tasks
 
 | ID | Specs | Route | Commit |
@@ -145,6 +147,7 @@ Tasks for L48 (all reopen the delivered picker and scope surfaces):
 | T32 | S48 | gentle-ai-worker: the `ctrl+e` handoff follows `/changes` — one forced repaint on every close and `dispose()` after the editor returns | `6cd9337fe` |
 | T33 | S11 | verify: focused suites, typecheck, full suite | this round's evidence below |
 | T34 | S42-S48 | parent: docs truth in `README.md`, `docs/readme-reference.md` and `docs/gentle-shell.md` | `cb6bd5fd5` |
+| T35 | S49 | parent: `alt+f` as the picker's default, in the keymap action, the command description, the tests and the three docs | this round |
 
 ## Delivery
 
@@ -494,3 +497,13 @@ L51 (parent, closing evidence): the round is closed and every unit of S41-S48 la
 - **Worker corrections accepted**: S44's premise does not reproduce — with `themes/Gentle.json` the Tab bar paints the accent role in all four row states, so the rule is pinned by a test and no glyph or column changed; the separator cell is three wide, so the closing rule paints all three to read continuous; and the unbordered preview is now reachable by pane width rather than by height, which is what its retargeted test pins.
 - **Review workload**: the picker's chrome unit is 881 authored changed lines and the branch stands at 33 commits and 6605 authored changed lines against `origin/main`, so delivery stays `gentle-ai-chained-pr` — the rounds recorded here are the work units, each self-contained with its tests and docs. Nothing is pushed.
 - **Risk**: item 3 is not claimed — the diff touches no shared option, parser or helper that an unrequested behaviour also uses; `extensions/gentle-shell.ts` gains the picker's own scope and handoff wiring only, and the `/changes` paths are untouched. `Risk: none` for this round, with no independent verifier required because no named high-risk item applies.
+
+L52 (user, verbatim):
+
+> [Image#10] otro detalle es que files no aparece en /commands nose si usaste mal el bridge o te falto, falta agregarlo a seccion "Session". [Image#11] y falto keybinding configurable en customize, no aparece, usando bridge. Y el atajo default seria alt+p
+
+L53 (user, verbatim):
+
+> alt+f mejor
+
+L54 (parent, findings and decision): both registrations already exist in this branch and have since `e4d936b85`: `lib/command-palette-catalog.ts:41` carries `gentle:files` → "File picker" under **Session**, and `lib/keymaps.ts:33` carries the `files` action with `command: "gentle:files"`, which is what `/gentle:customize` → **Keymaps** lists (`lib/keymaps-customize.ts:74` maps `KEYMAP_ACTIONS` straight into rows). So the `/commands` and Keymaps gaps are a runtime that is not this branch: the clone Pi loads through `git:github.com/Gentleman-Programming/gentle-shell` sits on `main` at `95179bd6d` with no picker at all (`lib/file-picker-view.ts` absent), and the installed npm package is `gentle-pi@4.3.0`, also without it, while this branch is `4.7.0`. Nothing to add for the two gaps beyond a reload of the branch; written down so the next round does not re-add what exists. L52's `alt+p` and L53's `alt+f` conflict on the default key, and L53 is the later message, so `alt+f` wins: S49 records it, and the three docs plus the keymap and customize tests follow. Recorded as T35.

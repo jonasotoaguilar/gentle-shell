@@ -3238,7 +3238,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		});
 	}
 	pi.registerCommand(FILES_COMMAND_NAME, {
-		description: "Browse this session's repository or a registered worktree with a live preview (default alt+p). Enter inserts the path, ctrl+e opens $EDITOR.",
+		description: "Browse this session's repository or a registered worktree with a live preview (default alt+f). Enter inserts the path, ctrl+e opens $EDITOR.",
 		handler: async (_args, ctx) => openFilePicker(ctx),
 	});
 	const filesShortcutKey = filesShortcut(env, keymaps.bindings);

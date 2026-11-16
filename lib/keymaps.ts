@@ -30,7 +30,7 @@ export interface KeymapAction {
 export const KEYMAP_ACTIONS: readonly KeymapAction[] = [
 	{ id: "commands", label: "Command palette", env: "GENTLE_PI_COMMANDS_KEY", defaultKey: "alt+k", command: "gentle:commands" },
 	{ id: "changes", label: "Browse changes", env: "GENTLE_PI_SHELL_CHANGES_KEY", defaultKey: "alt+g", command: "gentle:changes" },
-	{ id: "files", label: "File picker", env: "GENTLE_PI_FILES_KEY", defaultKey: "alt+p", command: "gentle:files" },
+	{ id: "files", label: "File picker", env: "GENTLE_PI_FILES_KEY", defaultKey: "alt+f", command: "gentle:files" },
 	{ id: "usage", label: "Subscription usage", env: "GENTLE_PI_SHELL_USAGE_KEY", defaultKey: "alt+u", command: "gentle:usage" },
 	{ id: "preset", label: "Cycle visual preset", env: "GENTLE_PI_SHELL_PRESET_KEY", defaultKey: "alt+l" },
 	{ id: "agents.view", label: "Subagents overlay", env: "GENTLE_PI_AGENTS_VIEW_KEY", defaultKey: "alt+a", command: "gentle:agents" },

@@ -5405,7 +5405,7 @@ test("a registered worktree opens Changes as its own group", async () => {
 
 // /gentle:files wires the command, the shortcut and the picker together: the
 // overlay the user sees, the text Enter pastes and the order of both.
-test("/gentle:files and alt+p register, and Enter pastes before the picker closes", async () => {
+test("/gentle:files and alt+f register, and Enter pastes before the picker closes", async () => {
 	const h = fakePi();
 	filePickerGit(h.pi);
 	gentleShell(h.pi, {});
@@ -5418,7 +5418,7 @@ test("/gentle:files and alt+p register, and Enter pastes before the picker close
 	api.pasteToEditor = (text) => { trace.push(`paste:${text}:${ui.overlayCompletions === 1 ? "open" : "closed"}`); basePaste.call(api, text); };
 	await fire(h.handlers, "session_start", ctx);
 	assert.ok(h.commands.has("gentle:files"), "/gentle:files is registered");
-	assert.ok(h.shortcuts.has("alt+p"), "alt+p is the registered default shortcut");
+	assert.ok(h.shortcuts.has("alt+f"), "alt+f is the registered default shortcut");
 	const opened = h.commands.get("gentle:files")!.handler("", ctx);
 	await overlayReady;
 	// S41: the scope step opens first, even with nothing registered, so a test
