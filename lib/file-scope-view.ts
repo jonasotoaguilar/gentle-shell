@@ -5,10 +5,10 @@ import type { FilePickerTheme } from "./file-picker-view.ts";
 import { paintHoverable } from "./shell-hover.ts";
 import { sanitizeTerminalText, stripAnsi } from "./terminal-theme.ts";
 
-// Gentle Shell worktree scope step: the single-choice card the file picker
-// opens behind when the session has registered worktrees (S15). It knows only
-// about scopes -- never about Git or the Pi session -- so the caller resolves
-// the session repository, its registered worktrees, their uncommitted files
+// Gentle Shell worktree scope step: the single-choice card every file picker
+// invocation opens behind (S41). It knows only about scopes -- never about Git or
+// the Pi session -- so the caller resolves the session repository, its
+// registered worktrees, the clone's other worktrees, their uncommitted files
 // (S32) and their Git detail (S33), and this component just orders, paints and
 // routes them.
 
@@ -41,7 +41,14 @@ export function orderScopes(scopes: readonly FileScope[]): FileScope[] {
 export interface FileScopeDeps {
 	theme: FilePickerTheme;
 	rows: number | (() => number);
+	/** The default list: the current checkout and the registered worktrees (S41). */
 	scopes: readonly FileScope[];
+	/**
+	 * Every worktree of the clone, built before the step opens so `a` needs no
+	 * Git and this view stays synchronous (S41). Absent means the toggle offers
+	 * the registered list it already has.
+	 */
+	allScopes?: readonly FileScope[];
 	/** Clock for the detail line's age, read once when the step opens (S33). Defaults to Date.now. */
 	now?: number;
 	onSelect(scope: FileScope): void;
@@ -54,11 +61,15 @@ const SUBTITLE = "Choose a scope";
 const NO_SCOPES = "No worktrees registered.";
 // One option per action (S19): ctrl+j/k and ctrl+c keep working but are not
 // advertised. The keys take the theme's key colour, the labels stay neutral (S32).
-const FOOTER_HINTS = [
+// The `a` label names the list the key switches TO, so the active state always
+// says what pressing it does next (S41).
+const footerHints = (showingAll: boolean): ReadonlyArray<readonly [string, string]> => [
 	["↑/↓", "move"],
 	["enter", "choose scope"],
+	["a", showingAll ? "registered" : "all"],
 	["esc", "close"],
-] as const;
+];
+const TOGGLE_KEY = "a";
 const FOOTER_SEPARATOR = " • ";
 const KEY_ROLE = "accent";
 const KEY_LABEL_ROLE = "dim";
@@ -98,15 +109,24 @@ export class FileScopeView {
 	private pointerFrame: PointerFrame | undefined;
 	private completed = false;
 	private disposed = false;
+	/** Which built list the step paints: the registered one, or every worktree (S41). */
+	private showingAll = false;
 	private readonly deps: FileScopeDeps;
-	private readonly scopes: FileScope[];
+	private readonly registered: FileScope[];
+	private readonly all: FileScope[];
 	private readonly now: number;
 
 	constructor(deps: FileScopeDeps) {
 		this.deps = deps;
-		this.scopes = orderScopes(deps.scopes);
+		this.registered = orderScopes(deps.scopes);
+		this.all = orderScopes(deps.allScopes ?? deps.scopes);
 		// The age is computed once when the step opens and never refreshed live.
 		this.now = deps.now ?? Date.now();
+	}
+
+	/** The list the step is painting; both were built before it opened (S41). */
+	private scopes(): readonly FileScope[] {
+		return this.showingAll ? this.all : this.registered;
 	}
 
 	render(width: number): string[] {
@@ -161,6 +181,12 @@ export class FileScopeView {
 			this.finish("close");
 			return;
 		}
+		// Plain `a` and no modifier: the step has no search field, so no printable
+		// key has another job here (S41).
+		if (data === TOGGLE_KEY) {
+			this.toggleList();
+			return;
+		}
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) this.finish("select");
 	}
 
@@ -211,16 +237,33 @@ export class FileScopeView {
 	}
 
 	private clampedSelected(): number {
-		if (this.scopes.length === 0) return 0;
-		return Math.max(0, Math.min(this.scopes.length - 1, this.selected));
+		const scopes = this.scopes();
+		if (scopes.length === 0) return 0;
+		return Math.max(0, Math.min(scopes.length - 1, this.selected));
 	}
 
 	private moveSelection(delta: number): boolean {
-		if (this.scopes.length === 0) return false;
-		const next = Math.max(0, Math.min(this.scopes.length - 1, this.selected + delta));
+		const scopes = this.scopes();
+		if (scopes.length === 0) return false;
+		const next = Math.max(0, Math.min(scopes.length - 1, this.selected + delta));
 		if (next === this.selected) return false;
 		this.selected = next;
 		return true;
+	}
+
+	// S41: the focused root decides the new cursor. A root the other list also
+	// carries stays focused, so the switch never loses the reader's place; a root
+	// the other list lacks leaves the cursor on the first row instead of an index
+	// that no longer means the same row.
+	private toggleList(): void {
+		const focused = this.scopes()[this.clampedSelected()]?.root;
+		this.showingAll = !this.showingAll;
+		const scopes = this.scopes();
+		const at = focused === undefined ? -1 : scopes.findIndex((scope) => scope.root === focused);
+		this.selected = at >= 0 ? at : 0;
+		this.pointerFrame = undefined;
+		this.hovered = undefined;
+		this.deps.requestRender();
 	}
 
 	private setHover(index: number | undefined): boolean {
@@ -232,7 +275,7 @@ export class FileScopeView {
 	// One single-shot flag covers both exits: this step is used once.
 	private finish(action: "select" | "close"): void {
 		if (this.completed || this.disposed) return;
-		const scope = action === "select" ? this.scopes[this.clampedSelected()] : undefined;
+		const scope = action === "select" ? this.scopes()[this.clampedSelected()] : undefined;
 		if (action === "select" && !scope) return;
 		this.completed = true;
 		this.pointerFrame = undefined;
@@ -253,20 +296,21 @@ export class FileScopeView {
 
 	private scopeRows(width: number, bodyRows: number, hits: PointerHit[]): string[] {
 		const lines: string[] = [];
-		if (this.scopes.length === 0) {
+		const scopes = this.scopes();
+		if (scopes.length === 0) {
 			lines.push(fit(this.renderText(NO_SCOPES, "muted"), width));
 		} else if (bodyRows > 0) {
 			const selected = this.clampedSelected();
-			const showIndicators = this.scopes.length > bodyRows && bodyRows >= 4;
+			const showIndicators = scopes.length > bodyRows && bodyRows >= 4;
 			const windowSize = showIndicators ? Math.max(1, bodyRows - 2) : bodyRows;
-			const start = Math.max(0, Math.min(selected - Math.floor(windowSize / 2), Math.max(0, this.scopes.length - windowSize)));
-			const end = Math.min(this.scopes.length, start + windowSize);
+			const start = Math.max(0, Math.min(selected - Math.floor(windowSize / 2), Math.max(0, scopes.length - windowSize)));
+			const end = Math.min(scopes.length, start + windowSize);
 			if (showIndicators && start > 0) lines.push(fit(this.renderText(`  ↑ ${start} more`, "muted"), width));
 			for (let index = start; index < end; index += 1) {
 				hits.push({ y: BODY_TOP + lines.length, index });
-				lines.push(this.renderScopeRow(this.scopes[index]!, index, selected, width));
+				lines.push(this.renderScopeRow(scopes[index]!, index, selected, width));
 			}
-			if (showIndicators && end < this.scopes.length) lines.push(fit(this.renderText(`  ↓ ${this.scopes.length - end} more`, "muted"), width));
+			if (showIndicators && end < scopes.length) lines.push(fit(this.renderText(`  ↓ ${scopes.length - end} more`, "muted"), width));
 		}
 		while (lines.length < bodyRows) lines.push("");
 		return lines.slice(0, bodyRows);
@@ -300,7 +344,7 @@ export class FileScopeView {
 	// S33: the focused scope's data on the line directly above the footer. An
 	// empty line keeps the card's geometry stable when nothing was measured.
 	private detailRow(width: number): string {
-		const scope = this.scopes[this.clampedSelected()];
+		const scope = this.scopes()[this.clampedSelected()];
 		if (scope?.detail === undefined) return fit("", width);
 		const text = sanitizeTerminalText(scopeDetailLine(scope.detail, this.now));
 		if (text.length === 0) return fit("", width);
@@ -309,7 +353,7 @@ export class FileScopeView {
 
 	private footerRow(width: number): string {
 		const separator = this.renderText(FOOTER_SEPARATOR, KEY_LABEL_ROLE);
-		const hints = FOOTER_HINTS.map(([key, label]) => `${this.renderText(key, KEY_ROLE)} ${this.renderText(label, KEY_LABEL_ROLE)}`);
+		const hints = footerHints(this.showingAll).map(([key, label]) => `${this.renderText(key, KEY_ROLE)} ${this.renderText(label, KEY_LABEL_ROLE)}`);
 		return fit(hints.join(separator), width);
 	}
 

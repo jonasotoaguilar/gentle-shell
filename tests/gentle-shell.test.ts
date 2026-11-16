@@ -5307,6 +5307,12 @@ function rowOfText(lines: readonly string[], text: string): number {
 	return y;
 }
 
+// The card frame is `│ ` + content + ` │`, so a footer's text is the trimmed
+// middle of the row above the bottom border.
+function footerLine(lines: readonly string[]): string {
+	return lines[lines.length - 2]!.slice(2, -2).trim();
+}
+
 test("Changes lists the session root's Git state at turn end, never at startup", async () => {
  const { pi, handlers, git } = fakePi([{numstat:"2\t0\tlib/b.ts\n",porcelain:" M lib/b.ts\0?? other.ts\0"},{numstat:"3\t0\tlib/b.ts\n",porcelain:" M lib/b.ts\0?? other.ts\0"}]);
  gentleShell(pi,{});
@@ -5407,12 +5413,19 @@ test("/gentle:files and alt+p register, and Enter pastes before the picker close
 	const api = ctx.ui as unknown as { pasteToEditor(text: string): void };
 	const trace: string[] = [];
 	const basePaste = api.pasteToEditor;
-	api.pasteToEditor = (text) => { trace.push(`paste:${text}:${ui.overlayCompletions === 0 ? "open" : "closed"}`); basePaste.call(api, text); };
+	// The marker counts the overlays already settled: the scope step (S41)
+	// settles the first, so the picker's own overlay is still open at 1.
+	api.pasteToEditor = (text) => { trace.push(`paste:${text}:${ui.overlayCompletions === 1 ? "open" : "closed"}`); basePaste.call(api, text); };
 	await fire(h.handlers, "session_start", ctx);
 	assert.ok(h.commands.has("gentle:files"), "/gentle:files is registered");
 	assert.ok(h.shortcuts.has("alt+p"), "alt+p is the registered default shortcut");
 	const opened = h.commands.get("gentle:files")!.handler("", ctx);
 	await overlayReady;
+	// S41: the scope step opens first, even with nothing registered, so a test
+	// that wants the picker chooses the focused scope and waits for the swap.
+	const scopeStep = ui.overlayView!;
+	scopeStep.handleInput("\r");
+	await until(() => ui.overlayView !== scopeStep);
 	const frame = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
 	await until(() => frame().includes("AGENTS.md"));
 	assert.match(frame(), /File picker/);
@@ -5422,7 +5435,7 @@ test("/gentle:files and alt+p register, and Enter pastes before the picker close
 	await opened;
 	assert.deepEqual(ui.pastes, ["@AGENTS.md"], "Enter pastes the @-relative path of the session cwd");
 	assert.deepEqual(trace, ["paste:@AGENTS.md:open"], "the paste lands while the overlay is still open, and closing follows it");
-	assert.equal(ui.overlayCompletions, 1, "Enter closes the picker exactly once");
+	assert.equal(ui.overlayCompletions, 2, "the scope step and the picker's Enter each close exactly once");
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
@@ -5440,8 +5453,13 @@ test("the picker title row shows the chosen scope's path", async () => {
 
 	const direct = h.commands.get("gentle:files")!.handler("", ctx);
 	await overlayReady;
+	// S41: the step opens on every invocation, so `main` is chosen first even
+	// when it is the only row.
+	const loneStep = ui.overlayView!;
+	loneStep.handleInput("\r");
+	await until(() => ui.overlayView !== loneStep);
 	await until(() => frame().includes("AGENTS.md"));
-	assert.match(header(), /^│ File picker +\/repo esc +│$/, `the session root is painted in the title row: ${header()}`);
+	assert.match(header(), /^│ File picker  \/repo +esc │$/, `the session root follows the title, with esc alone in the corner: ${header()}`);
 	ui.overlayView!.handleInput("\x1b");
 	await direct;
 
@@ -5454,7 +5472,7 @@ test("the picker title row shows the chosen scope's path", async () => {
 	scopeView.handleInput("\r");
 	await until(() => ui.overlayView !== scopeView);
 	await until(() => frame().includes("linked-only.ts"));
-	assert.match(header(), /^│ File picker +\/linked esc +│$/, `the chosen worktree root replaces the session root: ${header()}`);
+	assert.match(header(), /^│ File picker  \/linked +esc │$/, `the chosen worktree root replaces the session root: ${header()}`);
 	ui.overlayView!.handleInput("\x1b");
 	await opened;
 	await fire(h.handlers, "session_shutdown", ctx);
@@ -5477,6 +5495,11 @@ test("the picker previews the file's syntax in the active theme's colours, and a
 		await fire(h.handlers, "session_start", ctx);
 		const opened = h.commands.get("gentle:files")!.handler("", ctx);
 		await overlayReady;
+		// S41: the scope step opens first even with nothing registered, so choose
+		// the session checkout and wait for the picker's own overlay.
+		const scopeStep = ui.overlayView!;
+		scopeStep.handleInput("\r");
+		await until(() => ui.overlayView !== scopeStep);
 		const frame = () => ui.overlayView!.render(120);
 		const painted = () => frame().map((line) => stripAnsi(line)).join("\n");
 		// The preview box's interior on the row showing `text`: the pane's own
@@ -5559,7 +5582,11 @@ test("the picker title row elides a long worktree path at the 60-column floor", 
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
-test("the scope step appears only with a listed worktree, closes first, and browses the chosen root", async () => {
+// S41: the step opens on every invocation — `main` included — so an
+// unregistered session is offered its own checkout instead of being dropped
+// straight into the cwd. Choosing a scope still closes the step before the
+// picker exists and browses that scope's root.
+test("the scope step always opens, closes before the picker, and browses the chosen root", async () => {
 	const h = fakePi();
 	const calls = filePickerGit(h.pi, { "/repo": ["AGENTS.md"], "/linked": ["linked-only.ts"] }, ["/linked"]);
 	gentleShell(h.pi, {});
@@ -5567,8 +5594,17 @@ test("the scope step appears only with a listed worktree, closes first, and brow
 	await fire(h.handlers, "session_start", ctx);
 	const direct = h.commands.get("gentle:files")!.handler("", ctx);
 	await overlayReady;
-	assert.equal(ui.customOptions?.length, 1, "an unregistered session opens the picker directly");
-	assert.doesNotMatch(stripAnsi(ui.overlayView!.render(120).join("\n")), /Choose a scope/);
+	assert.equal(ui.customOptions?.length, 1, "the scope step is the first overlay even with nothing registered");
+	const loneFrame = stripAnsi(ui.overlayView!.render(120).join("\n"));
+	assert.match(loneFrame, /Choose a scope/, "the step never skips itself for an unregistered session");
+	assert.match(loneFrame, /▸ main/, "the session's own checkout is the one scope offered");
+	assert.doesNotMatch(loneFrame, /linked/, "no worktree is offered before it is registered");
+	ui.overlayView!.handleInput("\r");
+	await until(() => ui.customOptions?.length === 2);
+	const directPicker = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
+	await until(() => directPicker().includes("AGENTS.md"));
+	assert.doesNotMatch(directPicker(), /Choose a scope/, "choosing main opens the picker on the session root");
+	assert.match(stripAnsi(ui.overlayView!.render(120)[1]!), /\/repo/, "the picker lists the session root");
 	ui.overlayView!.handleInput("\x1b");
 	await direct;
 
@@ -5579,7 +5615,7 @@ test("the scope step appears only with a listed worktree, closes first, and brow
 	const scopeView = ui.overlayView!;
 	const options = ui.customOptions?.length ?? 0;
 	const scopeFrame = stripAnsi(scopeView.render(120).join("\n"));
-	assert.match(scopeFrame, /Choose a scope/, "a listed worktree adds the scope step");
+	assert.match(scopeFrame, /Choose a scope/, "a registered worktree keeps the step");
 	assert.match(scopeFrame, /▸ main/, "the session repository stays the first scope");
 	assert.match(scopeFrame, /unknown · linked/, "a rejected branch lookup is unknown, as /changes labels it");
 
@@ -5597,7 +5633,56 @@ test("the scope step appears only with a listed worktree, closes first, and brow
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
-test("a root /changes no longer lists adds no scope step", async () => {
+// S41: `a` reads every worktree of the clone through the same
+// `git worktree list --porcelain` answer and parser /changes uses, so an
+// unregistered worktree is reachable without registering it first.
+test("`a` widens the scope step to every worktree of the clone and back to the registered list", async () => {
+	const h = fakePi();
+	const calls: string[][] = [];
+	(h.pi as unknown as { exec(command: string, args: string[]): Promise<unknown> }).exec = async (_command, args) => {
+		calls.push(args);
+		const root = args[1];
+		const rest = args.slice(2);
+		const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, killed: false });
+		if (rest.includes("ls-files")) return ok(({ "/repo": ["AGENTS.md"], "/clone-worktree": ["clone-only.ts"] } as Record<string, string[]>)[root]?.map((path) => `${path}\0`).join("") ?? "");
+		if (rest.includes("worktree")) return ok("worktree /repo\0branch refs/heads/main\0\0worktree /clone-worktree\0branch refs/heads/feat/clone\0\0");
+		if (rest.includes("symbolic-ref")) return ok("feat/clone\n");
+		if (rest[0] === "rev-list") return { stdout: "", stderr: "", code: 128, killed: false };
+		if (rest[0] === "log") return ok("feat: clone work\n");
+		if (rest.includes("status")) return ok("");
+		if (rest.includes("numstat")) return ok("");
+		return ok(root ?? "");
+	};
+	gentleShell(h.pi, {});
+	const { ctx, ui, overlayReady } = fakeContext();
+	await fire(h.handlers, "session_start", ctx);
+	const opened = h.commands.get("gentle:files")!.handler("", ctx);
+	await overlayReady;
+	const scopeView = ui.overlayView!;
+	const frame = () => stripAnsi(scopeView.render(120).join("\n")).split("\n");
+	assert.match(frame().join("\n"), /▸ main/);
+	assert.doesNotMatch(frame().join("\n"), /clone-worktree/, "the step opens on the current checkout and the registered worktrees only");
+	assert.equal(footerLine(frame()), "↑/↓ move • enter choose scope • a all • esc close");
+	assert.ok(calls.some((args) => args.join(" ") === "-C /repo worktree list --porcelain -z"), "the wider list comes from the worktree discovery /changes uses");
+
+	scopeView.handleInput("a");
+	let lines = frame();
+	assert.match(lines.join("\n"), /feat\/clone · clone-worktree/, "`a` offers every worktree of the clone");
+	assert.equal(footerLine(lines), "↑/↓ move • enter choose scope • a registered • esc close", "the footer names the way back");
+	assert.ok(rowOfText(lines, "▸ main") < rowOfText(lines, "feat/clone · clone-worktree"), "the current checkout stays the first row");
+
+	scopeView.handleInput("\x1b[B");
+	scopeView.handleInput("\r");
+	await until(() => ui.overlayView !== scopeView);
+	const pickerFrame = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
+	await until(() => pickerFrame().includes("clone-only.ts"));
+	assert.match(stripAnsi(ui.overlayView!.render(120)[1]!), /\/clone-worktree/, "the picker browses the worktree the wider list offered");
+	ui.overlayView!.handleInput("\x1b");
+	await opened;
+	await fire(h.handlers, "session_shutdown", ctx);
+});
+
+test("a root /changes no longer lists is not offered as a scope", async () => {
 	const h = fakePi();
 	filePickerGit(h.pi, { "/repo": ["AGENTS.md"], "/gone": ["stale.ts"] });
 	gentleShell(h.pi, {}, { rootExists: (root) => root !== "/gone" });
@@ -5607,8 +5692,9 @@ test("a root /changes no longer lists adds no scope step", async () => {
 	const opened = h.commands.get("gentle:files")!.handler("", ctx);
 	await overlayReady;
 	const frame = stripAnsi(ui.overlayView!.render(120).join("\n"));
-	assert.equal(ui.customOptions?.length, 1, "a filtered root never adds the scope step");
-	assert.doesNotMatch(frame, /Choose a scope/);
+	assert.equal(ui.customOptions?.length, 1, "the filtered root never adds a second overlay");
+	assert.match(frame, /Choose a scope/, "the step opens whether or not a worktree survives the filter");
+	assert.match(frame, /▸ main/);
 	assert.doesNotMatch(frame, /gone/, "a root that no longer exists is not offered");
 	ui.overlayView!.handleInput("\x1b");
 	await opened;
@@ -5716,6 +5802,11 @@ test("ctrl+e closes the picker before the editor handoff and reports the missing
 	api.notify = (message) => { handoffs.push(`${message}:${ui.overlayCompletions === 0 ? "open" : "closed"}`); baseNotify.call(api, message); };
 	const opened = h.commands.get("gentle:files")!.handler("", ctx);
 	await overlayReady;
+	// S41: the scope step opens first; choosing `main` completes it, and the
+	// handoff below is the picker's own.
+	const scopeStep = ui.overlayView!;
+	scopeStep.handleInput("\r");
+	await until(() => ui.overlayView !== scopeStep);
 	const frame = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
 	await until(() => frame().includes("AGENTS.md"));
 	ui.overlayView!.handleInput("\x05");
@@ -5739,6 +5830,11 @@ test("the picker opens with a wider card and the full vertical budget", async (t
 	await fire(h.handlers, "session_start", ctx);
 	const opened = h.commands.get("gentle:files")!.handler("", ctx);
 	await overlayReady;
+	// S41: the scope step opens first, so the picker's own options are the ones
+	// the step hands over to, not the first overlay's.
+	const scopeStep = ui.overlayView!;
+	scopeStep.handleInput("\r");
+	await until(() => ui.overlayView !== scopeStep);
 	const options = (ui.customOptions?.at(-1) as { overlayOptions: { width?: number | string; minWidth?: number; maxHeight?: number | string } }).overlayOptions;
 	assert.deepEqual(options, { anchor: "center", width: "85%", minWidth: 76, maxHeight: "100%" });
 	const percent = (value: number | string | undefined, fallback: number): number => {
@@ -5769,12 +5865,12 @@ test("the picker opens with a wider card and the full vertical budget", async (t
 	await fire(h.handlers, "session_shutdown", ctx);
 });
 
-// S23: /changes returns the chosen file from the overlay and opens the editor
-// after teardown, with stop()/start() around the spawn. openInExternalEditor
-// already forces one repaint once the editor exits, so a forced full repaint
-// scheduled between the ctrl+e decision and stop() is pure jolt: Pi rewrites
-// every cell and then the terminal is stopped for the editor.
-test("ctrl+e hands the editor off after teardown with no full repaint before the terminal stops", async (t) => {
+// S48: /changes returns the chosen file from the overlay and opens the editor
+// after teardown, with stop()/start() around the spawn, and it closes its
+// overlay with one forced full repaint on every path, the editor's included.
+// The picker used to settle ctrl+e with a bare `done(file)` and keep its view
+// alive, and the session stayed unresponsive after the editor exited.
+test("ctrl+e hands the editor off after teardown with the forced repaint /changes uses", async (t) => {
 	const saved = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR };
 	delete process.env.VISUAL;
 	process.env.EDITOR = "/nonexistent-editor-for-the-picker-test";
@@ -5793,14 +5889,20 @@ test("ctrl+e hands the editor off after teardown with no full repaint before the
 	t.mock.method(fakeTui, "start", () => { trace.push("start"); });
 	const opened = h.commands.get("gentle:files")!.handler("", ctx);
 	await overlayReady;
+	// S41: the scope step opens first even with nothing registered; choosing the
+	// session checkout completes one overlay and is not part of the handoff.
+	const scopeStep = ui.overlayView!;
+	scopeStep.handleInput("\r");
+	await until(() => ui.overlayView !== scopeStep);
+	const pickerStart = trace.length;
 	const frame = () => stripAnsi(ui.overlayView!.render(120).join("\n"));
 	await until(() => frame().includes("AGENTS.md"));
 	ui.overlayView!.handleInput("\x05");
 	await opened;
-	const stoppedAt = trace.indexOf("stop:1");
+	const stoppedAt = trace.findIndex((entry) => entry.startsWith("stop:"));
 	assert.notEqual(stoppedAt, -1, "the picker is torn down before the terminal stops for the editor");
-	assert.deepEqual(trace.slice(0, stoppedAt).filter((entry) => entry === "repaint-all"), [], "no full repaint is requested between the ctrl+e decision and the stop");
-	assert.deepEqual(trace.slice(stoppedAt, stoppedAt + 3), ["stop:1", "start", "repaint-all"], "the terminal restarts and repaints once, after the editor exits");
+	assert.deepEqual(trace.slice(pickerStart, stoppedAt).filter((entry) => entry === "repaint-all"), ["repaint-all"], "S48: ctrl+e closes the card with the one forced repaint /changes uses, so nothing is left painted when the terminal stops");
+	assert.deepEqual(trace.slice(stoppedAt, stoppedAt + 3), ["stop:2", "start", "repaint-all"], "the terminal restarts and repaints once, after the editor exits");
 	assert.match(ui.notices.join("\n"), /Could not open editor/, "the handoff ran the configured editor and reported its failure");
 	await fire(h.handlers, "session_shutdown", ctx);
 });

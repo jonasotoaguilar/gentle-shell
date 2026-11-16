@@ -16,7 +16,7 @@ import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles
 import * as os from "node:os";
 import { dirname, basename, join, resolve } from "node:path";
 import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellSidebarBar, renderShellStatusBar, renderShellStatusSections, renderShellChromeBar, renderShellChromePad, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, UNKNOWN_BRANCH, WorktreeChangesTracker, changesDigest, foreignRootBranch, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
+import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, UNKNOWN_BRANCH, WorktreeChangesTracker, changesDigest, foreignRootBranch, parseWorktrees, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { FilePickerView } from "../lib/file-picker-view.ts";
 import { FileScopeView, type FileScope } from "../lib/file-scope-view.ts";
@@ -3092,9 +3092,13 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		return unloaded ? code.split("\n") : painted;
 	};
 	// `main` is always the session repository; every other scope is a root
-	// /changes lists too, labelled exactly as /changes labels it. With no
-	// registered worktree the list is just `main`, so the extra step is skipped.
-	const filePickerScopes = async (ctx: ExtensionContext): Promise<FileScope[]> => {
+	// /changes lists too, labelled exactly as /changes labels it. S41: the step
+	// never skips itself, so both of its lists are built here, before it opens —
+	// the default one (the current checkout plus the registered worktrees) and the
+	// wider one `a` toggles to (every worktree of the clone, discovered through the
+	// same `worktree list --porcelain` answer and `parseWorktrees` /changes reads).
+	// The view is handed both lists, so it never runs Git and stays synchronous.
+	const filePickerScopes = async (ctx: ExtensionContext): Promise<{ registered: FileScope[]; all: FileScope[] }> => {
 		const main = filePickerRoot(ctx);
 		const sessionId = ctx.sessionManager.getSessionId();
 		let roots: string[] = [];
@@ -3116,56 +3120,73 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			};
 		};
 		const headScope = async (): Promise<FileScope> => ({ root: main, label: "main", kind: "main", lastModifiedMs: scopeRecency(changes, main), detail: await detailFor(main, "main") });
-		const treeScopes = async (): Promise<FileScope[]> => Promise.all(others.map(async (root): Promise<FileScope> => {
+		const treeScopes = async (treeRoots: readonly string[]): Promise<FileScope[]> => Promise.all(treeRoots.map(async (root): Promise<FileScope> => {
 			const known = changes?.worktrees.find((tree) => tree.root === root)?.branch;
 			// A rejected branch lookup is unknown, never "detached": git never
 			// answered, so the root's HEAD state is not known (lib/shell-changes.ts).
 			const branch = known ?? await foreignRootBranch(deps.gitRunner(root)).catch(() => UNKNOWN_BRANCH);
 			return { root, label: `${branch ?? "detached"} · ${basename(root)}`, kind: "worktree", lastModifiedMs: scopeRecency(changes, root), detail: await detailFor(root, "worktree") };
 		}));
-		const [head, trees] = await Promise.all([headScope(), treeScopes()]);
-		return [head, ...trees];
+		// S41: every worktree of the clone. A failed or empty discovery leaves the
+		// registered list as the wide one instead of offering nothing; a root the
+		// session already registered — possibly a foreign clone — keeps the row it
+		// had, so `a` only ever adds.
+		const cloneTrees = await deps.gitRunner(main)(["worktree", "list", "--porcelain", "-z"])
+			.then((result) => result.code === 0 ? parseWorktrees(result.stdout) : [])
+			.catch(() => []);
+		const extraTrees = cloneTrees.filter((tree) => tree.root !== main && !others.includes(tree.root) && deps.rootExists(tree.root) && !isHomeOrBroadUserDirectory(tree.root));
+		const extraScopes = await Promise.all(extraTrees.map(async (tree): Promise<FileScope> => ({
+			root: tree.root,
+			// The discovery already answered this root's HEAD, so no second ask.
+			label: `${tree.branch ?? "detached"} · ${basename(tree.root)}`,
+			kind: "worktree",
+			lastModifiedMs: scopeRecency(changes, tree.root),
+			detail: await detailFor(tree.root, "worktree"),
+		})));
+		const [head, trees] = await Promise.all([headScope(), treeScopes(others)]);
+		const registered = [head, ...trees];
+		return { registered, all: [...registered, ...extraScopes] };
 	};
 	const openFilePicker = async (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
-		const scopes = await filePickerScopes(ctx);
-		const scope = scopes.length > 1
-			? await ctx.ui.custom<FileScope | null>(
-				(tui, theme, _keybindings, done) => {
-					const close = withOverlayRepaint(tui, done);
-					return new FileScopeView({
-						theme,
-						rows: () => Math.max(0, tui.terminal.rows),
-						scopes,
-						now: deps.now(),
-						onSelect: (chosen) => close(chosen),
-						onClose: () => close(null),
-						requestRender: () => tui.requestRender(),
-					});
-				},
-				{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" } },
-			)
-			: scopes[0];
+		const { registered, all } = await filePickerScopes(ctx);
+		// S41: the step always opens — `main` included — so an unregistered session
+		// still chooses its checkout instead of being dropped straight into the cwd.
+		const scope = await ctx.ui.custom<FileScope | null>(
+			(tui, theme, _keybindings, done) => {
+				const close = withOverlayRepaint(tui, done);
+				return new FileScopeView({
+					theme,
+					rows: () => Math.max(0, tui.terminal.rows),
+					scopes: registered,
+					allScopes: all,
+					now: deps.now(),
+					onSelect: (chosen) => close(chosen),
+					onClose: () => close(null),
+					requestRender: () => tui.requestRender(),
+				});
+			},
+			{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" } },
+		);
 		if (!scope) return;
 		let host: ExternalEditorHost | undefined;
+		let pickerView: FilePickerView | undefined;
 		const editorFile = await ctx.ui.custom<string | null>(
 			(tui, theme, _keybindings, done) => {
 				const repaintAndClose = withOverlayRepaint(tui, done);
 				host = tui;
-				// The view always closes through `onClose`, after `onOpen` on the
-				// editor path, so exactly one of them settles the overlay. Enter and
-				// Esc need the forced full repaint (the paste lands behind the card),
-				// ctrl+e does not: openInExternalEditor repaints once the editor exits,
-				// and painting every cell right before the terminal is stopped for the
-				// spawn is the jolt /changes does not have.
+				// Every path closes the card the way /changes closes its overlay: one
+				// forced full repaint with the card's cells gone, before anything else
+				// runs (S48). ctrl+e used to settle the overlay with a bare `done(file)`,
+				// so the terminal was stopped for the editor with the card still painted,
+				// and the session stayed unresponsive until something else repainted.
 				let closed = false;
-				const closeOnce = (file: string | null, repaint: boolean): void => {
+				const close = (file: string | null): void => {
 					if (closed) return;
 					closed = true;
-					if (repaint) repaintAndClose(file);
-					else done(file);
+					repaintAndClose(file);
 				};
-				return new FilePickerView({
+				pickerView = new FilePickerView({
 					theme,
 					// The title row names the path this picker lists (S26).
 					root: scope.root,
@@ -3179,10 +3200,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					// Enter formats and pastes, then the picker closes with focus back in
 					// the prompt: the message is never sent from here.
 					onInsert: (paths) => ctx.ui.pasteToEditor(formatFileInsertion(paths, { root: scope.root, kind: scope.kind, cwd: ctx.cwd })),
-					onOpen: (relative) => closeOnce(join(scope.root, relative), false),
-					onClose: () => closeOnce(null, true),
+					onOpen: (relative) => close(join(scope.root, relative)),
+					onClose: () => close(null),
 					requestRender: () => tui.requestRender(),
 				});
+				return pickerView;
 			},
 			// Wider than the Commands palette (85% with a 76-column floor, S27) while
 			// the whole terminal stays the height budget: Pi truncates an overlay's
@@ -3190,11 +3212,18 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			// footer line.
 			{ overlay: true, overlayOptions: { anchor: "center", width: "85%", minWidth: 76, maxHeight: "100%" } },
 		);
-		if (editorFile === null || !host) return;
+		if (editorFile === null || !host) {
+			pickerView?.dispose();
+			return;
+		}
 		try {
 			if (!openInExternalEditor(host, editorFile, process.env, spawnSync, scope.root)) ctx.ui.notify(NO_EDITOR_NOTICE, "warning");
 		} catch (error) {
 			ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+		} finally {
+			// /changes disposes its view once the editor returns (S48); the picker kept
+			// its previews and pointer frame for as long as the session lived.
+			pickerView?.dispose();
 		}
 	};
 	pi.registerCommand(CHANGES_COMMAND_NAME, {

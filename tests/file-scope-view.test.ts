@@ -42,6 +42,14 @@ const SCOPES: readonly FileScope[] = [
 	{ root: BETA, label: "fix/beta · beta", kind: "worktree", lastModifiedMs: 1_700_000_500_000 },
 ];
 
+// S41: `a` toggles the registered list with every worktree of the clone, so the
+// same step carries a wider second list.
+const GAMMA = "/work/repo-worktrees/gamma";
+const ALL_SCOPES: readonly FileScope[] = [
+	...SCOPES,
+	{ root: GAMMA, label: "chore/gamma · gamma", kind: "worktree", lastModifiedMs: 1_700_000_200_000 },
+];
+
 type MouseEvent = {
 	type: "press" | "release" | "move" | "drag" | "click" | "wheel";
 	button: "left" | "middle" | "right" | "none";
@@ -150,7 +158,7 @@ test("the card frame is exact at two widths, with the title, esc hint, step subt
 	const wide = view.render(100).map((line) => stripAnsi(line));
 	assert.match(wide[1]!, /^│ File picker +esc +│$/, "the header carries the title on the left and esc on the right");
 	assert.match(wide[2]!, /Choose a scope/, "a muted subtitle line names the step");
-	assert.equal(footerText(wide), "↑/↓ move • enter choose scope • esc close", "the footer names one option per action");
+	assert.equal(footerText(wide), "↑/↓ move • enter choose scope • a all • esc close", "the footer names one option per action");
 });
 
 test("every scope renders its label, with main first and the worktrees by recency, and no recency value leaks into the output", () => {
@@ -219,7 +227,7 @@ test("esc and ctrl+c close exactly once", () => {
 test("the scope footer names one option per action while every binding stays functional", () => {
 	const { view, calls } = createView();
 	const footer = footerText(view.render(100));
-	assert.equal(footer, "↑/↓ move • enter choose scope • esc close");
+	assert.equal(footer, "↑/↓ move • enter choose scope • a all • esc close");
 	assert.doesNotMatch(footer, /esc\/ctrl\+c/, "esc is the only close option the footer names");
 	assert.doesNotMatch(footer, /ctrl\+j/, "the arrows are the only move option the footer names");
 	assert.doesNotMatch(footer, /\bor\b/, "no action is offered twice");
@@ -314,7 +322,7 @@ test("an empty scope list renders its message instead of a blank card and never 
 	const body = bodyText(lines);
 	assert.match(body, /No worktrees/);
 	assert.match(body, /File picker/);
-	assert.match(body, /↑\/↓ move • enter choose scope • esc close/);
+	assert.match(body, /↑\/↓ move • enter choose scope • a all • esc close/);
 	assert.equal(visibleWidth(lines[0]!), 100);
 	view.handleInput("\r");
 	view.handleInput("\x1b[B");
@@ -341,6 +349,47 @@ test("a long scope list keeps the selected row visible with the more indicators 
 	for (const line of lines) assert.equal(visibleWidth(line), 100);
 	const hit = rowOf(lines, "branch-20");
 	assert.deepEqual(view.handleMouse(mouse(lines, 4, hit)), { handled: true, render: true }, "a windowed row is clickable where it is painted");
+});
+
+// S41: the step opens on the current checkout and the registered worktrees, and
+// `a` swaps that list for every worktree of the clone and back. The footer says
+// what the key does next, in the same one option per action style.
+test("`a` widens the step to every worktree of the clone and the footer names what it does next", () => {
+	const { view, calls } = createView({ allScopes: ALL_SCOPES });
+	const body = () => bodyText(view.render(100));
+	assert.doesNotMatch(body(), /gamma/, "the step opens on the registered list");
+	assert.equal(footerText(view.render(100)), "↑/↓ move • enter choose scope • a all • esc close", "the key advertises the list it switches to");
+	view.handleInput("a");
+	assert.match(body(), /chore\/gamma · gamma/, "`a` lists every worktree of the clone");
+	assert.equal(footerText(view.render(100)), "↑/↓ move • enter choose scope • a registered • esc close", "the active state names the way back");
+	const lines = view.render(100);
+	for (const line of lines) assert.equal(visibleWidth(line), 100, "a wider list never breaks the card's geometry");
+	assert.ok(rowOf(lines, "main") < rowOf(lines, "chore/gamma · gamma"), "main stays the first row of the wider list too");
+	view.handleInput("a");
+	assert.doesNotMatch(body(), /gamma/, "a second press returns to the registered list");
+	assert.equal(footerText(view.render(100)), "↑/↓ move • enter choose scope • a all • esc close");
+	view.handleInput("a");
+	const wider = view.render(100);
+	assert.deepEqual(view.handleMouse(mouse(wider, 4, rowOf(wider, "chore/gamma"))), { handled: true, render: true }, "a row of the wider list is clickable where it is painted");
+	assert.deepEqual(calls.select.map((scope) => scope.root), [GAMMA], "the active list is the one a choice comes from");
+});
+
+// S41: the toggle never loses the reader's place when the focused root survives
+// the switch, and never keeps a stale index when it does not.
+test("toggling keeps the focused scope focused when the other list carries it, otherwise it starts at the first row", () => {
+	const { view, calls } = createView({ allScopes: ALL_SCOPES });
+	view.handleInput("\x1b[B");
+	assert.match(selectedRow(view.render(100)), /feat\/alpha · alpha/);
+	view.handleInput("a");
+	assert.match(selectedRow(view.render(100)), /feat\/alpha · alpha/, "the focused root stays focused in the wider list");
+	view.handleInput("\x1b[B");
+	view.handleInput("\x1b[B");
+	assert.match(selectedRow(view.render(100)), /chore\/gamma · gamma/);
+	view.handleInput("a");
+	assert.match(selectedRow(view.render(100)), /│ ▸ main +│$/, "a root the registered list does not carry leaves the cursor on the first row");
+	view.handleInput("\r");
+	assert.deepEqual(calls.select.map((scope) => scope.root), [REPO], "the scope chosen is a row of the active list");
+	assert.equal(calls.close, 0);
 });
 
 // S32: each row reports how many files the scope has changed in the working
@@ -372,9 +421,10 @@ test("each scope row reports its uncommitted files at the right, in the theme's 
 test("the footer keys take the theme's key colour with neutral labels, keeping the text", () => {
 	const tagged = createView({ theme: taggedTheme }).view.render(200);
 	const footer = tagged[tagged.length - 2]!;
-	assert.equal(footerText(createView().view.render(100)), "↑/↓ move • enter choose scope • esc close", "the footer text is unchanged");
+	assert.equal(footerText(createView().view.render(100)), "↑/↓ move • enter choose scope • a all • esc close", "the footer text is unchanged");
 	assert.match(footer, /<accent>↑\/↓<\/accent> <dim>move<\/dim>/, "the move key takes the key colour");
 	assert.match(footer, /<accent>enter<\/accent> <dim>choose scope<\/dim>/, "the choose key takes the key colour");
+	assert.match(footer, /<accent>a<\/accent> <dim>all<\/dim>/, "the toggle key takes the key colour");
 	assert.match(footer, /<accent>esc<\/accent> <dim>close<\/dim>/, "the close key takes the key colour");
 	assert.equal(tagged.filter((line) => line.includes("↑/↓ move") || line.includes("<accent>↑/↓</accent>")).length, 1, "the footer is the only row that names the keys");
 });
@@ -393,7 +443,7 @@ test("the row above the footer paints the focused scope's detail and never a zer
 	const detail = (frame: readonly string[]): string => stripAnsi(frame[frame.length - 3]!).slice(2, -2).trim();
 	let lines = view.render(120);
 	assert.equal(detail(lines), "feat: add the picker · ±3 files · 5h · ↑2 main", "the commit subject leads and the zero `behind` field is not painted");
-	assert.equal(footerText(lines), "↑/↓ move • enter choose scope • esc close", "the detail line sits directly above the footer");
+	assert.equal(footerText(lines), "↑/↓ move • enter choose scope • a all • esc close", "the detail line sits directly above the footer");
 	view.handleInput("\x1b[B");
 	lines = view.render(120);
 	assert.equal(detail(lines), "fix: alpha only · 3d · ↓1 main", "the subject leads even when a zero `changedFiles` field is not painted");
