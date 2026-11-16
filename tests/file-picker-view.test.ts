@@ -35,10 +35,15 @@ const KEY_ROLE = "\x1b[35m";
 const LABEL_ROLE = "\x1b[90m";
 const ROLE_END = "\x1b[39m";
 
-// Card rows: top border, header, search row, blank separator, count row, body.
+// Card rows: top border, header, search row, info row, body, closing rule.
 const SEARCH_ROW = 2;
-const COUNT_ROW = 4;
-const BODY_TOP = 5;
+const INFO_ROW = 3;
+const BODY_TOP = 4;
+// The card's own rows: the search row is the list column's alone, the preview
+// box starts on the info row below it and its bottom border lands on the list's
+// last row (S47).
+const PREVIEW_TOP = 2;
+const BOX_TOP_ROW = 3;
 // A selected row's marker cell: the accent bar that joins across adjacent rows.
 const SELECTION_BAR = "▏";
 const FOOTER_TEXT = "↑/↓ move • ctrl+j/k scroll • tab select • space fold • ctrl+o order • ctrl+u clear • enter insert • ctrl+e editor • esc close";
@@ -164,16 +169,16 @@ function rowOf(lines: readonly string[], text: string): number {
 	return y;
 }
 
-/** The left pane cell of the row showing `text`, without the card border. */
+/** The left pane cell of the list row showing `text`, without the card border. */
 function listCell(lines: readonly string[], text: string): string {
-	const row = stripAnsi(lines[rowOf(lines, text)] ?? "");
+	const row = stripAnsi(lines[listRowOf(lines, text)] ?? "");
 	const cell = row.split(" │ ")[0] ?? "";
 	return cell.replace(/^│ /, "");
 }
 
 /** The same list cell with its escape sequences intact, for tone assertions. */
 function rawListCell(lines: readonly string[], text: string): string {
-	const row = lines[rowOf(lines, text)] ?? "";
+	const row = lines[listRowOf(lines, text)] ?? "";
 	return (row.split(" │ ")[0] ?? "").replace(/^│ /, "");
 }
 
@@ -203,7 +208,7 @@ function previewPaneWidth(lines: readonly string[]): number {
 
 /** The preview pane's cells at `offset` body rows, box borders included, escapes intact. */
 function rawPreviewPane(lines: readonly string[], offset: number): string {
-	return sliceByColumn(lines[BODY_TOP + offset] ?? "", previewPaneStart(lines), previewPaneWidth(lines));
+	return sliceByColumn(lines[PREVIEW_TOP + offset] ?? "", previewPaneStart(lines), previewPaneWidth(lines));
 }
 
 /** The same cells without their escape sequences. */
@@ -213,18 +218,24 @@ function previewPane(lines: readonly string[], offset: number): string {
 
 /** True when the preview paints inside its own rounded box (S38). */
 function previewPaintsBox(lines: readonly string[]): boolean {
-	return previewPane(lines, 0).startsWith("╭");
+	return previewPane(lines, BOX_TOP_ROW - PREVIEW_TOP).startsWith("╭");
 }
 
-/** The preview's own content rows: what the scroll keys and the wheel can move through. */
+/**
+ * The preview's own content rows: what the scroll keys and the wheel can move
+ * through. The box's top border rides the info row and its bottom border the
+ * list's last row, so a boxed preview keeps one content row fewer than the list
+ * paints body rows; the unbordered fallback spends one row on the position
+ * indicator and keeps every body row for content (S47).
+ */
 function previewRowCount(lines: readonly string[]): number {
 	const bodyRows = lines.length - 7;
-	return Math.max(0, bodyRows - (previewPaintsBox(lines) ? 2 : 1));
+	return Math.max(0, previewPaintsBox(lines) ? bodyRows - 1 : bodyRows);
 }
 
 /** The box's interior at `offset` content rows, escapes intact; 0 is the first content row. */
 function rawPreviewCell(lines: readonly string[], offset: number): string {
-	return sliceByColumn(rawPreviewPane(lines, offset + 1), 1, Math.max(0, previewPaneWidth(lines) - 2));
+	return sliceByColumn(rawPreviewPane(lines, offset + BOX_TOP_ROW - PREVIEW_TOP + 1), 1, Math.max(0, previewPaneWidth(lines) - 2));
 }
 
 /** The box's interior at `offset` content rows; 0 is the first content row. */
@@ -243,13 +254,33 @@ function previewTop(lines: readonly string[]): string {
  * is too short to box the preview.
  */
 function positionCell(lines: readonly string[]): string {
-	const pane = previewPane(lines, 0);
+	const pane = previewPane(lines, BOX_TOP_ROW - PREVIEW_TOP);
 	return (previewPaintsBox(lines) ? pane.replace(/^╭─*/, "").replace(/╮$/, "") : pane).trim();
 }
 
-/** The count row's text: the file and selection counts, then the active order. */
-function countCell(lines: readonly string[]): string {
-	return stripAnsi(lines[COUNT_ROW] ?? "").replace(/^│ /, "").replace(/ +│$/, "");
+/**
+ * The info row's list cell: `listed/total (selected)`, the rule that fills the
+ * rest and the active order at the list pane's right edge (S43).
+ */
+function infoCell(lines: readonly string[]): string {
+	const cell = (stripAnsi(lines[INFO_ROW] ?? "").split(" │ ")[0] ?? "").replace(/^│ /, "");
+	return cell.trimEnd();
+}
+
+/** The search row's list cell, which the preview's box now starts beside (S47). */
+function searchCell(lines: readonly string[]): string {
+	const cell = (stripAnsi(lines[SEARCH_ROW] ?? "").split(" │ ")[0] ?? "").replace(/^│ /, "");
+	return cell.trimEnd();
+}
+
+/** The row that closes the body: a rule under the list and the preview's own last row (S47). */
+function ruleRow(lines: readonly string[]): string {
+	return stripAnsi(lines[lines.length - 3] ?? "").replace(/^│ /, "").replace(/ │$/, "");
+}
+
+/** The body rows the list pane is given, which the card's own height decides. */
+function bodyRowsOf(lines: readonly string[]): number {
+	return lines.length - 7;
 }
 
 /**
@@ -258,7 +289,7 @@ function countCell(lines: readonly string[]): string {
  */
 function paintedList(lines: readonly string[], names: readonly string[]): string[] {
 	const painted: string[] = [];
-	for (let index = BODY_TOP; index <= lines.length - 3; index += 1) {
+	for (let index = BODY_TOP; index <= lines.length - 4; index += 1) {
 		const cell = stripAnsi(lines[index] ?? "").split(" │ ")[0] ?? "";
 		const name = names.find((candidate) => cell.includes(candidate));
 		if (name !== undefined && !painted.includes(name)) painted.push(name);
@@ -271,7 +302,7 @@ function paintedList(lines: readonly string[], names: readonly string[]): string
  * preview's own copy of a path.
  */
 function listRowOf(lines: readonly string[], text: string): number {
-	for (let index = BODY_TOP; index <= lines.length - 3; index += 1) {
+	for (let index = BODY_TOP; index <= lines.length - 4; index += 1) {
 		const cell = stripAnsi(lines[index] ?? "").split(" │ ")[0] ?? "";
 		if (cell.includes(text)) return index;
 	}
@@ -285,7 +316,7 @@ function listRowOf(lines: readonly string[], text: string): number {
  */
 function listTree(lines: readonly string[]): { depth: number; label: string }[] {
 	const rows: { depth: number; label: string }[] = [];
-	for (let index = BODY_TOP; index <= lines.length - 3; index += 1) {
+	for (let index = BODY_TOP; index <= lines.length - 4; index += 1) {
 		const cell = (stripAnsi(lines[index] ?? "").split(" │ ")[0] ?? "").replace(/^│ /, "");
 		const text = cell.slice(MARKER_COLUMN);
 		if (text.trim().length === 0) continue;
@@ -341,7 +372,7 @@ test("the card grows with the terminal, never exceeds the rows it is given, and 
 		assert.ok(lines.length > previous, `the card grows with ${rows} rows`);
 		assert.ok(lines.length <= rows, `the card never exceeds the ${rows} rows it is given`);
 		assert.match(stripAnsi(lines[1]!), /^│ File picker .*esc +│$/, "the header is painted");
-		assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › Search +│$/);
+		assert.equal(searchCell(lines), "› Search", "the search row is painted in the list column");
 		assert.ok(stripAnsi(lines[BODY_TOP]!).includes("README.md"), "the list is painted");
 		assert.ok(footerText(lines).startsWith("↑/↓ move"), "the footer is painted");
 		previous = lines.length;
@@ -352,17 +383,18 @@ test("the card grows with the terminal, never exceeds the rows it is given, and 
 	assert.equal(smallest.length, 9, "the smallest supported card fills the rows it is given");
 	for (const line of smallest) assert.equal(visibleWidth(line), 120);
 	assert.match(stripAnsi(smallest[1]!), /File picker/);
-	assert.match(stripAnsi(smallest[SEARCH_ROW]!), /› Search/);
+	assert.equal(searchCell(smallest), "› Search");
 	assert.ok(footerText(smallest).startsWith("↑/↓ move"), "the footer survives the smallest card");
 });
 
-test("the title row shows the path being listed at its top-right, next to the esc hint", async () => {
+test("the title row paints the listing path next to the title and leaves esc alone in the far corner", async () => {
 	const { view } = await openView({ root: ROOT });
 	const line = view.render(120)[1]!;
 	assert.equal(visibleWidth(line), 120);
 	const header = stripAnsi(line);
-	assert.ok(header.includes(ROOT), `the whole path is painted when it fits: ${header}`);
-	assert.match(header, /^│ File picker +.*file-picker esc +│$/, "the path sits between the title and the close hint");
+	assert.ok(header.startsWith(`│ File picker  ${ROOT} `), `the path follows the title after one two-space gap: ${header}`);
+	assert.ok(header.trimEnd().endsWith(" esc │"), "esc keeps the far-right corner to itself");
+	assert.doesNotMatch(header, new RegExp(`${ROOT.replace(/[/-]/g, "\\$&")} esc`), "the path no longer sits beside esc");
 
 	const plain = await openView();
 	assert.match(stripAnsi(plain.view.render(120)[1]!), /^│ File picker +esc +│$/, "no path leaves the header unchanged");
@@ -389,49 +421,81 @@ test("a narrow title row elides the path from the left and keeps the title and e
 	assert.match(stripAnsi(tiny[1]!), /^│ File picker +esc +│$/, "too narrow a card drops the path, never the title or esc");
 });
 
-test("a count row under the blank line reports the files listed and the Tab selection, and updates at once", async () => {
+test("the info row reports the files listed against the whole listing and the Tab selection, with the order at its right edge", async () => {
 	const { view } = await openView({}, [entry("a.ts"), entry("b.ts"), entry("c.ts")]);
 	let lines = view.render(120);
-	assert.match(stripAnsi(lines[COUNT_ROW - 1]!), /^│ +│$/, "the blank row stays between the search row and the count");
-	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(0 selected\) · modified +│$/, "the count row sits under the blank line");
-	assert.ok(stripAnsi(lines[BODY_TOP]!).includes("a.ts"), "the list starts under the count row");
+	assert.match(infoCell(lines), /^3\/3 \(0\) ─+ modified$/, "the counts, the rule that fills the row and the order at its right edge");
+	assert.match(stripAnsi(lines[INFO_ROW]!), /^│ 3\/3 \(0\) ─+ modified │ /, "the rule separates the counts from the order");
+	assert.ok(stripAnsi(lines[BODY_TOP]!).includes("a.ts"), "the list starts under the info row");
 	view.handleInput(TAB);
 	lines = view.render(120);
-	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(1 selected\) · modified +│$/, "Tab updates the selection count immediately");
+	assert.match(infoCell(lines), /^3\/3 \(1\) ─+ modified$/, "Tab updates the selection count immediately");
 	view.handleInput("\x1b[B");
 	view.handleInput(TAB);
 	lines = view.render(120);
-	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 3 files \(2 selected\) · modified +│$/, "a second Tab counts too");
+	assert.match(infoCell(lines), /^3\/3 \(2\) ─+ modified$/, "a second Tab counts too");
 	for (const character of "b") view.handleInput(character);
 	lines = view.render(120);
-	assert.match(stripAnsi(lines[COUNT_ROW]!), /^│ 1 file \(2 selected\) · modified +│$/, "filtering updates the file count at once, and the selection count never lies about the whole selection");
+	assert.match(infoCell(lines), /^1\/3 \(2\) ─+ modified$/, "filtering repaints the listed count against the whole listing, and the selection count never lies about the whole selection");
 });
 
-test("the count row keeps the card geometry at a narrow width and at the smallest height", async () => {
+test("the info row takes the list pane's width, right-aligns the order at its edge and never names the retired path order", async () => {
+	const { view } = await openView({}, [entry("a.ts"), entry("b.ts")]);
+	const lines = view.render(120);
+	const listWidth = listPaneWidth(lines);
+	const row = stripAnsi(lines[INFO_ROW]!);
+	// The card's own content is wider than the list pane: the info row stops at
+	// the pane separator instead of running under the preview (S47).
+	assert.ok(listWidth < visibleWidth(lines[0]!) - 4, "the list pane is narrower than the card's content");
+	const infoEnd = 2 + listWidth;
+	assert.equal(row.slice(infoEnd - "modified".length, infoEnd), "modified", "the active order ends at the list pane's right edge");
+	assert.equal(row.slice(2, 2 + "2/2 (0)".length), "2/2 (0)", "the counts start at the pane's left edge");
+	assert.equal(row.slice(2 + "2/2 (0)".length, 2 + "2/2 (0)".length + 1), " ", "one space separates the counts from the rule");
+	assert.equal(row.slice(infoEnd - "modified".length - 1, infoEnd - "modified".length), " ", "one space separates the rule from the order");
+	for (const character of "a.ts") view.handleInput(character);
+	const filtered = view.render(120);
+	assert.equal(stripAnsi(filtered[INFO_ROW]!).slice(2, 2 + "1/2 (0)".length), "1/2 (0)", "the counts compare what the query lists with the whole listing");
+	assert.doesNotMatch(infoCell(filtered), /path/, "the retired order name never paints");
+});
+
+test("the info row keeps the card geometry at a narrow width and at the smallest height", async () => {
 	const { view } = await openView({}, [entry("a.ts")]);
 	const narrow = view.render(40);
-	assert.equal(visibleWidth(narrow[COUNT_ROW]!), 40);
-	assert.match(stripAnsi(narrow[COUNT_ROW]!), /^│ 1 file \(0 selected\) · modified +│$/, "a single file reads as one file");
-	assert.equal(narrow.length, view.render(120).length, "the count row never adds a row");
+	assert.equal(visibleWidth(narrow[INFO_ROW]!), 40);
+	assert.match(infoCell(narrow), /^1\/1 \(0\)/, "the counts survive a narrow list pane");
+	assert.equal(narrow.length, view.render(120).length, "the info row never adds a row");
 
 	const small = (await openView({ rows: 9 }, [entry("a.ts")])).view.render(120);
 	assert.equal(small.length, 9);
-	assert.match(stripAnsi(small[COUNT_ROW]!), /1 file \(0 selected\)/, "the count row survives the smallest card");
+	assert.match(infoCell(small), /^1\/1 \(0\) ─+ modified$/, "the info row survives the smallest card");
 	assert.ok(footerText(small).startsWith("↑/↓ move"));
 	for (const line of small) assert.equal(visibleWidth(line), 120);
 });
 
-test("the search row sits directly under the title and shows the placeholder or the typed query, then a blank row and the list", async () => {
+test("the info row paints nothing while the listing is unloaded or failed", async () => {
+	let resolveList: (result: RepositoryEntriesResult) => void = () => {};
+	const pending = createView({ listEntries: () => new Promise<RepositoryEntriesResult>((resolve) => { resolveList = resolve; }) });
+	const loading = pending.view.render(120);
+	assert.equal(infoCell(loading), "", "a pending listing counts nothing");
+	assert.match(stripAnsi(loading[INFO_ROW]!).split(" │ ")[0]!.replace(/^│ /, ""), /^ +$/, "the row stays blank, never a claimed zero");
+	resolveList({ ok: false, message: "Cannot list repository files: not a repository." });
+	await settle();
+	const failed = pending.view.render(120);
+	assert.equal(infoCell(failed), "", "a failed listing counts nothing either");
+	assert.ok(bodyText(failed).includes("Cannot list repository files: not a repository."));
+});
+
+test("the search row sits directly under the title, the info row under it, and the list under both", async () => {
 	const { view } = await openView({}, [entry("app.ts"), entry("src/app-store.ts")]);
 	let lines = view.render(120);
 	assert.match(stripAnsi(lines[1]!), /^│ File picker +esc +│$/, "the title row stays on top");
-	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › Search +│$/, "the empty search row shows the placeholder");
-	assert.match(stripAnsi(lines[SEARCH_ROW + 1]!), /^│ +│$/, "a blank row follows the search row");
-	assert.ok(stripAnsi(lines[BODY_TOP]!).includes("app.ts"), "the list starts under the count row");
+	assert.equal(searchCell(lines), "› Search", "the empty search row shows the placeholder");
+	assert.match(infoCell(lines), /^2\/2 \(0\) .* modified$/, "the info row follows the search row");
+	assert.ok(stripAnsi(lines[BODY_TOP]!).includes("app.ts"), "the list starts under the info row");
 	for (const character of "app") view.handleInput(character);
 	lines = view.render(120);
-	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › app +│$/, "the search row shows exactly what was typed");
-	assert.doesNotMatch(stripAnsi(lines[SEARCH_ROW]!), /Search/, "the placeholder gives way to the query");
+	assert.equal(searchCell(lines), "› app", "the search row shows exactly what was typed");
+	assert.doesNotMatch(searchCell(lines), /Search/, "the placeholder gives way to the query");
 });
 
 test("the search row paints its prompt and placeholder from the theme roles", async () => {
@@ -447,8 +511,8 @@ test("the body is two panes split by one vertical rule, with the list and previe
 	const lines = view.render(120).map((line) => stripAnsi(line));
 	const row = lines.find((line) => line.includes("README.md"));
 	assert.ok(row, "the list shows the repository-relative path");
-	assert.match(row!, /^│ .*README\.md.* │ .*│$/, "the separator sits between the list and its preview");
-	assert.equal((row!.match(/│/g) ?? []).length, 3, "the body's top border row has the two card borders plus one pane separator");
+	assert.match(row!, /^│ .*README\.md.* │ .*╮?.*│$/, "the separator sits between the list and its preview");
+	assert.equal((row!.match(/│/g) ?? []).length, 5, "a body row has the card borders, the pane separator and the preview box's two border columns");
 	const contentRow = lines.find((line) => line.includes("1 preview of README.md"));
 	assert.ok(contentRow, "the preview paints its first line beside the list");
 	assert.equal((contentRow!.match(/│/g) ?? []).length, 5, "a content row has the card borders, the pane separator and the preview box's two border columns");
@@ -537,7 +601,7 @@ test("ctrl+u restores the whole listing and keeps the Tab selection", async () =
 	view.handleInput("\x15");
 	const lines = view.render(120);
 	assert.ok(bodyText(lines).includes("README.md"), "ctrl+u clears the query");
-	assert.match(stripAnsi(lines[rowOf(lines, "app.ts")]!), new RegExp(SELECTION_BAR), "clearing the query keeps the selection");
+	assert.match(stripAnsi(lines[listRowOf(lines, "app.ts")]!), new RegExp(SELECTION_BAR), "clearing the query keeps the selection");
 });
 
 test("a failed listing shows its message and an empty repository shows an explicit line", async () => {
@@ -610,14 +674,14 @@ test("ctrl+shift+j/k and pageUp/pageDown scroll the preview and clamp to its con
 	view.handleInput(CTRL_SHIFT_K);
 	assert.match(previewTop(view.render(120)), /line 2/);
 	view.handleInput(PAGE_DOWN);
-	assert.match(previewTop(view.render(120)), /line 6/, "a page moves one preview height");
+	assert.match(previewTop(view.render(120)), /line 7/, "a page moves one preview height");
 	view.handleInput(PAGE_UP);
 	assert.match(previewTop(view.render(120)), /line 2/);
 	for (let index = 0; index < 100; index += 1) view.handleInput(CTRL_SHIFT_K);
 	assert.match(previewTop(view.render(120)), /line 0/, "scrolling clamps at the top");
 	for (let index = 0; index < 100; index += 1) view.handleInput(CTRL_SHIFT_J);
 	const clamped = view.render(120);
-	assert.match(previewTop(clamped), /line 56/, "scrolling clamps at the last full page");
+	assert.match(previewTop(clamped), /line 55/, "scrolling clamps at the last full page");
 	assert.ok(bodyText(clamped).includes("line 59"));
 	const settled = view.render(120).join("\n");
 	view.handleInput(CTRL_SHIFT_J);
@@ -649,7 +713,7 @@ test("the wheel over the list moves the selection and the wheel over the preview
 
 	for (let index = 0; index < 100; index += 1) view.handleMouse(mouse(lines, previewX, BODY_TOP, "wheel", "none", 1));
 	lines = view.render(120);
-	assert.match(previewTop(lines), /line 56/);
+	assert.match(previewTop(lines), /line 55/);
 	assert.deepEqual(view.handleMouse(mouse(lines, previewX, BODY_TOP, "wheel", "none", 1)), { handled: true, render: false }, "the preview wheel clamps at the end");
 });
 
@@ -979,13 +1043,81 @@ test("a truncated preview appends an explicit truncation notice; a whole file do
 	assert.doesNotMatch(bodyText(whole.view.render(120)), /truncated/i);
 });
 
+test("the search row keeps the list's width and the preview box rides the info row through the last list row", async () => {
+	const { view } = await openView({}, [entry("a.ts"), entry("b.ts"), entry("c.ts")]);
+	const lines = view.render(120);
+	const bodyRows = bodyRowsOf(lines);
+	const listWidth = listPaneWidth(lines);
+	assert.equal(bodyRows, 10, "the card keeps its body rows");
+	assert.equal(lines.length, bodyRows + 7, "the card's chrome is still the seven rows S47 fixes");
+
+	// The search row belongs to the list column alone: its right side is filler.
+	assert.equal(searchCell(lines), "› Search");
+	assert.equal(previewPane(lines, 0), " ".repeat(previewPaneWidth(lines)), "the search row paints no box cell");
+	assert.equal(stripAnsi(lines[SEARCH_ROW]!).slice(2 + listWidth, 2 + listWidth + 3), " │ ", "the list's search row ends at the pane separator");
+	// The info row carries the counts on its left and the box's top border beside it.
+	assert.match(infoCell(lines), /^3\/3 \(0\) ─+ modified$/);
+	assert.match(previewPane(lines, 1), /^╭─+ \d+\/\d+╮$/, "the box's top border rides the info row, with the position at its right");
+	// The bottom border lands on the list's last row, the one the more indicator
+	// would sit on when the list overflows.
+	assert.match(previewPane(lines, bodyRows + 1), /^╰─+╯$/, "the box's bottom border rides the last list row");
+	assert.equal(BODY_TOP + bodyRows - 1, lines.length - 4, "the last list row is the row above the closing rule");
+	// A list that overflows paints its `↓ n more` indicator on that same last row,
+	// and the box still closes there.
+	const overflow = await openView({}, Array.from({ length: 20 }, (_, index) => entry(`file-${String(index).padStart(2, "0")}.ts`)));
+	for (let step = 0; step < 15; step += 1) overflow.view.handleInput("\x1b[B");
+	const overflowing = overflow.view.render(120);
+	const lastList = overflowing.length - 4;
+	assert.match((stripAnsi(overflowing[lastList]!).split(" │ ")[0] ?? ""), /↓ \d+ more/, "the list's last row carries the more indicator when it overflows");
+	assert.match(previewPane(overflowing, bodyRows + 1), /^╰─+╯$/, "the box closes on the row the list's indicator sits on");
+	assert.equal(previewRowCount(lines), bodyRows - 1, "the box leaves one content row fewer than the list paints body rows");
+	// One rule closes the body across the whole card content, the preview included.
+	const rule = stripAnsi(lines[BODY_TOP + bodyRows]!).replace(/^│ /, "").replace(/ │$/, "");
+	assert.equal(rule, "─".repeat(visibleWidth(lines[0]!) - 4), "the closing rule spans the whole card content, list and preview alike");
+	for (const line of lines) assert.equal(visibleWidth(line), 120);
+});
+
+test("wheel and click geometry follow the corrected rows: the first list row is frame row 4 and the box's own rows absorb the wheel", async () => {
+	const long = Array.from({ length: 40 }, (_, index) => `line ${index}`);
+	const { view, calls } = await openView({ rows: 20, loadPreview: async () => preview(long) }, [entry("a.ts"), entry("b.ts")]);
+	let lines = view.render(120);
+	const previewX = previewPaneStart(lines) + 3;
+	assert.match(previewTop(lines), /line 0/);
+	// The wheel over the info row — the box's top border — scrolls the preview.
+	assert.deepEqual(view.handleMouse(mouse(lines, previewX, INFO_ROW, "wheel", "none", 1)), { handled: true, render: true });
+	lines = view.render(120);
+	assert.match(previewTop(lines), /line 1/, "the box's top border row is part of the scrollable preview");
+	// The search row's right side is filler: it is nobody's click target.
+	assert.equal(view.handleMouse(mouse(lines, previewX, SEARCH_ROW)), undefined, "the search row's right column is not a preview click");
+	// A click on the first list row selects the first file.
+	assert.deepEqual(view.handleMouse(mouse(lines, 3, BODY_TOP)), { handled: true, render: false }, "a click on the first list row is a list click");
+	await settle();
+	lines = view.render(120);
+	assert.match(selectedRow(lines), /a\.ts/, "the first list row is frame row 4");
+	assert.deepEqual(calls.insert, []);
+	assert.equal(calls.close, 0);
+});
+
+test("the smallest card still boxes the preview, with exactly one content row inside it", async () => {
+	const smallest = (await openView({ rows: 9 }, [entry("a.ts")])).view.render(120);
+	assert.equal(smallest.length, 9, "the smallest card fills the rows it is given");
+	const bodyRows = bodyRowsOf(smallest);
+	assert.equal(bodyRows, 2, "the smallest card has two body rows");
+	assert.equal(previewPaintsBox(smallest), true, "the box only needs one content row between its borders");
+	assert.equal(previewRowCount(smallest), 1, "one content row sits between the borders");
+	assert.match(previewPane(smallest, 1), /^╭─+ \d+\/\d+╮$/, "the top border rides the info row");
+	assert.match(previewPane(smallest, 3), /^╰─+╯$/, "the bottom border rides the second, last list row");
+	assert.match(previewCell(smallest, 0), /^ *1 preview of a\.ts/);
+	for (const line of smallest) assert.equal(visibleWidth(line), 120);
+});
+
 test("the preview gutter numbers every visible row with its real file line number, also after scrolling", async () => {
 	const long = Array.from({ length: 60 }, (_, index) => `entry ${index}`);
 	const { view } = await openView({ rows: 16, loadPreview: async () => preview(long) });
 	let lines = view.render(120);
 	assert.match(previewTop(lines), /^ 1 entry 0 +$/, "the first content row is file line 1");
 	const rows = previewRowCount(lines);
-	assert.equal(rows, 4, "the box leaves four content rows at this height");
+	assert.equal(rows, 5, "the box's two border rows come out of the info row and the last list row, leaving five content rows at this height");
 	for (let index = 1; index < rows; index += 1) {
 		assert.match(previewCell(lines, index), new RegExp(`^ ${index + 1} entry ${index} `), "every visible row carries its own line number");
 	}
@@ -1006,7 +1138,7 @@ test("the preview gutter and position indicator use the theme roles", async () =
 	};
 	const { view } = await openView({ theme: roleTheme, loadPreview: async () => preview(["alpha", "beta"]) });
 	const lines = view.render(120);
-	assert.match(rawPreviewPane(lines, 0), /\x1b\[90m1\/2\x1b\[0m/, "the position uses the muted role");
+	assert.match(rawPreviewPane(lines, BOX_TOP_ROW - PREVIEW_TOP), /\x1b\[90m1\/2\x1b\[0m/, "the position uses the muted role");
 	assert.match(rawPreviewCell(lines, 0), /\x1b\[2m1\x1b\[0m alpha/, "the gutter number uses the dim role");
 	assert.match(rawPreviewCell(lines, 1), /\x1b\[2m2\x1b\[0m beta/);
 });
@@ -1052,11 +1184,16 @@ test("the preview sits in its own rounded box in the border tone, with the posit
 	const paneWidth = previewPaneWidth(lines);
 	const interiorWidth = paneWidth - 2;
 	const bodyRows = lines.length - 7;
-	assert.equal(bodyRows, 10, "the box spends two of the ten body rows on its borders");
+	assert.equal(bodyRows, 10, "the list keeps its ten body rows");
+	// The box rides the info row and the list's last row (S47), so its borders
+	// take one row of the body block and the search row above keeps no box cell.
+	const boxTop = BOX_TOP_ROW - PREVIEW_TOP;
+	const boxBottom = bodyRows + 1;
+	assert.equal(boxBottom, 11);
 
 	// The four corners land on the pane's own columns, and the card's frame is untouched.
-	const top = previewPane(lines, 0);
-	const bottom = previewPane(lines, bodyRows - 1);
+	const top = previewPane(lines, boxTop);
+	const bottom = previewPane(lines, boxBottom);
 	assert.equal(top.length, paneWidth, "the top border spans exactly the preview pane");
 	assert.equal(top[0], "╭", "the top-left corner sits in the pane's first column");
 	assert.equal(top[paneWidth - 1], "╮", "the top-right corner closes the box at the pane's last column");
@@ -1065,25 +1202,26 @@ test("the preview sits in its own rounded box in the border tone, with the posit
 	assert.equal(stripAnsi(lines[BODY_TOP]!).slice(paneStart - 3, paneStart), " │ ", "the pane separator sits immediately left of the box's first column");
 	assert.equal(stripAnsi(lines[BODY_TOP]!)[0], "│", "the card's own left border is untouched");
 	assert.equal(stripAnsi(lines[BODY_TOP]!).at(-1), "│", "the card's own right border is untouched");
-	for (let offset = 1; offset < bodyRows - 1; offset += 1) {
+	for (let offset = boxTop + 1; offset < boxBottom; offset += 1) {
 		const row = previewPane(lines, offset);
-		assert.equal(row[0], "│", `the left border column runs down body row ${offset}`);
-		assert.equal(row[paneWidth - 1], "│", `the right border column runs down body row ${offset}`);
+		assert.equal(row[0], "│", `the left border column runs down preview row ${offset}`);
+		assert.equal(row[paneWidth - 1], "│", `the right border column runs down preview row ${offset}`);
 	}
+	assert.equal(previewPane(lines, 0), " ".repeat(paneWidth), "the search row's right column is blank filler, never a box cell");
 
 	// Every border cell paints in the theme's border tone.
 	const dashes = interiorWidth - 1 - "1/2".length;
-	const rawTop = rawPreviewPane(lines, 0);
+	const rawTop = rawPreviewPane(lines, boxTop);
 	assert.ok(rawTop.includes(`${BORDER_TONE}╭`), "the top-left corner starts a border-tone run");
 	assert.ok(rawTop.includes(`${BORDER_TONE}${"─".repeat(dashes)}`), "the top border's dashes are one border-tone run of the interior the indicator leaves");
 	assert.ok(rawTop.includes(` ${LABEL_ROLE}1/2${ROLE_END}`), "the embedded indicator paints in the muted role inside the border");
 	assert.ok(rawTop.includes(`${BORDER_TONE}╮`), "the top-right corner is a border cell too");
 	assert.ok(!rawTop.includes(`${LABEL_ROLE}╭`) && !rawTop.includes(`${LABEL_ROLE}╮`), "no corner takes the label tone");
-	const rawBottom = rawPreviewPane(lines, bodyRows - 1);
+	const rawBottom = rawPreviewPane(lines, boxBottom);
 	assert.ok(rawBottom.includes(`${BORDER_TONE}╰`), "the bottom-left corner is a border cell");
 	assert.ok(rawBottom.includes(`${BORDER_TONE}${"─".repeat(interiorWidth)}`), "the bottom border is one continuous border-tone run");
 	assert.ok(rawBottom.includes(`${BORDER_TONE}╯`), "the bottom-right corner is a border cell");
-	assert.equal(rawPreviewPane(lines, 1).split(`${BORDER_TONE}│`).length - 1, 2, "both border columns of a content row paint in the border tone");
+	assert.equal(rawPreviewPane(lines, boxTop + 1).split(`${BORDER_TONE}│`).length - 1, 2, "both border columns of a content row paint in the border tone");
 
 	// The position moved out of the content and into the top border's right end.
 	assert.equal(positionCell(lines), "1/2", "the position sits in the top border");
@@ -1097,7 +1235,7 @@ test("the preview sits in its own rounded box in the border tone, with the posit
 	assert.equal(previewCell(lines, 0).slice(2, 7), "alpha", "the text starts two cells in: the gutter, then its gap");
 	assert.equal(previewCell(lines, 1).slice(2, 6), "beta");
 	for (const offset of [0, 1]) {
-		const row = previewPane(lines, offset + 1);
+		const row = previewPane(lines, offset + boxTop + 1);
 		assert.ok(row.startsWith("│") && row.endsWith("│"), "every content row is framed by the box's border columns");
 		assert.ok(!row.includes("╭") && !row.includes("╮"), "only the top border carries corners");
 	}
@@ -1172,34 +1310,30 @@ test("a click on the box's border or inside it is absorbed, and the wheel inside
 	assert.notEqual(view.handleMouse(mouse(scrolled, paneStart + 3, BODY_TOP + 2, "move", "none"))?.render, true, "hovering inside the box never lights a list row");
 });
 
-test("a body too short for the box plus one content row paints the unbordered preview it painted before", async () => {
-	const { view } = await openView({ rows: 9, loadPreview: async () => preview(["alpha", "beta"]) });
-	const lines = view.render(120);
-	assert.equal(lines.length, 9, "the smallest card fills the rows it is given");
-	assert.equal(lines.length - 7, 2, "the smallest card has two body rows");
-	assert.equal(previewPaintsBox(lines), false, "no box when the body cannot hold one plus a content row");
-	for (let offset = 0; offset < 2; offset += 1) {
-		for (const glyph of ["╭", "╮", "╰", "╯", "─"]) {
-			assert.ok(!previewPane(lines, offset).includes(glyph), `no box glyph is painted on body row ${offset}`);
+test("a preview pane too narrow for the box paints the unbordered fallback on the same spanned height", async () => {
+	// The box needs one cell between its two border columns, so a card narrow
+	// enough to leave the preview pane two cells keeps today's unbordered preview
+	// instead of squeezing the content (S38). The box no longer depends on the
+	// body's height: it spans the search, info, body and rule rows (S47).
+	const { view } = await openView({ rows: 20, loadPreview: async () => preview(["alpha", "beta"]) });
+	const lines = view.render(13);
+	const bodyRows = bodyRowsOf(lines);
+	assert.equal(bodyRows, 10, "the card keeps its ten body rows");
+	assert.equal(previewPaintsBox(lines), false, "no box when the pane cannot hold its border columns and one cell");
+	for (let offset = 0; offset < bodyRows + 3; offset += 1) {
+		for (const glyph of ["╭", "╮", "╰", "╯"]) {
+			assert.ok(!previewPane(lines, offset).includes(glyph), `no box glyph is painted on preview row ${offset}`);
 		}
 	}
-	// Exactly the shape the pane painted before the box existed: the position row
-	// at the pane's right, then the content rows.
-	assert.equal(positionCell(lines), "1/2", "the position keeps its own row at the pane's right");
-	assert.match(previewPane(lines, 0), /^ +1\/2 *$/, "the indicator is right-aligned in the pane, not in a border");
-	assert.match(previewPane(lines, 1), /^1 alpha +$/, "the content row sits under the indicator");
-	assert.equal(previewRowCount(lines), 1, "the body still has one usable content row");
-	assert.match(selectedRow(lines), /README\.md/, "the list pane is untouched by the degradation");
-	for (const line of lines) assert.equal(visibleWidth(line), 120);
-
-	// One more body row and the box fits, with exactly one content row inside it.
-	const tight = await openView({ rows: 12, loadPreview: async () => preview(["alpha", "beta"]) });
-	const tightLines = tight.view.render(120);
-	assert.equal(tightLines.length, 10);
-	assert.equal(previewPaintsBox(tightLines), true, "the box paints as soon as the body can hold it plus one content row");
-	assert.equal(previewRowCount(tightLines), 1, "the box leaves exactly one content row at the smallest boxed height");
-	assert.equal(previewCell(tightLines, 0).trim(), "1 alpha");
-	assert.equal(positionCell(tightLines), "1/2", "the indicator is in the top border at the smallest boxed height");
+	// The shape the pane painted before the box existed: the position indicator
+	// on its own row at the pane's right, then the content rows under it — now
+	// using the whole span the box would have taken.
+	assert.match(previewPane(lines, 0), /^ +$/, "the search row keeps no preview cell at all");
+	assert.match(previewPane(lines, 1), /^1…$/, "the position keeps a row of its own at the pane's right, beside the info row");
+	assert.match(previewPane(lines, 2), /^1 /, "the first content row sits under the indicator, beside the first list row");
+	assert.equal(previewRowCount(lines), bodyRows, "the unbordered preview fills the same rows, less the single position row");
+	assert.match(selectedRow(lines), /▸/, "the list pane keeps its highlighted row");
+	for (const line of lines) assert.equal(visibleWidth(line), 13);
 });
 
 test("the preview's notices paint inside the box when there is one", async () => {
@@ -1208,7 +1342,7 @@ test("the preview's notices paint inside the box when there is one", async () =>
 	assert.equal(previewPaintsBox(binaryLines), true);
 	assert.equal(previewCell(binaryLines, 0).trim(), FILE_PREVIEW_BINARY_NOTICE, "the binary notice paints inside the box");
 	assert.equal(positionCell(binaryLines), "", "a file with no lines shows no position in the top border");
-	assert.match(previewPane(binaryLines, 0), /^╭─+╮$/, "the top border is a whole frame with no indicator");
+	assert.match(previewPane(binaryLines, BOX_TOP_ROW - PREVIEW_TOP), /^╭─+╮$/, "the top border is a whole frame with no indicator");
 
 	const truncated = await openView({ loadPreview: async () => preview(["one", "two"], true) });
 	const truncatedLines = truncated.view.render(120);
@@ -1255,7 +1389,7 @@ test("ctrl+home and ctrl+end jump the preview to its first line and its last pag
 	for (const sequence of CTRL_END_SEQUENCES) {
 		view.handleInput(sequence);
 		const lines = view.render(120);
-		assert.match(positionCell(lines), /^57\/60$/, `ctrl+end shows the last page for ${JSON.stringify(sequence)}`);
+		assert.match(positionCell(lines), /^56\/60$/, `ctrl+end shows the last page for ${JSON.stringify(sequence)}`);
 		assert.match(previewCell(lines, previewRowCount(lines) - 1), /60 line 59/, "the end of the file is on screen");
 		view.handleInput(CTRL_HOME_SEQUENCES[0]!);
 	}
@@ -1327,6 +1461,8 @@ test("a preview line wider than the box's interior wraps onto continuation rows 
 	assert.equal(reassembled, wide, "the whole line is painted across the rows");
 	assert.match(nextRow, /^ *3 second/, "the following file line keeps its own number");
 
+	// Six painted rows against five content rows, so a clamped scroll really stops
+	// inside the wrapped line rather than at its start.
 	const scrolledView = await openView({ rows: 16, loadPreview: async () => preview(["first", wide, "second"]) });
 	for (let index = 0; index < 5; index += 1) scrolledView.view.handleInput(CTRL_SHIFT_J);
 	const scrolled = scrolledView.view.render(120);
@@ -1397,6 +1533,11 @@ test("a box interior narrower than a double-width grapheme paints it on its own 
 // the already-ANSI lines Pi's own highlighter returns and assert the pane the
 // way the terminal receives it.
 const CODE_TONE = "\x1b[36m";
+
+/** A painted sequence escaped for a regular expression. */
+function roleRuns(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 const CODE_RESET = "\x1b[39m";
 const DIM_TONE = "\x1b[2m";
 const MUTED_TONE = "\x1b[90m";
@@ -1423,8 +1564,11 @@ test("the preview paints the file's syntax through the injected highlighter and 
 	}, [entry("src/app.ts")]);
 	const lines = view.render(120);
 	assert.deepEqual(highlighted, [{ code: "const answer = 42;\n// done", lang: "typescript" }], "the already-bounded preview is highlighted with the language of the previewed path");
-	assert.equal(rawPreviewCell(lines, 0).trimEnd(), `${DIM_TONE}1${ROLE_END} ${CODE_TONE}const${CODE_RESET} answer = 42;${CELL_RESET}`, "the file line keeps the highlighter's colour and its number keeps the dim tone");
-	assert.equal(rawPreviewCell(lines, 1).trimEnd(), `${DIM_TONE}2${ROLE_END} ${CODE_TONE}// done${CODE_RESET}${CELL_RESET}`, "the gutter is painted after highlighting, never through it");
+	// The painted cells end exactly where the dim gutter and the highlighted line
+	// do; slicing the row's list column can leave empty role runs in front, which
+	// paint nothing.
+	assert.match(rawPreviewCell(lines, 0).trimEnd(), new RegExp(`${roleRuns(`${DIM_TONE}1${ROLE_END} ${CODE_TONE}const${CODE_RESET} answer = 42;${CELL_RESET}`)}$`), "the file line keeps the highlighter's colour and its number keeps the dim tone");
+	assert.match(rawPreviewCell(lines, 1).trimEnd(), new RegExp(`${roleRuns(`${DIM_TONE}2${ROLE_END} ${CODE_TONE}// done${CODE_RESET}${CELL_RESET}`)}$`), "the gutter is painted after highlighting, never through it");
 	assert.match(previewCell(lines, 0), /^1 const answer = 42; *$/, "the painted text is the file's own text");
 	assert.match(positionCell(lines), /^1\/2\+$/, "the position indicator still counts the file's lines");
 	assert.equal(previewCell(lines, 2).trim(), "… preview truncated.", "the truncation notice is a notice, not highlighted code");
@@ -1506,6 +1650,33 @@ test("an error preview renders its message", async () => {
 	assert.ok(bodyText(view.render(120)).includes("Cannot read src/app.ts (EACCES)."));
 });
 
+test("the Tab bar of a marked row always carries a theme role, focused or not, with or without a background", async () => {
+	const ACCENT_TONE = "\x1b[35m";
+	const roleTheme = (withBackground: boolean): FilePickerTheme => ({
+		fg(color: string, text: string) {
+			if (color === "accent") return `${ACCENT_TONE}${text}${ROLE_END}`;
+			if (color === "muted") return `${LABEL_ROLE}${text}${ROLE_END}`;
+			return text;
+		},
+		...(withBackground ? { bg: (_color: string, text: string) => `\x1b[44m${text}\x1b[49m` } : {}),
+	});
+	// The four states a marked row is painted in: focused or not, inside a theme
+	// that highlights the focused row with a background or one that does not.
+	for (const withBackground of [false, true]) {
+		for (const focused of [true, false]) {
+			const { view } = await openView({ theme: roleTheme(withBackground) }, [entry("a.ts"), entry("b.ts")]);
+			view.handleInput(TAB);
+			if (!focused) view.handleInput("\x1b[B");
+			const lines = view.render(120);
+			const row = rawListCell(lines, "a.ts");
+			const where = `${focused ? "focused" : "idle"}, ${withBackground ? "with" : "without"} a background`;
+			assert.ok(stripAnsi(row).includes(SELECTION_BAR), `the marked row paints its bar: ${where}`);
+			assert.ok(row.includes(`${ACCENT_TONE}${SELECTION_BAR}${ROLE_END}`), `the bar cell carries the accent role: ${where}`);
+			assert.equal(labelColumn(lines, "a.ts"), MARKER_COLUMN, `the marker column keeps its width: ${where}`);
+		}
+	}
+});
+
 test("a theme with a background paints the selected row as a full-width bar", async () => {
 	const bgTheme: FilePickerTheme = {
 		fg(_color, text) {
@@ -1517,11 +1688,11 @@ test("a theme with a background paints the selected row as a full-width bar", as
 	};
 	const { view } = await openView({ theme: bgTheme });
 	const lines = view.render(120);
-	const row = lines[rowOf(lines, "README.md")]!;
+	const row = lines[listRowOf(lines, "README.md")]!;
 	assert.match(row, /\x1b\[44m/, "the selected row uses the selected background");
 	assert.doesNotMatch(row, /▸/, "a full-width bar replaces the marker");
 	view.handleInput(TAB);
-	assert.match(view.render(120)[rowOf(lines, "README.md")]!, new RegExp(SELECTION_BAR), "a marked row keeps its bar inside the highlight");
+	assert.match(view.render(120)[listRowOf(lines, "README.md")]!, new RegExp(SELECTION_BAR), "a marked row keeps its bar inside the highlight");
 	for (const line of lines) assert.equal(visibleWidth(line), 120);
 });
 
@@ -1602,13 +1773,13 @@ const EXT_FILES = [entry("zeta.ts"), entry("alpha.md"), entry("beta.ts"), entry(
 
 test("the info row names the active order and ctrl+o cycles modified, path, ext and back to modified", async () => {
 	const { view, calls } = await openView({}, [entry("b.ts"), entry("a.md")]);
-	assert.equal(countCell(view.render(120)), "2 files (0 selected) · modified", "modified is the default order");
+	assert.match(infoCell(view.render(120)), /^2\/2 \(0\) ─+ modified$/, "modified is the default order");
 	view.handleInput(CTRL_O);
-	assert.equal(countCell(view.render(120)), "2 files (0 selected) · path");
+	assert.match(infoCell(view.render(120)), /^2\/2 \(0\) ─+ tree$/, "the folder order is named tree (S45)");
 	view.handleInput(CTRL_O);
-	assert.equal(countCell(view.render(120)), "2 files (0 selected) · ext");
+	assert.match(infoCell(view.render(120)), /^2\/2 \(0\) ─+ ext$/);
 	view.handleInput(CTRL_O);
-	assert.equal(countCell(view.render(120)), "2 files (0 selected) · modified", "the third press returns to modified");
+	assert.match(infoCell(view.render(120)), /^2\/2 \(0\) ─+ modified$/, "the third press returns to modified");
 	assert.deepEqual(calls.insert, [], "cycling never inserts");
 	assert.deepEqual(calls.open, []);
 	assert.equal(calls.close, 0, "cycling never closes the panel");
@@ -1619,14 +1790,14 @@ test("the default modified order keeps the listing order, and only ctrl+o re-sor
 	const { view } = await openView({}, list);
 	const lines = view.render(120);
 	assert.deepEqual(paintedList(lines, ["a-clean.ts", "m-older.ts", "z-newest.ts"]), ["z-newest.ts", "m-older.ts", "a-clean.ts"], "the listing's changed-first, newest-first order is painted");
-	assert.equal(countCell(lines), "3 files (0 selected) · modified");
+	assert.match(infoCell(lines), /^3\/3 \(0\) ─+ modified$/);
 });
 
-test("the path order keeps every file of a folder and its subfolders together, like an IDE explorer, and still paints the badge", async () => {
+test("the tree order keeps every file of a folder and its subfolders together, like an IDE explorer, and still paints the badge", async () => {
 	const { view } = await openView({ rows: 40 }, TREE_FILES);
 	view.handleInput(CTRL_O);
 	const lines = view.render(120);
-	assert.equal(countCell(lines), "10 files (0 selected) · path");
+	assert.match(infoCell(lines), /^10\/10 \(0\) ─+ tree$/);
 	const painted = paintedList(lines, TREE_BASENAMES);
 	assert.deepEqual(painted, PATH_ORDER, "every file of a folder and of its subfolders paints together, and the root's own files paint last");
 	assert.match(listCell(lines, "app.ts"), /app\.ts +U 1m/, "a changed row keeps its letter and age");
@@ -1639,7 +1810,7 @@ test("the ext order groups every file by extension, alphabetical by extension an
 	view.handleInput(CTRL_O);
 	view.handleInput(CTRL_O);
 	const lines = view.render(120);
-	assert.equal(countCell(lines), "6 files (0 selected) · ext");
+	assert.match(infoCell(lines), /^6\/6 \(0\) ─+ ext$/);
 	assert.deepEqual(paintedList(lines, EXT_BASENAMES), ["alpha.md", "gamma.md", "beta.ts", "zeta.ts", "LICENSE", "Makefile"], "grouped by extension, then by path, with the extensionless files last");
 	assert.deepEqual(listTree(lines).filter((row) => row.depth === 0), [
 		{ depth: 0, label: ".md" },
@@ -1682,7 +1853,7 @@ test("a query filter applies to a non-default order and the info row names that 
 	view.handleInput(CTRL_O);
 	for (const character of "util") view.handleInput(character);
 	const lines = view.render(120);
-	assert.equal(countCell(lines), "1 file (0 selected) · ext");
+	assert.match(infoCell(lines), /^1\/10 \(0\) ─+ ext$/, "the listed count is what the query lists out of the whole listing (S43)");
 	assert.match(selectedRow(lines), /util\.ts/, "the filter still chooses the row, in the active order");
 	assert.deepEqual(paintedList(lines, TREE_BASENAMES), ["util.ts"], "the query hides every other row in this order too");
 });
@@ -1692,7 +1863,7 @@ test("a query filter applies to a non-default order and the info row names that 
 // focused group, and a query forces every group open. `modified` stays a flat
 // file list, exactly as it painted before.
 
-test("the path order paints the tree: each folder's subfolders before its own files, the repository's own files last", async () => {
+test("the tree order paints the tree: each folder's subfolders before its own files, the repository's own files last", async () => {
 	const { view } = await openView({ rows: 40 }, TREE_FILES);
 	view.handleInput(CTRL_O);
 	const lines = view.render(120);
@@ -1716,11 +1887,11 @@ test("the path order paints the tree: each folder's subfolders before its own fi
 		{ depth: 0, label: ".gitignore" },
 		{ depth: 0, label: "AGENTS.md" },
 	], "inside every folder its subfolders come first and then its own files, so the root's own files paint last");
-	assert.equal(countCell(lines), "10 files (0 selected) · path", "the info row counts files, never the group rows");
+	assert.match(infoCell(lines), /^10\/10 \(0\) ─+ tree$/, "the info row counts files, never the group rows");
 	for (const line of lines) assert.equal(visibleWidth(line), 120);
 });
 
-test("every group starts expanded, and space folds the focused group in place, keeping the highlight on its row", async () => {
+test("space folds the group that owns the focused file and leaves the cursor on a file row", async () => {
 	const { view, calls } = await openView({ rows: 40 }, TREE_FILES);
 	view.handleInput(CTRL_O);
 	let lines = view.render(120);
@@ -1728,37 +1899,16 @@ test("every group starts expanded, and space folds the focused group in place, k
 	assert.match(footerText(lines), /space fold/, "the footer names the fold key");
 	view.handleInput(HOME_SEQUENCES[0]!);
 	lines = view.render(120);
-	assert.deepEqual(listTree(lines)[0], { depth: 0, label: ".github" }, "home lands on the first painted row, a group");
+	assert.match(selectedRow(lines), /bug\.md/, "home lands on the first file row, never on a group row");
 	view.handleInput(SPACE);
 	lines = view.render(120);
-	assert.deepEqual(listTree(lines), [
-		{ depth: 0, label: ".github" },
-		{ depth: 0, label: "bin" },
-		{ depth: 1, label: "cli.ts" },
-		{ depth: 0, label: "docs" },
-		{ depth: 1, label: "api" },
-		{ depth: 2, label: "reference.md" },
-		{ depth: 1, label: "guide.md" },
-		{ depth: 0, label: "src" },
-		{ depth: 1, label: "lib" },
-		{ depth: 2, label: "util.ts" },
-		{ depth: 1, label: "app.ts" },
-		{ depth: 0, label: ".gitignore" },
-		{ depth: 0, label: "AGENTS.md" },
-	], "the folded group's files disappear and its own row stays");
-	assert.match(selectedRow(lines), /\.github/, "toggling a group keeps the highlight on that group row");
-	assert.equal(countCell(lines), "10 files (0 selected) · path", "a fold hides rows but never recounts the files");
-	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › Search +│$/, "space never becomes query text");
+	assert.deepEqual(listTree(lines)[0], { depth: 0, label: ".github" }, "the group rows stay painted");
+	assert.ok(!listTree(lines).some((row) => row.label === "bug.md"), "the folded group's files disappear");
+	assert.match(selectedRow(lines), /ci\.yml/, "the cursor follows the rows and lands on the file row that took the fold's place");
+	assert.match(infoCell(lines), /^10\/10 \(0\) ─+ tree$/, "a fold hides rows but never recounts the files");
+	assert.match(searchCell(lines), /^› Search$/, "space never becomes query text");
 	assert.deepEqual(calls.insert, [], "space never inserts");
 	assert.equal(calls.close, 0, "space never closes the panel");
-	view.handleInput(SPACE);
-	assert.equal(listTree(view.render(120)).length, 18, "space again unfolds the group");
-	view.handleInput("\r");
-	lines = view.render(120);
-	assert.equal(listTree(lines).length, 13, "enter on a group row folds it too, matching /changes");
-	assert.match(selectedRow(lines), /\.github/, "and keeps the highlight there");
-	assert.deepEqual(calls.insert, [], "a group row never inserts");
-	assert.equal(calls.close, 0, "a group row never closes the panel");
 
 	// The fold state is kept per order: another order starts expanded, and coming
 	// back to this one restores the fold the user set here.
@@ -1766,7 +1916,72 @@ test("every group starts expanded, and space folds the focused group in place, k
 	assert.equal(listTree(view.render(120)).filter((row) => row.depth === 1).length, 10, "the ext order starts with every group expanded");
 	view.handleInput(CTRL_O);
 	view.handleInput(CTRL_O);
-	assert.equal(listTree(view.render(120)).length, 13, "coming back to path keeps the fold this order had");
+	assert.equal(listTree(view.render(120)).length, 17, "coming back to tree keeps the fold this order had");
+});
+
+test("the one exception to S46: with every group folded the cursor rests on a group row and space reopens the tree", async () => {
+	// No file row is painted once every group is folded, so the group rows are the
+	// only way back into the tree. That is the single state where the cursor may
+	// rest on a group row, and the next space unfolds it (S46).
+	const { view, calls } = await openView({ rows: 20 }, [entry("a.md"), entry("b.ts")]);
+	view.handleInput(CTRL_O);
+	view.handleInput(CTRL_O);
+	view.handleInput(HOME_SEQUENCES[0]!);
+	assert.match(selectedRow(view.render(120)), /a\.md/, "the cursor starts on the first file row");
+	view.handleInput(SPACE);
+	view.handleInput(SPACE);
+	let lines = view.render(120);
+	assert.deepEqual(listTree(lines), [{ depth: 0, label: ".md" }, { depth: 0, label: ".ts" }], "both groups are folded, so the list holds no file row at all");
+	assert.match(selectedRow(lines), /\.ts/, "the cursor rests on the group row that owns the last file");
+	assert.match(infoCell(lines), /^2\/2 \(0\) ─+ ext$/, "the counts still report every file");
+	assert.deepEqual(calls.insert, [], "a folded tree never inserts");
+	assert.equal(calls.close, 0);
+
+	view.handleInput(SPACE);
+	lines = view.render(120);
+	assert.match(selectedRow(lines), /b\.ts/, "space on that group row unfolds it and the cursor lands on its first file");
+	assert.deepEqual(listTree(lines), [{ depth: 0, label: ".md" }, { depth: 0, label: ".ts" }, { depth: 1, label: "b.ts" }]);
+	assert.deepEqual(calls.insert, []);
+	assert.equal(calls.close, 0);
+});
+
+test("arrows, home/end, the wheel and a query never leave the cursor on a group row in tree or ext", async () => {
+	const names = TREE_BASENAMES;
+	const onFileRow = (lines: readonly string[]): boolean => {
+		const cell = (stripAnsi(selectedRow(lines)).split(" │ ")[0] ?? "").replace(/^│ /, "");
+		return names.some((name) => cell.includes(name));
+	};
+
+	for (const presses of [1, 2] as const) {
+		const { view } = await openView({ rows: 40 }, TREE_FILES);
+		for (let index = 0; index < presses; index += 1) view.handleInput(CTRL_O);
+		const order = presses === 1 ? "tree" : "ext";
+		assert.match(infoCell(view.render(120)), new RegExp(`─+ ${order}$`));
+		assert.ok(onFileRow(view.render(120)), "the first painted row of a tree can hold the cursor");
+		view.handleInput(HOME_SEQUENCES[0]!);
+		assert.ok(onFileRow(view.render(120)), `${order}: home lands on a file row`);
+		for (let step = 0; step < 24; step += 1) {
+			view.handleInput("\x1b[B");
+			assert.ok(onFileRow(view.render(120)), `${order}: every step down lands on a file row`);
+		}
+		for (let step = 0; step < 24; step += 1) {
+			view.handleInput("\x1b[A");
+			assert.ok(onFileRow(view.render(120)), `${order}: every step up lands on a file row`);
+		}
+		view.handleInput(END_SEQUENCES[0]!);
+		assert.ok(onFileRow(view.render(120)), `${order}: end lands on the last file row, never on a group row`);
+		view.handleInput(HOME_SEQUENCES[0]!);
+		let lines = view.render(120);
+		assert.deepEqual(view.handleMouse(mouse(lines, 4, BODY_TOP, "wheel", "none", 1)), { handled: true, render: true });
+		lines = view.render(120);
+		assert.ok(onFileRow(lines), `${order}: the wheel lands on a file row`);
+		for (const character of names[0]!.slice(0, 2)) view.handleInput(character);
+		lines = view.render(120);
+		assert.ok(onFileRow(lines), `${order}: typing lands on the first matching file row`);
+		view.handleInput("\x15");
+		assert.ok(onFileRow(view.render(120)), `${order}: clearing the query keeps the cursor on a file row`);
+		await settle();
+	}
 });
 
 test("space is never query text, so it no longer throws the highlight back to the first row", async () => {
@@ -1776,13 +1991,13 @@ test("space is never query text, so it no longer throws the highlight back to th
 	view.handleInput(SPACE);
 	let lines = view.render(120);
 	assert.match(selectedRow(lines), /b\.ts/, "space leaves the highlight where it is on a flat list");
-	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › Search +│$/, "space never reaches the search row");
-	assert.equal(countCell(lines), "3 files (0 selected) · modified");
+	assert.equal(searchCell(lines), "› Search", "space never reaches the search row");
+	assert.match(infoCell(lines), /^3\/3 \(0\) ─+ modified$/);
 	for (const character of "sp") view.handleInput(character);
-	assert.match(stripAnsi(view.render(120)[SEARCH_ROW]!), /^│ › sp +│$/, "typing still reaches the query");
+	assert.equal(searchCell(view.render(120)), "› sp", "typing still reaches the query");
 	view.handleInput(SPACE);
 	lines = view.render(120);
-	assert.match(stripAnsi(lines[SEARCH_ROW]!), /^│ › sp +│$/, "space is appended to no query, ever");
+	assert.equal(searchCell(lines), "› sp", "space is appended to no query, ever");
 	assert.ok(bodyText(lines).includes('No files match "sp"'), "the query is still exactly what was typed");
 	assert.deepEqual(calls.insert, [], "space never inserts");
 	assert.equal(calls.close, 0);
@@ -1792,10 +2007,14 @@ test("a non-empty query forces every group open, and the fold keys do nothing un
 	const { view, calls } = await openView({ rows: 40 }, TREE_FILES);
 	view.handleInput(CTRL_O);
 	view.handleInput(HOME_SEQUENCES[0]!);
-	view.handleInput(SPACE);
-	assert.equal(listTree(view.render(120)).length, 13, "the group is folded before the query");
-	for (const character of "bug") view.handleInput(character);
 	let lines = view.render(120);
+	// A click on a group row folds it, which is how the tree folds without a
+	// focusable group row (S46).
+	view.handleMouse(mouse(lines, 4, listRowOf(lines, ".github")));
+	lines = view.render(120);
+	assert.equal(listTree(lines).length, 13, "the group and its whole subtree are folded before the query");
+	for (const character of "bug") view.handleInput(character);
+	lines = view.render(120);
 	assert.deepEqual(listTree(lines), [
 		{ depth: 0, label: ".github" },
 		{ depth: 1, label: "ISSUE_TEMPLATE" },
@@ -1803,11 +2022,11 @@ test("a non-empty query forces every group open, and the fold keys do nothing un
 	], "a query forces the folded group open, so its match is never hidden");
 	assert.match(selectedRow(lines), /bug\.md/, "the highlight lands on the first match, never on a group row");
 	view.handleInput(HOME_SEQUENCES[0]!);
-	assert.match(selectedRow(view.render(120)), /\.github/);
+	assert.match(selectedRow(view.render(120)), /bug\.md/, "home still lands on a file row while the query holds the groups open");
 	view.handleInput(SPACE);
 	lines = view.render(120);
 	assert.equal(listTree(lines).length, 3, "the fold keys do nothing while a query holds the groups open");
-	assert.match(selectedRow(lines), /\.github/, "and nothing moves either");
+	assert.match(selectedRow(lines), /bug\.md/, "and nothing moves either");
 	view.handleInput("\x15");
 	lines = view.render(120);
 	assert.equal(listTree(lines).length, 13, "clearing the query restores the fold the user set");
@@ -1815,28 +2034,35 @@ test("a non-empty query forces every group open, and the fold keys do nothing un
 	assert.equal(calls.close, 0);
 });
 
-test("enter on a file row still inserts and closes, while tab and ctrl+e do nothing on a group row", async () => {
-	const { view, calls } = await openView({ rows: 40 }, TREE_FILES);
+test("a group row never marks, opens or inserts, and enter on a file row still inserts and closes", async () => {
+	// The only state where a group row takes the cursor is the all-folded tree
+	// (S46), so that is where tab and ctrl+e are proven to do nothing on one.
+	const { view, calls } = await openView({ rows: 20 }, [entry("a.md"), entry("b.ts")]);
+	view.handleInput(CTRL_O);
 	view.handleInput(CTRL_O);
 	view.handleInput(HOME_SEQUENCES[0]!);
-	view.handleInput(TAB);
+	view.handleInput(SPACE);
+	view.handleInput(SPACE);
 	let lines = view.render(120);
-	assert.equal(countCell(lines), "10 files (0 selected) · path", "tab marks no group row");
+	assert.match(selectedRow(lines), /\.ts/, "the cursor rests on a group row while every group is folded");
+	view.handleInput(TAB);
+	lines = view.render(120);
+	assert.match(infoCell(lines), /^2\/2 \(0\) ─+ ext$/, "tab marks no group row");
 	view.handleInput("\x05");
 	lines = view.render(120);
 	assert.deepEqual(calls.open, [], "ctrl+e opens nothing on a group row");
 	assert.equal(calls.close, 0, "ctrl+e on a group row never closes the panel");
-	assert.match(selectedRow(lines), /\.github/, "and the highlight stays on the group");
-	view.handleInput("\x1b[B");
-	view.handleInput("\x1b[B");
-	lines = view.render(120);
-	assert.match(selectedRow(lines), /bug\.md/, "the arrows step onto a file row of the tree");
+	assert.match(selectedRow(lines), /\.ts/, "and the cursor stays on the group row");
 	view.handleInput("\r");
-	assert.deepEqual(calls.insert, [[".github/ISSUE_TEMPLATE/bug.md"]], "enter on a file row inserts that file");
+	lines = view.render(120);
+	assert.deepEqual(calls.insert, [], "enter on a group row toggles it instead of inserting");
+	assert.match(selectedRow(lines), /b\.ts/, "and the tree reopens on that group's first file");
+	view.handleInput("\r");
+	assert.deepEqual(calls.insert, [["b.ts"]], "enter on a file row inserts that file");
 	assert.equal(calls.close, 1, "and closes the panel once");
 });
 
-test("a group row paints only its name, and the path order paints no trailing directory", async () => {
+test("a group row paints only its name, and the tree order paints no trailing directory", async () => {
 	const { view } = await openView({ rows: 40 }, TREE_FILES);
 	view.handleInput(CTRL_O);
 	// The highlight sits on a group row, so no preview mentions a file name here.
@@ -1846,7 +2072,7 @@ test("a group row paints only its name, and the path order paints no trailing di
 	assert.equal(group.slice(MARKER_COLUMN).trimEnd(), ".github", "a group row paints its name at its depth and nothing else");
 	assert.doesNotMatch(group, /\b[UM]\b/, "a group row never paints a badge");
 	assert.doesNotMatch(group, /\d+[smhd]\b/, "a group row never paints an age");
-	assert.match(listCell(pathLines, "app.ts"), new RegExp(`^ {${MARKER_COLUMN + GROUP_INDENT}}app\\.ts +U 1m$`), "a file row in path order keeps the badge and the age");
+	assert.match(listCell(pathLines, "app.ts"), new RegExp(`^ {${MARKER_COLUMN + GROUP_INDENT}}app\\.ts +U 1m$`), "a file row in tree order keeps the badge and the age");
 	assert.doesNotMatch(listCell(pathLines, "app.ts"), /src/, "in path the tree already places the file in its folder, so no directory suffix");
 	assert.equal(listCell(pathLines, "guide.md").trimEnd(), " ".repeat(MARKER_COLUMN + GROUP_INDENT) + "guide.md", "a clean nested file paints its name alone");
 
@@ -1873,11 +2099,11 @@ test("the modified order stays a flat file list: changed files first, badge and 
 		{ depth: 0, label: "util.ts" },
 		{ depth: 0, label: "reference.md" },
 	], "the default order paints its flat listing untouched: every row is a depth-zero file row");
-	assert.equal(countCell(lines), "10 files (0 selected) · modified");
+	assert.match(infoCell(lines), /^10\/10 \(0\) ─+ modified$/);
 	assert.match(listCell(lines, "app.ts"), /app\.ts +src +U 1m$/, "the changed row keeps its badge, its age and its directory");
 });
 
-test("a click, the wheel and hover land on the row actually painted, group rows included", async () => {
+test("a click, the wheel and hover land on the row actually painted, and a group row is never focused", async () => {
 	// Only the hover role is tagged, so every painted cell keeps its width and
 	// the pointer geometry is the one the plain theme paints.
 	const hoverTheme: FilePickerTheme = {
@@ -1887,28 +2113,40 @@ test("a click, the wheel and hover land on the row actually painted, group rows 
 	};
 	const { view, calls } = await openView({ theme: hoverTheme, rows: 40 }, TREE_FILES);
 	view.handleInput(CTRL_O);
-	// A group row is the highlight, so the preview carries no file name and the
-	// list rows are the only place the searched label can appear.
 	view.handleInput(HOME_SEQUENCES[0]!);
 	let lines = view.render(120);
+	assert.match(selectedRow(lines), /bug\.md/, "the cursor starts on the first file row, not on the first group row");
+	const cursorRow = rowOf(lines, "▸");
+
+	// A click on a group row folds it: it never takes the cursor (S46).
 	const groupRow = listRowOf(lines, "docs");
 	assert.deepEqual(view.handleMouse(mouse(lines, 4, groupRow)), { handled: true, render: true }, "a click on a group row is a list click");
 	lines = view.render(120);
-	assert.equal(rowOf(lines, "▸"), groupRow, "the selection lands on the group row under the pointer");
-	assert.match(selectedRow(lines), /docs/);
+	assert.ok(!listTree(lines).some((row) => row.label === "guide.md" || row.label === "reference.md"), "the clicked group's files are hidden");
+	assert.equal(rowOf(lines, "▸"), cursorRow, "the cursor never moves onto the group row that was clicked");
+	assert.match(selectedRow(lines), /bug\.md/);
 	assert.deepEqual(calls.insert, [], "a group click never inserts");
 	assert.equal(calls.close, 0, "a group click never closes the panel");
+	view.handleMouse(mouse(lines, 4, listRowOf(lines, "docs")));
+	lines = view.render(120);
+	assert.ok(listTree(lines).some((row) => row.label === "guide.md"), "a second click unfolds it again");
 
 	const issueRow = listRowOf(lines, "ISSUE_TEMPLATE");
 	assert.equal(view.handleMouse(mouse(lines, 4, issueRow, "move", "none"))?.render, true);
 	lines = view.render(120);
-	assert.match(lines[issueRow]!, /<warning>/, "a group row takes the shared hover role");
+	assert.match(lines[issueRow]!, /<warning>/, "a group row still takes the shared hover role");
 
-	view.handleInput(HOME_SEQUENCES[0]!);
-	assert.match(selectedRow(view.render(120)), /\.github/);
+	// The wheel steps over the group rows and only ever lands on a file row.
+	for (let step = 0; step < 6; step += 1) {
+		lines = view.render(120);
+		assert.deepEqual(view.handleMouse(mouse(lines, 4, BODY_TOP, "wheel", "none", 1)), { handled: true, render: true });
+		await settle();
+		const painted = view.render(120);
+		const cell = (stripAnsi(selectedRow(painted)).split(" │ ")[0] ?? "").replace(/^│ /, "");
+		assert.ok(TREE_BASENAMES.some((name) => cell.includes(name)), "the wheel lands on a file row, never on a group row");
+	}
 	lines = view.render(120);
-	assert.deepEqual(view.handleMouse(mouse(lines, 4, listRowOf(lines, "bin"), "wheel", "none", 1)), { handled: true, render: true });
-	assert.match(selectedRow(view.render(120)), /ISSUE_TEMPLATE/, "the list wheel steps onto the group row painted below");
+	assert.match(selectedRow(lines), /\.(md|yml|ts)/, "the wheel only ever lands on a file row");
 
 	const fileRow = listRowOf(lines, "guide.md");
 	assert.deepEqual(view.handleMouse(mouse(lines, 4, fileRow)), { handled: true, render: true }, "a click on a file row of the tree selects that file");

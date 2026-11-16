@@ -28,7 +28,7 @@ export interface FilePickerDeps {
 	requestRender(): void;
 	/** Clock for the row ages, read once when the panel opens (S12). Defaults to Date.now. */
 	now?(): number;
-	/** The path this picker is listing, painted in the title's top-right corner. */
+	/** The path this picker is listing, painted next to the title (S42). */
 	root?: string;
 	/**
 	 * The library name of a previewed path (Pi's `getLanguageFromPath`, wired by
@@ -46,14 +46,17 @@ export interface FilePickerDeps {
 // The card fills the terminal like the Commands palette instead of a fixed
 // height (S22).
 const HEIGHT_RATIO = 0.85;
-// Two card borders plus the header, the search row, its blank separator row,
-// the count row and the footer.
+// Two card borders plus the header, the search row, the info row, the rule
+// that closes the body and the footer.
 const CHROME_ROWS = 7;
-// The smallest card that still paints the frame, header, search row, blank
-// row, count row, one body row and the footer.
+// The smallest card that still paints the frame, header, search row, info row,
+// one body row, the closing rule and the footer.
 const MIN_CARD_HEIGHT = CHROME_ROWS + 2;
-// The first painted row of the body: top border, header, search, blank, count.
-const BODY_TOP = 5;
+// The first painted row of the body — top border, header, search, info — and
+// the first row a list row or a click on it can land on (S47).
+const BODY_TOP = 4;
+// One two-space gap between the title and the listing path it names (S42).
+const TITLE_ROOT_GAP = 2;
 const MIN_WIDTH = CARD_PADDING + 4;
 // Below this the title row drops the listing path rather than eliding it to
 // nothing useful, so the title and the close hint stay legible.
@@ -72,7 +75,7 @@ const SEARCH_PLACEHOLDER = "Search";
 // One space between the preview's line-number gutter and its text.
 const PREVIEW_GUTTER_GAP = 1;
 // The preview's own rounded box (S38): its corners, its horizontal and vertical
-// border cells, the two border columns and the top and bottom border rows.
+// border cells and the two border columns they spend.
 const BOX_TOP_LEFT = "╭";
 const BOX_TOP_RIGHT = "╮";
 const BOX_BOTTOM_LEFT = "╰";
@@ -80,10 +83,11 @@ const BOX_BOTTOM_RIGHT = "╯";
 const BOX_HORIZONTAL = "─";
 const BOX_VERTICAL = "│";
 const BOX_COLUMNS = 2;
-const BOX_ROWS = 2;
-// The box paints only when the body can hold its two border rows plus one
-// usable content row, and when one cell is left between its border columns.
-const BOX_MIN_BODY_ROWS = BOX_ROWS + 1;
+// The box paints its top border on the info row above the list and its bottom
+// border on the list's last row, so the body has to hold the two border rows
+// plus one content row between them; a shorter body keeps the unbordered
+// preview (S47).
+const BOX_MIN_BODY_ROWS = 2;
 const BOX_MIN_WIDTH = BOX_COLUMNS + 1;
 const SEPARATOR_WIDTH = SEPARATOR.length;
 const LOADING_FILES = "Loading files …";
@@ -123,16 +127,15 @@ const DIRECTORY_TONE = "dim";
 
 /**
  * The listing orders ctrl+o cycles through (S29): `modified` is the listing's own
- * changed-first recency order, painted flat, while `path` and `ext` paint a
- * foldable tree — `path` a folder tree with group rows nested by path segment,
- * `ext` one level of extension groups (S35).
+ * changed-first recency order, painted flat, while `tree` and `ext` paint a
+ * foldable tree — `tree` a folder tree with group rows nested by path segment,
+ * `ext` one level of extension groups (S35). The folder order is named `tree`
+ * because that is the name the user reads (S45).
  */
-export type FilePickerOrder = "modified" | "path" | "ext";
-const ORDER_CYCLE: readonly FilePickerOrder[] = ["modified", "path", "ext"];
+export type FilePickerOrder = "modified" | "tree" | "ext";
+const ORDER_CYCLE: readonly FilePickerOrder[] = ["modified", "tree", "ext"];
 const DEFAULT_ORDER: FilePickerOrder = "modified";
-// Separates the counts from the active order in the info row (S29).
-const INFO_SEPARATOR = " · ";
-// The tree `path` and `ext` paint (S35): the indent one nesting level costs, and
+// The tree `tree` and `ext` paint (S35): the indent one nesting level costs, and
 // the name of the extensionless group, which always paints last.
 const GROUP_INDENT = 2;
 const EXTENSIONLESS_GROUP = "(none)";
@@ -140,7 +143,7 @@ const EXTENSIONLESS_GROUP = "(none)";
 type Tone = "border" | "accent" | "muted" | "dim" | "text" | "error";
 
 /**
- * One row the list paints (S35): a foldable group of the `path` or `ext` tree, or
+ * One row the list paints (S35): a foldable group of the `tree` or `ext` tree, or
  * a file. `depth` is the nesting level the row is indented at, and a group's
  * `key` is what the fold state remembers for the order painting it.
  */
@@ -204,12 +207,17 @@ interface PointerHit {
 interface PointerFrame {
 	width: number;
 	height: number;
+	/** The rows the list rows paint at; the first is `BODY_TOP`. */
 	bodyTop: number;
 	bodyRows: number;
 	listStart: number;
 	listEnd: number;
+	/** The columns the preview pane paints at. */
 	previewStart: number;
 	previewEnd: number;
+	/** The rows the preview pane spans: the info row through the list's last row. */
+	previewTop: number;
+	previewBottom: number;
 	hits: PointerHit[];
 }
 
@@ -223,13 +231,14 @@ function paneLayout(width: number, bodyRows: number): PaneLayout {
 	const listWidth = Math.max(1, Math.min(LIST_MAX_WIDTH, Math.floor(contentWidth * LIST_RATIO), maxList));
 	const previewStart = listWidth + SEPARATOR_WIDTH;
 	const previewWidth = Math.max(0, contentWidth - previewStart);
-	// Too short a body (or too narrow a pane) keeps today's unbordered preview
-	// instead of squeezing the content or painting half a frame (S38).
+	// The box frames the info row above the list and the list's last row, so its
+	// two border rows come out of the body plus that one row above it, and the
+	// search row above and the closing rule below belong to the card (S47).
 	const boxed = bodyRows >= BOX_MIN_BODY_ROWS && previewWidth >= BOX_MIN_WIDTH;
 	const previewInteriorWidth = boxed ? previewWidth - BOX_COLUMNS : previewWidth;
-	// The unboxed preview spends one row on the position indicator; the box moves
-	// that indicator into its top border and spends the row on the border itself.
-	const previewContentRows = Math.max(0, bodyRows - (boxed ? BOX_ROWS : 1));
+	// The unbordered fallback spends one row on the position indicator and keeps
+	// the rest for content, so it fills the same rows the box would (S38).
+	const previewContentRows = Math.max(0, boxed ? bodyRows - 1 : bodyRows);
 	return {
 		contentWidth,
 		listWidth,
@@ -371,20 +380,20 @@ export class FilePickerView {
 		// The list, the preview and the scroll math all read this one layout, so a
 		// click, the wheel and a clamp land on what is painted (S6, S38).
 		this.paintedLayout = layout;
-		// Title, search row, a blank row, the count row and then the list (S18).
-		const lines: string[] = [this.headerRow(layout.contentWidth), this.searchRow(layout.contentWidth), "", this.countRow(layout.contentWidth)];
 		const hits: PointerHit[] = [];
 		const state = this.emptyState();
-		if (state) {
-			lines.push(fit(this.renderText(state.text, state.tone), layout.contentWidth));
-			for (let index = 1; index < bodyRows; index += 1) lines.push("");
-		} else {
-			const left = this.listColumn(layout, bodyRows, hits);
-			const right = this.previewColumn(layout, bodyRows);
-			for (let index = 0; index < bodyRows; index += 1) {
-				lines.push(`${fit(left[index] ?? "", layout.listWidth)}${this.renderText(SEPARATOR, "border")}${fit(right[index] ?? "", layout.previewWidth)}`);
-			}
-		}
+		// The two columns are interleaved row by row instead of composed on their
+		// own (S47): the search row is the list column's alone, the info row carries
+		// the box's top border beside it, and one rule closes both below the body.
+		const left = state ? this.emptyColumn(layout, state, bodyRows) : this.listColumn(layout, bodyRows, hits);
+		const right = state ? [] : this.previewColumn(layout, bodyRows);
+		const separator = this.renderText(SEPARATOR, "border");
+		const paneRow = (list: string | undefined, preview: string | undefined): string => `${fit(list ?? "", layout.listWidth)}${separator}${fit(preview ?? "", layout.previewWidth)}`;
+		// Title, the search row the preview leaves to the list, the info row the box
+		// starts on, then the list rows against the preview's content rows.
+		const lines: string[] = [this.headerRow(layout.contentWidth), paneRow(this.searchRow(layout.listWidth), ""), paneRow(this.infoRow(layout.listWidth), right[0])];
+		for (let index = 0; index < bodyRows; index += 1) lines.push(paneRow(left[index], right[index + 1]));
+		lines.push(this.closingRuleRow(layout));
 		lines.push(this.footerRow(layout.contentWidth));
 		const frame = renderPaletteCard(lines, width, this.deps.theme);
 		this.pointerFrame = this.completed || this.disposed ? undefined : {
@@ -396,6 +405,10 @@ export class FilePickerView {
 			listEnd: 2 + layout.listWidth,
 			previewStart: 2 + layout.previewStart,
 			previewEnd: 2 + layout.contentWidth,
+			// The preview pane is the box itself: the info row above the list through
+			// the list's last row.
+			previewTop: BODY_TOP - 1,
+			previewBottom: BODY_TOP + bodyRows,
 			hits,
 		};
 		return frame;
@@ -439,11 +452,11 @@ export class FilePickerView {
 			return;
 		}
 		if (matchesKey(data, Key.home)) {
-			this.select(0);
+			this.select(this.focusableRows()[0] ?? 0);
 			return;
 		}
 		if (matchesKey(data, Key.end)) {
-			this.select(this.rows().length - 1);
+			this.select(this.focusableRows().at(-1) ?? 0);
 			return;
 		}
 		if (matchesKey(data, Key.down)) {
@@ -458,11 +471,11 @@ export class FilePickerView {
 			this.toggleSelection();
 			return;
 		}
-		// space folds the focused group row and is the one printable that never
-		// reaches the query, which is what used to reset the highlight to the
-		// first row (S5, S35).
+		// space folds the group that owns the focused file and is the one printable
+		// that never reaches the query, which is what used to reset the highlight
+		// to the first row (S5, S46).
 		if (matchesKey(data, Key.space)) {
-			this.toggleFold();
+			this.toggleFoldAt(this.selected);
 			return;
 		}
 		if (matchesKey(data, Key.ctrl("o"))) {
@@ -474,9 +487,11 @@ export class FilePickerView {
 			return;
 		}
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-			// Enter on a group row folds it, matching /changes; on a file row it
-			// still inserts and closes (S35).
-			if (this.selectedRow()?.kind === "group") this.toggleFold();
+			// A group row is never focusable, so the cursor is on a file row and
+			// Enter inserts and closes (S8, S46). The one exception is a tree with
+			// every group folded: no file row is painted then and the group row under
+			// the cursor is the way back into the tree, so Enter toggles it.
+			if (this.selectedRow()?.kind === "group") this.toggleFoldAt(this.selected);
 			else this.finish("insert");
 			return;
 		}
@@ -506,9 +521,8 @@ export class FilePickerView {
 			this.hovered = undefined;
 			return changed && moving ? { handled: true, render: true } : undefined;
 		}
-		const inBody = event.y >= frame.bodyTop && event.y < frame.bodyTop + frame.bodyRows;
-		const inList = inBody && event.x >= frame.listStart && event.x < frame.listEnd;
-		const inPreview = inBody && event.x >= frame.previewStart && event.x < frame.previewEnd;
+		const inList = event.y >= frame.bodyTop && event.y < frame.bodyTop + frame.bodyRows && event.x >= frame.listStart && event.x < frame.listEnd;
+		const inPreview = event.y >= frame.previewTop && event.y < frame.previewBottom && event.x >= frame.previewStart && event.x < frame.previewEnd;
 		const hit = inList ? frame.hits.find((candidate) => candidate.y === event.y) : undefined;
 		if (moving) {
 			const changed = this.hovered !== hit?.index;
@@ -526,6 +540,9 @@ export class FilePickerView {
 		if (!inList) return undefined;
 		if (event.type === "press") return { handled: true, render: false };
 		if (event.type !== "click" || !hit) return undefined;
+		// A group row folds or unfolds under the pointer instead of taking the
+		// cursor, because it is never focusable (S46).
+		if (this.rows()[hit.index]?.kind === "group") return { handled: true, render: this.toggleFoldAt(hit.index) };
 		return { handled: true, render: this.select(hit.index) };
 	}
 
@@ -555,12 +572,9 @@ export class FilePickerView {
 		return Math.max(0, this.cardHeight() - CHROME_ROWS);
 	}
 
-	/** Rows of preview content inside the frame the last render painted (S38). */
+	/** Rows of preview content inside the frame the last render painted (S38, S47). */
 	private previewRows(): number {
-		const painted = this.paintedLayout;
-		if (painted) return painted.previewContentRows;
-		// No frame has been painted yet: no box is claimed before the body is known.
-		return Math.max(0, this.bodyRowCount() - 1);
+		return this.painted().previewContentRows;
 	}
 
 	/**
@@ -585,6 +599,7 @@ export class FilePickerView {
 				this.listingError = undefined;
 			}
 			this.selected = 0;
+			this.clampCursor(0);
 			this.previewScroll = 0;
 			this.ensurePreviewLoaded();
 			this.deps.requestRender();
@@ -600,7 +615,7 @@ export class FilePickerView {
 	/**
 	 * The files the query matches, in the listing's own order (S29): changed
 	 * first, newest first (S12). A non-empty query ranks them instead, and the
-	 * `path` and `ext` trees re-sort their own rows below.
+	 * `tree` and `ext` trees re-sort their own rows below.
 	 */
 	private matches(): FileEntry[] {
 		if (!this.loaded || this.entries.length === 0) return [];
@@ -626,21 +641,21 @@ export class FilePickerView {
 	/**
 	 * The rows the list paints in the active order (S29, S35). `modified` is a flat
 	 * file list in the listing's own order and is never re-sorted or grouped here;
-	 * `path` and `ext` paint a tree of group rows and file rows.
+	 * `tree` and `ext` paint a tree of group rows and file rows.
 	 */
 	private rows(): ListRow[] {
 		const matched = this.matches();
 		if (this.order === "modified" || matched.length === 0) return matched.map((entry) => ({ kind: "file", entry, depth: 0 }));
-		return this.order === "path" ? this.pathRows(matched) : this.extensionRows(matched);
+		return this.order === "tree" ? this.treeRows(matched) : this.extensionRows(matched);
 	}
 
 	/**
-	 * The `path` tree: inside every folder its subfolders come first and then its
+	 * The `tree` order: inside every folder its subfolders come first and then its
 	 * own files, each alphabetical by name, so at the top level every folder group
 	 * paints before the files living at the repository root (S35). Every folder on
 	 * the way down gets a group row, even one holding no file of its own.
 	 */
-	private pathRows(entries: FileEntry[]): ListRow[] {
+	private treeRows(entries: FileEntry[]): ListRow[] {
 		const ownFiles = new Map<string, FileEntry[]>();
 		const subfolders = new Map<string, Set<string>>();
 		for (const entry of entries) {
@@ -725,7 +740,7 @@ export class FilePickerView {
 
 	/**
 	 * The first file row, so typing moves the highlight to a match and never to a
-	 * group row, which has no file to preview (S5, S35).
+	 * group row, which has no file to preview (S5, S46).
 	 */
 	private firstFileRow(): number {
 		const index = this.rows().findIndex((row) => row.kind === "file");
@@ -739,10 +754,59 @@ export class FilePickerView {
 		this.ensurePreviewLoaded();
 	}
 
+	/**
+	 * The rows the cursor may rest on (S46): file rows only, so every movement
+	 * steps over a group row. The exception is a tree whose groups are all folded:
+	 * no file row is painted then, and the group rows are the only way back into
+	 * the tree, so they take the cursor until one of them reopens.
+	 */
+	private focusableRows(): number[] {
+		const rows = this.rows();
+		const files: number[] = [];
+		for (let index = 0; index < rows.length; index += 1) {
+			if (rows[index]!.kind === "file") files.push(index);
+		}
+		return files.length > 0 ? files : rows.map((_row, index) => index);
+	}
+
+	/**
+	 * Put the cursor on a row it may rest on (S46), anchored at the row a change
+	 * happened on: the first file row at or after `anchor` takes the place the
+	 * hidden rows left, and when the fold hid the rest of the tree the nearest file
+	 * row above it does. With no file row left at all the cursor stays on the group
+	 * row, the one exception S46 allows.
+	 */
+	private clampCursor(anchor: number): void {
+		const rows = this.rows();
+		if (rows.length === 0) {
+			this.selected = 0;
+			return;
+		}
+		const start = Math.max(0, Math.min(rows.length - 1, anchor));
+		let next = -1;
+		for (let index = start; index < rows.length && next < 0; index += 1) {
+			if (rows[index]!.kind === "file") next = index;
+		}
+		for (let index = start - 1; index >= 0 && next < 0; index -= 1) {
+			if (rows[index]!.kind === "file") next = index;
+		}
+		this.selected = next >= 0 ? next : start;
+	}
+
 	private moveSelection(delta: number): boolean {
-		const total = this.rows().length;
-		if (total === 0) return false;
-		return this.select(Math.max(0, Math.min(total - 1, this.selected + delta)));
+		const focusable = this.focusableRows();
+		if (focusable.length === 0) return false;
+		const current = focusable.indexOf(this.selected);
+		if (current < 0) {
+			// The cursor sits on a row it may not rest on: land on the nearest row it
+			// may, in the direction of the movement.
+			const next = delta > 0
+				? focusable.find((index) => index > this.selected) ?? focusable[focusable.length - 1]!
+				: [...focusable].reverse().find((index) => index < this.selected) ?? focusable[0]!;
+			return this.select(next);
+		}
+		const position = Math.max(0, Math.min(focusable.length - 1, current + delta));
+		return this.select(focusable[position]!);
 	}
 
 	private select(index: number): boolean {
@@ -765,19 +829,49 @@ export class FilePickerView {
 	}
 
 	/**
-	 * space and Enter on a group row (S35): the group folds or unfolds and the
-	 * highlight stays on that group row. A file row, and a query that holds every
-	 * group open, has nothing to toggle.
+	 * space and a click on a group row (S46): fold or unfold the tree group at
+	 * `index` — the row itself when it is a group, and otherwise the group that
+	 * owns the focused file, which is its folder in `tree` and its extension group
+	 * in `ext`. A file at the repository root in `tree` has no group above it, and
+	 * a query that holds every group open has nothing to toggle.
 	 */
-	private toggleFold(): boolean {
-		const row = this.selectedRow();
-		if (!row || row.kind !== "group" || this.query.length > 0) return false;
+	private toggleFoldAt(index: number): boolean {
+		if (this.query.length > 0) return false;
+		const rows = this.rows();
+		if (rows.length === 0) return false;
+		const owner = this.owningGroup(rows, Math.max(0, Math.min(rows.length - 1, index)));
+		if (!owner) return false;
+		const focused = this.selectedPath();
 		const folded = this.foldedGroups(this.order);
-		if (folded.has(row.key)) folded.delete(row.key);
-		else folded.add(row.key);
-		const index = this.rows().findIndex((candidate) => candidate.kind === "group" && candidate.key === row.key);
-		if (index >= 0) this.selected = index;
+		if (folded.has(owner.key)) folded.delete(owner.key);
+		else folded.add(owner.key);
+		// A fold that hides the focused file moves the cursor to the row that took
+		// the hidden rows' place; a fold elsewhere in the tree leaves it on the same
+		// file, which the row indexes below have shifted (S46).
+		const kept = focused === undefined ? -1 : this.rows().findIndex((row) => row.kind === "file" && row.entry.path === focused);
+		if (kept >= 0) this.selected = kept;
+		else this.clampCursor(owner.index);
+		if (this.selectedPath() !== focused) {
+			this.previewScroll = 0;
+			this.ensurePreviewLoaded();
+		}
 		return true;
+	}
+
+	/**
+	 * The group a row folds it through: the row itself when it is a group, and
+	 * otherwise the nearest group row above it one nesting level up — the folder
+	 * that holds the file, or its extension group in `ext` (S46).
+	 */
+	private owningGroup(rows: ListRow[], index: number): { key: string; index: number } | undefined {
+		const row = rows[index];
+		if (!row) return undefined;
+		if (row.kind === "group") return { key: row.key, index };
+		for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+			const candidate = rows[cursor]!;
+			if (candidate.kind === "group" && candidate.depth === row.depth - 1) return { key: candidate.key, index: cursor };
+		}
+		return undefined;
 	}
 
 	/**
@@ -792,6 +886,9 @@ export class FilePickerView {
 		const rows = this.rows();
 		const moved = previous === undefined ? -1 : rows.findIndex((row) => row.kind === "file" && row.entry.path === previous);
 		this.selected = moved >= 0 ? moved : Math.max(0, Math.min(rows.length - 1, this.selected));
+		// The new order can paint a group row where the old one painted a file, so
+		// the cursor follows the rows and never the index (S46).
+		this.clampCursor(this.selected);
 		if (this.selectedPath() !== previous) this.previewScroll = 0;
 		this.ensurePreviewLoaded();
 		return true;
@@ -940,21 +1037,29 @@ export class FilePickerView {
 		return undefined;
 	}
 
+	/**
+	 * The title row: the listing path follows `File picker` after one two-space
+	 * gap, so the scope reads as the title's own context, and `esc` keeps the
+	 * far-right corner to itself (S42).
+	 */
 	private headerRow(width: number): string {
 		const title = this.renderText("File picker", "accent");
 		const close = this.renderText("esc", KEY_TONE);
 		const titleWidth = visibleWidth(stripAnsi(title));
 		const closeWidth = visibleWidth(stripAnsi(close));
-		const root = this.rootCell(width - titleWidth - closeWidth - 2);
+		// The path may take the room between the title's gap and the space that
+		// keeps `esc` in the corner; under the floor it is dropped, never elided to
+		// nothing useful (S42).
+		const root = this.rootCell(width - titleWidth - TITLE_ROOT_GAP - 1 - closeWidth);
 		if (root === undefined) {
 			const gap = Math.max(1, width - titleWidth - closeWidth);
 			return fit(`${title}${" ".repeat(gap)}${close}`, width);
 		}
-		const gap = Math.max(1, width - titleWidth - visibleWidth(stripAnsi(root)) - closeWidth - 1);
-		return fit(`${title}${" ".repeat(gap)}${root} ${close}`, width);
+		const gap = Math.max(1, width - titleWidth - TITLE_ROOT_GAP - visibleWidth(stripAnsi(root)) - closeWidth);
+		return fit(`${title}${" ".repeat(TITLE_ROOT_GAP)}${root}${" ".repeat(gap)}${close}`, width);
 	}
 
-	/** The listing path in the title's top-right; the title and `esc` win over it. */
+	/** The listing path next to the title, elided from its left; the title and `esc` win over it (S42). */
 	private rootCell(room: number): string | undefined {
 		if (this.deps.root === undefined || room < MIN_ROOT_WIDTH) return undefined;
 		const root = displayText(this.deps.root);
@@ -962,26 +1067,56 @@ export class FilePickerView {
 		return this.renderText(elideLeft(root, room), "dim");
 	}
 
-	/** Always-active search, painted exactly like the Commands palette (S18). */
+	/**
+	 * Always-active search, painted exactly like the Commands palette (S18) and
+	 * narrowed to the list pane, which leaves the preview's right column blank on
+	 * this row (S47).
+	 */
 	private searchRow(width: number): string {
 		if (this.query.length === 0) return fit(this.renderText(`${SEARCH_PROMPT} ${SEARCH_PLACEHOLDER}`, "muted"), width);
 		return fit(`${this.renderText(SEARCH_PROMPT, "muted")} ${displayText(this.query)}`, width);
 	}
 
 	/**
-	 * The info row under the blank line: the counts and the active listing order,
-	 * so the order is always visible without being a key hint (S29). The file
-	 * count is what the query currently lists — files only, never the group rows
-	 * the trees paint; the parenthesised count is the whole Tab selection, which
-	 * can include files the query hides. A pending or failed listing counts
-	 * nothing, so the row stays blank instead of claiming zero files.
+	 * The info row under the search: how many files the query lists out of the
+	 * whole listing, the Tab selection in parentheses, and the active list nesting
+	 * order right-aligned at the list pane's edge, so the order is always visible
+	 * without being a key hint (S43). Only the list column paints it (S47). The
+	 * listed count is files only, never the group rows the trees paint, and the
+	 * parenthesised count is the whole selection, which can include files the query
+	 * hides. A pending or failed listing counts nothing, so the row stays blank
+	 * instead of claiming zero files.
 	 */
-	private countRow(width: number): string {
-		if (!this.loaded || this.listingError !== undefined) return "".padEnd(width, " ");
-		const files = this.matches().length;
-		const selected = this.selection.size;
-		const counts = `${files} ${files === 1 ? "file" : "files"} (${selected} selected)`;
-		return fit(this.renderText(`${counts}${INFO_SEPARATOR}${this.order}`, "muted"), width);
+	private infoRow(width: number): string {
+		if (!this.loaded || this.listingError !== undefined) return "".padEnd(Math.max(0, width), " ");
+		const listed = this.matches().length;
+		const counts = this.renderText(`${listed}/${this.entries.length} (${this.selection.size})`, "muted");
+		const order = this.renderText(this.order, "muted");
+		// One space each side of the rule, which takes every cell the two labels
+		// leave; a list pane too narrow for both drops the rule instead.
+		const room = width - visibleWidth(stripAnsi(counts)) - visibleWidth(stripAnsi(order));
+		if (room < 2) return fit(`${counts} ${order}`, width);
+		return `${counts} ${this.renderText(BOX_HORIZONTAL.repeat(room - 2), "border")} ${order}`;
+	}
+
+	/**
+	 * The list column while the listing is unloaded, failed or holds nothing: the
+	 * state line takes the first list row, exactly where a painted list starts.
+	 */
+	private emptyColumn(layout: PaneLayout, state: { text: string; tone: Tone }, bodyRows: number): string[] {
+		if (bodyRows <= 0) return [];
+		const lines = [fit(this.renderText(state.text, state.tone), layout.listWidth)];
+		while (lines.length < bodyRows) lines.push("");
+		return lines;
+	}
+
+	/**
+	 * The row that closes the body (S47): one rule across the whole card content,
+	 * so the list column, the separator and the preview column read as one line.
+	 */
+	private closingRuleRow(layout: PaneLayout): string {
+		const rule = this.renderText(BOX_HORIZONTAL, "border");
+		return `${rule.repeat(layout.listWidth)}${rule.repeat(SEPARATOR_WIDTH)}${rule.repeat(layout.previewWidth)}`;
 	}
 
 	/**
@@ -1009,12 +1144,12 @@ export class FilePickerView {
 
 	/**
 	 * The label a file row paints: its name, and — in `modified` and `ext` only —
-	 * the trailing parent directory. In `path` the tree already places the file
+	 * the trailing parent directory. In `tree` the tree already places the file
 	 * under its folder, so that suffix would echo the row above it (S35).
 	 */
 	private rowLabel(entry: FileEntry): { text: string; nameLength: number } {
 		const name = displayText(posix.basename(entry.path));
-		const directory = this.order === "path" ? undefined : posix.dirname(entry.path);
+		const directory = this.order === "tree" ? undefined : posix.dirname(entry.path);
 		if (directory === undefined || directory === ".") return { text: name, nameLength: name.length };
 		return { text: `${name}  ${displayText(directory)}`, nameLength: name.length };
 	}
@@ -1084,6 +1219,12 @@ export class FilePickerView {
 		return fit(`${marker}${indent}${paintedLabel}${gap}${showsSuffix ? suffix : ""}`, listWidth);
 	}
 
+	/**
+	 * The preview pane's own cells for the info row and the list rows (S47): the
+	 * box's top border beside the info row, a content row per list row, and the
+	 * box's bottom border on the list's last row. The unbordered fallback keeps
+	 * the position indicator on the info row and fills the same rows below it.
+	 */
 	private previewColumn(layout: PaneLayout, bodyRows: number): string[] {
 		const path = this.selectedPath();
 		if (!path || bodyRows <= 0) return [];
